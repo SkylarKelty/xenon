@@ -7,8 +7,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use memmap2::{Mmap, MmapOptions};
 use serde::Deserialize;
 
 use crate::{Error, Result};
@@ -201,4 +202,82 @@ pub fn matches_glob(name: &str, pattern: &str) -> bool {
 
 pub fn is_excluded(tensor_name: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| matches_glob(tensor_name, p))
+}
+
+/// Memory-mapped safetensors file. Holds both the mmap and the parsed header;
+/// tensor byte slices point into the mmap'd region.
+pub struct MmapWeights {
+    pub path: PathBuf,
+    pub mmap: Mmap,
+    pub header: SafetensorsHeader,
+    /// Byte offset in the file where tensor data starts (= 8 + header_bytes).
+    pub data_offset: u64,
+}
+
+impl MmapWeights {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+
+        // Parse header out of the mmap'd bytes directly. SafetensorsHeader
+        // reads from disk; replicate the parsing here to keep a single owner
+        // of the tensor table without re-reading the file.
+        if mmap.len() < 8 {
+            return Err(Error::Config("safetensors file too short".into()));
+        }
+        let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap());
+        let data_offset = 8 + header_len;
+        if (data_offset as usize) > mmap.len() {
+            return Err(Error::Config(format!(
+                "header length {header_len} exceeds file size {}",
+                mmap.len()
+            )));
+        }
+        let header_buf = &mmap[8..(data_offset as usize)];
+        let mut all: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(header_buf)?;
+        let metadata = all.remove("__metadata__");
+        let mut tensors = BTreeMap::new();
+        for (name, val) in all {
+            let info: TensorInfo = serde_json::from_value(val)
+                .map_err(|e| Error::Config(format!("bad tensor entry for '{name}': {e}")))?;
+            tensors.insert(name, info);
+        }
+        let header = SafetensorsHeader {
+            tensors,
+            metadata,
+            header_bytes: header_len,
+            file_bytes: mmap.len() as u64,
+        };
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            mmap,
+            header,
+            data_offset,
+        })
+    }
+
+    /// Byte slice for a named tensor's data (points into the mmap).
+    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
+        let info = self
+            .header
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("tensor '{name}' not found")))?;
+        let begin = (self.data_offset + info.data_offsets[0]) as usize;
+        let end = (self.data_offset + info.data_offsets[1]) as usize;
+        if end > self.mmap.len() {
+            return Err(Error::Config(format!(
+                "tensor '{name}' offset {end} exceeds mmap len {}",
+                self.mmap.len()
+            )));
+        }
+        Ok(&self.mmap[begin..end])
+    }
+
+    /// Look up a tensor's metadata.
+    pub fn info(&self, name: &str) -> Option<&TensorInfo> {
+        self.header.tensors.get(name)
+    }
 }

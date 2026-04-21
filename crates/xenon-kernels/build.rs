@@ -37,6 +37,10 @@ fn main() {
     let src_dir = manifest.join("src/cu");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
+    // Re-run if a new .cu file appears (the per-file rerun-if-changed below
+    // doesn't cover directory contents).
+    println!("cargo:rerun-if-changed={}", src_dir.display());
+
     // Enumerate .cu sources.
     let mut sources: Vec<PathBuf> = std::fs::read_dir(&src_dir)
         .expect("read src/cu")

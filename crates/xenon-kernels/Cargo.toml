@@ -9,3 +9,5 @@ build = "build.rs"
 links = "xenon_kernels_impl"
 
 [dependencies]
+half.workspace = true
+bytemuck.workspace = true
