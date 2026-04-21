@@ -17,3 +17,4 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 xenon-core = { path = "../xenon-core" }
+xenon-kernels = { path = "../xenon-kernels" }

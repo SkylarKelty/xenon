@@ -5,5 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Hand-rolled CUDA kernels (RMSNorm, GELU, RoPE, FMHA) for xenon."
+build = "build.rs"
+links = "xenon_kernels_impl"
 
 [dependencies]
