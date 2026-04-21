@@ -11,7 +11,8 @@ use xenon_core::{
 };
 use xenon_kernels::{
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
-    rmsnorm_bf16, rmsnorm_bf16_reference,
+    fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16, gelu_tanh_bf16_reference,
+    matmul_bf16_reference, rmsnorm_bf16, rmsnorm_bf16_reference, CublasLt,
 };
 
 #[derive(Parser, Debug)]
@@ -40,6 +41,33 @@ enum Command {
         hidden: usize,
         #[arg(long, default_value_t = 1e-6)]
         eps: f32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Dequantize synthetic NVFP4 bytes on the GPU, compare to a CPU reference.
+    TestDequant {
+        #[arg(long, default_value_t = 32)]
+        rows: usize,
+        #[arg(long, default_value_t = 128)]
+        cols: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run a bf16 matmul via cuBLASLt and compare to a CPU fp32 reference.
+    TestGemm {
+        #[arg(long, default_value_t = 128)]
+        m: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 128)]
+        k: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run GELU-tanh on random input and compare to a CPU reference.
+    TestGelu {
+        #[arg(long, default_value_t = 4096)]
+        n: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -73,6 +101,9 @@ fn main() -> anyhow::Result<()> {
         Command::Sanity => cmd_sanity(),
         Command::Vram => cmd_vram(),
         Command::TestRmsnorm { rows, hidden, eps, seed } => cmd_test_rmsnorm(rows, hidden, eps, seed),
+        Command::TestDequant { rows, cols, seed } => cmd_test_dequant(rows, cols, seed),
+        Command::TestGemm { m, n, k, seed } => cmd_test_gemm(m, n, k, seed),
+        Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -311,22 +342,7 @@ fn cmd_test_rmsnorm(rows: usize, hidden: usize, eps: f32, seed: u64) -> anyhow::
 
     let y_gpu = d_y.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
     let y_ref = rmsnorm_bf16_reference(&x_host, &weight_host, rows, hidden, eps);
-
-    let mut max_abs_diff: f32 = 0.0;
-    let mut max_rel_diff: f32 = 0.0;
-    for (a, b) in y_gpu.iter().zip(y_ref.iter()) {
-        let fa = a.to_f32();
-        let fb = b.to_f32();
-        let d = (fa - fb).abs();
-        if d > max_abs_diff {
-            max_abs_diff = d;
-        }
-        let denom = fb.abs().max(1e-6);
-        let rel = d / denom;
-        if rel > max_rel_diff {
-            max_rel_diff = rel;
-        }
-    }
+    let (max_abs_diff, max_rel_diff, _global) = compare_bf16(&y_gpu, &y_ref);
 
     println!("=== xenon-cli test-rmsnorm ===");
     println!("rows x hidden           {} x {}", rows, hidden);
@@ -344,6 +360,163 @@ fn cmd_test_rmsnorm(rows: usize, hidden: usize, eps: f32, seed: u64) -> anyhow::
     } else {
         anyhow::bail!("max rel diff {max_rel_diff} exceeds bf16 tolerance {tol_rel}");
     }
+    Ok(())
+}
+
+/// Compare two bf16 arrays. Returns `(max_abs, max_per_elem_rel, global_rel)`.
+/// `global_rel = max_abs / max(|want|)` is the right measure for tensor ops
+/// where values can pass through zero; per-elem rel blows up there.
+fn compare_bf16(got: &[bf16], want: &[bf16]) -> (f32, f32, f32) {
+    let mut max_abs = 0.0f32;
+    let mut max_per_elem_rel = 0.0f32;
+    let mut max_mag = 0.0f32;
+    for (a, b) in got.iter().zip(want.iter()) {
+        let fa = a.to_f32();
+        let fb = b.to_f32();
+        let d = (fa - fb).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        let mb = fb.abs();
+        if mb > max_mag {
+            max_mag = mb;
+        }
+        let denom = mb.max(1e-6);
+        let r = d / denom;
+        if r > max_per_elem_rel {
+            max_per_elem_rel = r;
+        }
+    }
+    let global_rel = if max_mag > 0.0 { max_abs / max_mag } else { 0.0 };
+    (max_abs, max_per_elem_rel, global_rel)
+}
+
+fn cmd_test_dequant(rows: usize, cols: usize, seed: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(cols % 16 == 0, "cols must be a multiple of 16");
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    // Packed FP4: any byte pattern is valid.
+    let packed_host: Vec<u8> = (0..rows * cols / 2).map(|_| rng.gen()).collect();
+    // Scales: sample UE4M3 byte space but keep sign bit off so every byte is a
+    // valid non-negative scale. Restrict to exp in [1, 12] for values that
+    // don't overflow bf16 after multiplication with |fp4| up to 6.
+    let scales_host: Vec<u8> = (0..rows * cols / 16)
+        .map(|_| {
+            let exp = rng.gen_range(1u8..=12);
+            let man = rng.gen_range(0u8..=7);
+            (exp << 3) | man
+        })
+        .collect();
+    let global_scale = 0.125f32 + rng.gen::<f32>() * 0.25f32;
+
+    let mut d_packed: DeviceBuffer<u8> = DeviceBuffer::new(packed_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_scales: DeviceBuffer<u8> = DeviceBuffer::new(scales_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_out: DeviceBuffer<bf16> = DeviceBuffer::new(rows * cols).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_packed.copy_from_host(&packed_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_scales.copy_from_host(&scales_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    fp4_dequant_bf16(&mut d_out, &d_packed, &d_scales, global_scale, rows, cols, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let t0 = Instant::now();
+    let iters = 20;
+    for _ in 0..iters {
+        fp4_dequant_bf16(&mut d_out, &d_packed, &d_scales, global_scale, rows, cols, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let per_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    let got = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = fp4_dequant_bf16_reference(&packed_host, &scales_host, global_scale, rows, cols);
+
+    let (max_abs, _per_elem, _global) = compare_bf16(&got, &want);
+    println!("=== xenon-cli test-dequant ===");
+    println!("rows x cols             {} x {}", rows, cols);
+    println!("global_scale            {:.6}", global_scale);
+    println!("per-launch time         {:>7.2} us", per_us);
+    println!("max abs diff            {:.3e}", max_abs);
+    // Kernel and reference share identical math; any difference is a bug.
+    anyhow::ensure!(max_abs == 0.0, "dequant kernel diverges from reference (abs {max_abs})");
+    println!("OK: kernel matches reference bit-for-bit.");
+    Ok(())
+}
+
+fn cmd_test_gemm(m: usize, n: usize, k: usize, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let a_host: Vec<bf16> = (0..m * k).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let b_host: Vec<bf16> = (0..k * n).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_a: DeviceBuffer<bf16> = DeviceBuffer::new(m * k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_b: DeviceBuffer<bf16> = DeviceBuffer::new(k * n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_d: DeviceBuffer<bf16> = DeviceBuffer::new(m * n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_a.copy_from_host(&a_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_b.copy_from_host(&b_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Warmup + timed runs.
+    lt.matmul_bf16_rm(&mut d_d, &d_a, &d_b, None, m, n, k, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let t0 = Instant::now();
+    let iters = 20;
+    for _ in 0..iters {
+        lt.matmul_bf16_rm(&mut d_d, &d_a, &d_b, None, m, n, k, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let per_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let tflops = (2.0 * m as f64 * n as f64 * k as f64) / (per_us * 1e-6) / 1e12;
+
+    let got = d_d.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = matmul_bf16_reference(&a_host, &b_host, m, n, k, 1.0, 0.0, None);
+
+    let (max_abs, _per_elem, global_rel) = compare_bf16(&got, &want);
+    // GEMM outputs can pass through zero; the right measure is
+    // max_abs / max(|ref|), which is a bounded fraction of 1 bf16 ULP.
+    println!("=== xenon-cli test-gemm ===");
+    println!("shape                   M={m} N={n} K={k}");
+    println!("per-launch time         {:>7.2} us  ({:>5.2} TFLOP/s)", per_us, tflops);
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("global rel diff         {:.3e}", global_rel);
+    let tol_rel: f32 = 2e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel diff {global_rel} exceeds tolerance {tol_rel}");
+    println!("OK: within bf16 tolerance (global rel {tol_rel:.1e}).");
+    Ok(())
+}
+
+fn cmd_test_gelu(n: usize, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..n).map(|_| bf16::from_f32(rng.gen_range(-4.0..4.0))).collect();
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_y: DeviceBuffer<bf16> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    gelu_tanh_bf16(&mut d_y, &d_x, Some(&stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got = d_y.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = gelu_tanh_bf16_reference(&x_host);
+
+    let (max_abs, _per_elem, global_rel) = compare_bf16(&got, &want);
+    println!("=== xenon-cli test-gelu ===");
+    println!("n                       {n}");
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("global rel diff         {:.3e}", global_rel);
+    // GELU crosses zero, so per-elem rel is unbounded near the origin;
+    // global rel is the right metric.
+    let tol_rel: f32 = 1e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel diff {global_rel} exceeds tolerance {tol_rel}");
+    println!("OK: within bf16 tolerance (global rel {tol_rel:.1e}).");
     Ok(())
 }
 

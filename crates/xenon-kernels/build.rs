@@ -103,5 +103,8 @@ fn main() {
     println!("cargo:rustc-link-lib=static=xenon_kernels_impl");
     println!("cargo:rustc-link-search=native={cuda_lib}");
     println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=cublasLt");
     println!("cargo:rustc-link-lib=dylib=stdc++");
+    // Bake rpath so binaries find libcudart/libcublasLt without LD_LIBRARY_PATH.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{cuda_lib}");
 }
