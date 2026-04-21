@@ -103,15 +103,23 @@ Legend: `[x]` done, `[>]` in progress, `[ ]` todo.
 - [x] GELU-tanh kernel (+ fused GLU variant)
 - [x] CLI: `test-dequant`, `test-gemm`, `test-gelu`
 
-#### Week 3 [ ] — real-weight MLP end-to-end
-- [ ] `list <model> --pattern <glob>` CLI utility to surface tensor names
-- [ ] Tensor-family loader: `(weight, weight_scale, weight_scale_2)` tuple for
+#### Week 3 [x] — real-weight MLP end-to-end
+- [x] `list <model> --pattern <glob>` CLI utility to surface tensor names
+- [x] Tensor-family loader: `(weight, weight_scale, weight_scale_2)` tuple for
       a given module prefix, with shape validation against config
-- [ ] `test-mlp <model> --layer 0`: dequant gate/up/down, run full MLP chain,
-      compare GPU vs host reference (same FP4 bytes, fp32 math, bf16 round
-      at the end). Target: global rel diff ≤ 5e-2.
-- [ ] Decide layer prefix convention (`model.language_model.layers.N.*` vs
-      `model.layers.N.*`) from tensor listing
+      (`MmapWeights::load_quant_linear` / `load_bf16`)
+- [x] `CublasLt::linear_bf16` — `y = x @ W^T` for W stored `[N, K]` HF-style
+- [x] `test-mlp <model> --layer 0`: dequant gate/up/down, run full MLP chain,
+      compare GPU vs host reference. Result: global rel diff 3.1e-3 at
+      batch=1 (well under 5e-2 target); 0.54 ms/forward post-warmup.
+- [x] Layer prefix convention confirmed: `model.language_model.layers.N.*`
+- [x] Discovered (for phase 2): `per_layer_input_gate` + `per_layer_projection`
+      are the PLE injection path (quantized), not just gathered embeddings.
+      Also `self_attn.{q,k}_norm` weights present — QK LayerNorm is enabled.
+
+**Key finding:** cuBLASLt algorithm selection is ~90 ms on the first call per
+unique shape. Must be pre-warmed at init for every shape that might appear
+during serving; phase 4 CUDA Graph capture subsumes this.
 
 ### Phase 2 — attention [ ]
 - [ ] Tokenizer (load `tokenizer.json`, SentencePiece-compatible via
