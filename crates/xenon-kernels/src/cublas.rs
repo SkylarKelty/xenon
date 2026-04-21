@@ -325,6 +325,130 @@ impl CublasLt {
         drop(guard_desc);
         Ok(())
     }
+
+    /// Standard Linear layer: `y[M,N] = alpha * x[M,K] * W^T + beta * c`,
+    /// all row-major bf16. `W` is stored row-major `[N, K]` — the HF convention.
+    ///
+    /// Internally: col-major view of `W_rm[N,K]` is `[K, N]` ld=K; with
+    /// `opA = T` cuBLASLt treats it as `[N, K]` which is what we want for the
+    /// col-major math `y_cm[N,M] = W_rm[N,K] * x^T_cm[K,M]`.
+    pub fn linear_bf16(
+        &mut self,
+        y: &mut DeviceBuffer<bf16>,
+        x: &DeviceBuffer<bf16>,
+        w: &DeviceBuffer<bf16>,
+        c: Option<&DeviceBuffer<bf16>>,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        beta: f32,
+        stream: Option<&Stream>,
+    ) -> Result<(), GemmError> {
+        assert_eq!(x.len(), m * k);
+        assert_eq!(w.len(), n * k);
+        assert_eq!(y.len(), m * n);
+        if let Some(c) = c {
+            assert_eq!(c.len(), m * n);
+        }
+
+        let mut desc: MatmulDescRaw = std::ptr::null_mut();
+        ck(unsafe { cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) })?;
+        let _g_desc = DescGuard(desc);
+
+        let op_t = CUBLAS_OP_T;
+        let op_n = CUBLAS_OP_N;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(
+                desc,
+                CUBLASLT_MATMUL_DESC_TRANSA,
+                &op_t as *const i32 as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+        })?;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(
+                desc,
+                CUBLASLT_MATMUL_DESC_TRANSB,
+                &op_n as *const i32 as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+        })?;
+
+        // A = W pointer, col-major [K, N] ld=K; opA=T flips to [N, K].
+        // B = x pointer, col-major [K, M] ld=K; opB=N.
+        // D = y pointer, col-major [N, M] ld=N.
+        let mut a_layout: MatrixLayoutRaw = std::ptr::null_mut();
+        let mut b_layout: MatrixLayoutRaw = std::ptr::null_mut();
+        let mut d_layout: MatrixLayoutRaw = std::ptr::null_mut();
+        ck(unsafe { cublasLtMatrixLayoutCreate(&mut a_layout, CUDA_R_16BF, k as u64, n as u64, k as i64) })?;
+        let _g_a = LayoutGuard(a_layout);
+        ck(unsafe { cublasLtMatrixLayoutCreate(&mut b_layout, CUDA_R_16BF, k as u64, m as u64, k as i64) })?;
+        let _g_b = LayoutGuard(b_layout);
+        ck(unsafe { cublasLtMatrixLayoutCreate(&mut d_layout, CUDA_R_16BF, n as u64, m as u64, n as i64) })?;
+        let _g_d = LayoutGuard(d_layout);
+
+        let mut pref: MatmulPreferenceRaw = std::ptr::null_mut();
+        ck(unsafe { cublasLtMatmulPreferenceCreate(&mut pref) })?;
+        let _g_pref = PrefGuard(pref);
+        let ws_bytes: u64 = self.workspace.bytes() as u64;
+        ck(unsafe {
+            cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const u64 as *const c_void,
+                std::mem::size_of::<u64>(),
+            )
+        })?;
+
+        let mut heur = MatmulHeuristicResult {
+            algo: MatmulAlgo { data: [0; 8] },
+            workspace_size: 0,
+            state: 0,
+            waves_count: 0.0,
+            _reserved: [0; 4],
+        };
+        let mut returned: i32 = 0;
+        ck(unsafe {
+            cublasLtMatmulAlgoGetHeuristic(
+                self.handle,
+                desc,
+                a_layout, b_layout, d_layout, d_layout,
+                pref,
+                1,
+                &mut heur,
+                &mut returned,
+            )
+        })?;
+        if returned == 0 {
+            return Err(GemmError::NoAlgorithm);
+        }
+
+        let c_ptr: *const c_void = match c {
+            Some(c) => c.as_device_ptr() as *const c_void,
+            None => y.as_device_ptr() as *const c_void,
+        };
+        let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+
+        ck(unsafe {
+            cublasLtMatmul(
+                self.handle,
+                desc,
+                &alpha as *const f32 as *const c_void,
+                w.as_device_ptr() as *const c_void, a_layout,
+                x.as_device_ptr() as *const c_void, b_layout,
+                &beta as *const f32 as *const c_void,
+                c_ptr, d_layout,
+                y.as_device_ptr(), d_layout,
+                &heur.algo as *const MatmulAlgo,
+                self.workspace.as_device_ptr(),
+                self.workspace.bytes(),
+                stream_ptr,
+            )
+        })?;
+
+        Ok(())
+    }
 }
 
 impl Drop for CublasLt {
@@ -360,6 +484,34 @@ impl Drop for PrefGuard {
             let _ = unsafe { cublasLtMatmulPreferenceDestroy(self.0) };
         }
     }
+}
+
+/// Reference host-side Linear: `y[M,N] = alpha * x[M,K] * W^T + beta * c`,
+/// with W row-major `[N, K]`. Matches `CublasLt::linear_bf16`.
+pub fn linear_bf16_reference(
+    x: &[bf16],
+    w: &[bf16],
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    beta: f32,
+    c: Option<&[bf16]>,
+) -> Vec<bf16> {
+    assert_eq!(x.len(), m * k);
+    assert_eq!(w.len(), n * k);
+    let mut y = vec![bf16::ZERO; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for l in 0..k {
+                acc += x[i * k + l].to_f32() * w[j * k + l].to_f32();
+            }
+            let cv = c.map(|c| c[i * n + j].to_f32()).unwrap_or(0.0);
+            y[i * n + j] = bf16::from_f32(alpha * acc + beta * cv);
+        }
+    }
+    y
 }
 
 /// Reference host-side bf16 matmul (fp32 accumulate) for correctness tests.

@@ -12,8 +12,19 @@ use xenon_core::{
 use xenon_kernels::{
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
     fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16, gelu_tanh_bf16_reference,
-    matmul_bf16_reference, rmsnorm_bf16, rmsnorm_bf16_reference, CublasLt,
+    gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference, rmsnorm_bf16,
+    rmsnorm_bf16_reference, CublasLt,
 };
+
+/// Parse a little-endian bf16 byte slice into a `Vec<bf16>`. Avoids
+/// alignment assumptions `bytemuck::cast_slice` would impose on mmap'd data.
+fn bytes_to_bf16_vec(bytes: &[u8]) -> Vec<bf16> {
+    assert!(bytes.len() % 2 == 0, "bf16 bytes must be even-length");
+    bytes
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "xenon-cli", about = "xenon command-line tool")]
@@ -29,6 +40,17 @@ enum Command {
     /// Walk the safetensors header and categorize tensors (NVFP4 pairs vs
     /// plain); validate the modelopt exclude invariant.
     Load { model: PathBuf },
+    /// Print tensor entries (name, dtype, shape, bytes) matching an optional
+    /// glob-ish pattern (trailing `*` supported).
+    List {
+        model: PathBuf,
+        /// Glob pattern; if omitted, prints all.
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Limit on number of lines printed. Set to 0 for unlimited.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Run the hello kernel to verify the CUDA build pipeline.
     Sanity,
     /// Print CUDA device count and free/total VRAM on device 0.
@@ -61,6 +83,29 @@ enum Command {
         n: usize,
         #[arg(long, default_value_t = 128)]
         k: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run a bf16 Linear (y = x @ W^T) via cuBLASLt and compare to a CPU reference.
+    TestLinear {
+        #[arg(long, default_value_t = 128)]
+        m: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 128)]
+        k: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run a full MLP block (norm + gate/up/down + GELU GLU) on real Gemma
+    /// weights, comparing GPU output to a host-reference computation that
+    /// dequantizes the same FP4 bytes.
+    TestMlp {
+        model: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+        #[arg(long, default_value_t = 2)]
+        batch: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -98,12 +143,15 @@ fn main() -> anyhow::Result<()> {
     match Args::parse().cmd {
         Command::Info { model } => cmd_info(model),
         Command::Load { model } => cmd_load(model),
+        Command::List { model, pattern, limit } => cmd_list(model, pattern, limit),
         Command::Sanity => cmd_sanity(),
         Command::Vram => cmd_vram(),
         Command::TestRmsnorm { rows, hidden, eps, seed } => cmd_test_rmsnorm(rows, hidden, eps, seed),
         Command::TestDequant { rows, cols, seed } => cmd_test_dequant(rows, cols, seed),
         Command::TestGemm { m, n, k, seed } => cmd_test_gemm(m, n, k, seed),
+        Command::TestLinear { m, n, k, seed } => cmd_test_linear(m, n, k, seed),
         Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
+        Command::TestMlp { model, layer, batch, seed } => cmd_test_mlp(model, layer, batch, seed),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -279,6 +327,39 @@ fn cmd_load(dir: PathBuf) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_list(dir: PathBuf, pattern: Option<String>, limit: usize) -> anyhow::Result<()> {
+    let st_path = dir.join("model.safetensors");
+    let header = SafetensorsHeader::from_path(&st_path)?;
+    let matches: Vec<(&String, &xenon_core::TensorInfo)> = header
+        .tensors
+        .iter()
+        .filter(|(n, _)| {
+            pattern
+                .as_ref()
+                .map(|p| xenon_core::weights::matches_glob(n, p))
+                .unwrap_or(true)
+        })
+        .collect();
+    let total = matches.len();
+    let shown = if limit == 0 { total } else { total.min(limit) };
+
+    println!("=== xenon-cli list ===");
+    if let Some(p) = &pattern {
+        println!("pattern                  {p}");
+    }
+    println!("matches                  {total} (showing {shown})");
+    println!();
+    println!("{:<64}  {:>10}  {:>24}  {:>12}", "name", "dtype", "shape", "bytes");
+    for (name, info) in matches.iter().take(shown) {
+        let shape = format!("{:?}", info.shape);
+        println!(
+            "{:<64}  {:>10}  {:>24}  {:>12}",
+            name, info.dtype, shape, info.bytes()
+        );
+    }
     Ok(())
 }
 
@@ -586,5 +667,220 @@ fn cmd_upload(dir: PathBuf, prefix: Option<String>, limit_bytes: u64, verify: bo
     println!("vram free after        {:>6.2} GiB  (delta {:>+6.2} GiB)",
              free_after as f64 / 1073741824.0,
              (free_after as f64 - free_before as f64) / 1073741824.0);
+    Ok(())
+}
+
+fn cmd_test_linear(m: usize, n: usize, k: usize, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..m * k).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    // W is [N, K] row-major in HF convention.
+    let w_host: Vec<bf16> = (0..n * k).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(m * k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_w: DeviceBuffer<bf16> = DeviceBuffer::new(n * k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_y: DeviceBuffer<bf16> = DeviceBuffer::new(m * n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_w.copy_from_host(&w_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    lt.linear_bf16(&mut d_y, &d_x, &d_w, None, m, n, k, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let t0 = Instant::now();
+    let iters = 20;
+    for _ in 0..iters {
+        lt.linear_bf16(&mut d_y, &d_x, &d_w, None, m, n, k, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let per_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let tflops = (2.0 * m as f64 * n as f64 * k as f64) / (per_us * 1e-6) / 1e12;
+
+    let got = d_y.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = linear_bf16_reference(&x_host, &w_host, m, n, k, 1.0, 0.0, None);
+    let (max_abs, _per_elem, global_rel) = compare_bf16(&got, &want);
+
+    println!("=== xenon-cli test-linear ===");
+    println!("shape                   y[M,N] = x[M,K] * W[N,K]^T; M={m} N={n} K={k}");
+    println!("per-launch time         {:>7.2} us  ({:>5.2} TFLOP/s)", per_us, tflops);
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("global rel diff         {:.3e}", global_rel);
+    let tol_rel: f32 = 2e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel diff {global_rel} exceeds tolerance {tol_rel}");
+    println!("OK: within bf16 tolerance (global rel {tol_rel:.1e}).");
+    Ok(())
+}
+
+fn cmd_test_mlp(dir: PathBuf, layer: usize, batch: usize, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    let hidden = tc.hidden_size;
+    let inter = tc.intermediate_size;
+    let eps = tc.rms_norm_eps as f32;
+    anyhow::ensure!(layer < tc.num_hidden_layers, "layer {layer} >= num_hidden_layers {}", tc.num_hidden_layers);
+
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+    let prefix = format!("model.language_model.layers.{layer}");
+
+    let norm_bytes = mm.load_bf16(&format!("{prefix}.pre_feedforward_layernorm.weight"))?;
+    let gate = mm.load_quant_linear(&format!("{prefix}.mlp.gate_proj"))?;
+    let up = mm.load_quant_linear(&format!("{prefix}.mlp.up_proj"))?;
+    let down = mm.load_quant_linear(&format!("{prefix}.mlp.down_proj"))?;
+
+    anyhow::ensure!(
+        gate.out_features == inter && gate.in_features == hidden,
+        "gate_proj shape mismatch: got [{}, {}], expected [{inter}, {hidden}]",
+        gate.out_features, gate.in_features
+    );
+    anyhow::ensure!(
+        up.out_features == inter && up.in_features == hidden,
+        "up_proj shape mismatch: got [{}, {}], expected [{inter}, {hidden}]",
+        up.out_features, up.in_features
+    );
+    anyhow::ensure!(
+        down.out_features == hidden && down.in_features == inter,
+        "down_proj shape mismatch: got [{}, {}], expected [{hidden}, {inter}]",
+        down.out_features, down.in_features
+    );
+
+    println!("=== xenon-cli test-mlp ===");
+    println!("layer {layer}  batch {batch}  hidden {hidden}  intermediate {inter}");
+    println!("  gate.global_scale      {}", gate.global_scale);
+    println!("  up.global_scale        {}", up.global_scale);
+    println!("  down.global_scale      {}", down.global_scale);
+
+    // Random input.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..batch * hidden)
+        .map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)))
+        .collect();
+
+    // ----- GPU path -----
+    let upload_start = Instant::now();
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(batch * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_norm_w: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_gate_packed: DeviceBuffer<u8> = DeviceBuffer::new(gate.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_gate_scales: DeviceBuffer<u8> = DeviceBuffer::new(gate.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_gate_w: DeviceBuffer<bf16> = DeviceBuffer::new(gate.out_features * gate.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_up_packed: DeviceBuffer<u8> = DeviceBuffer::new(up.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_up_scales: DeviceBuffer<u8> = DeviceBuffer::new(up.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_up_w: DeviceBuffer<bf16> = DeviceBuffer::new(up.out_features * up.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_down_packed: DeviceBuffer<u8> = DeviceBuffer::new(down.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_down_scales: DeviceBuffer<u8> = DeviceBuffer::new(down.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_down_w: DeviceBuffer<bf16> = DeviceBuffer::new(down.out_features * down.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_normed: DeviceBuffer<bf16> = DeviceBuffer::new(batch * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new(batch * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_up_out: DeviceBuffer<bf16> = DeviceBuffer::new(batch * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_act: DeviceBuffer<bf16> = DeviceBuffer::new(batch * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_out: DeviceBuffer<bf16> = DeviceBuffer::new(batch * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_norm_w.copy_from_host_bytes(norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_gate_packed.copy_from_host_bytes(gate.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_gate_scales.copy_from_host_bytes(gate.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_up_packed.copy_from_host_bytes(up.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_up_scales.copy_from_host_bytes(up.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_down_packed.copy_from_host_bytes(down.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_down_scales.copy_from_host_bytes(down.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Dequantize weights on device (one-time).
+    fp4_dequant_bf16(&mut d_gate_w, &d_gate_packed, &d_gate_scales,
+                     gate.global_scale, gate.out_features, gate.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_up_w, &d_up_packed, &d_up_scales,
+                     up.global_scale, up.out_features, up.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_down_w, &d_down_packed, &d_down_scales,
+                     down.global_scale, down.out_features, down.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let upload_ms = upload_start.elapsed().as_secs_f64() * 1e3;
+
+    // Warmup: first cuBLASLt call on a new (M, N, K) shape pays an algorithm-
+    // selection / JIT cost that's unrelated to steady-state perf.
+    let mut run_forward = |lt: &mut CublasLt| -> anyhow::Result<()> {
+        rmsnorm_bf16(&mut d_normed, &d_x, &d_norm_w, batch, hidden, eps, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(&mut d_gate_out, &d_normed, &d_gate_w, None, batch, inter, hidden, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(&mut d_up_out, &d_normed, &d_up_w, None, batch, inter, hidden, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(&mut d_out, &d_act, &d_down_w, None, batch, hidden, inter, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    };
+
+    run_forward(&mut lt)?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Timed runs.
+    let iters = 20;
+    let fwd_start = Instant::now();
+    for _ in 0..iters {
+        run_forward(&mut lt)?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let fwd_ms = fwd_start.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+    let gpu_out = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // ----- Host reference -----
+    let ref_start = Instant::now();
+    let norm_w_host = bytes_to_bf16_vec(norm_bytes);
+    let gate_w_host = fp4_dequant_bf16_reference(gate.packed, gate.scales, gate.global_scale, gate.out_features, gate.in_features);
+    let up_w_host   = fp4_dequant_bf16_reference(up.packed,   up.scales,   up.global_scale,   up.out_features,   up.in_features);
+    let down_w_host = fp4_dequant_bf16_reference(down.packed, down.scales, down.global_scale, down.out_features, down.in_features);
+
+    let normed_host = rmsnorm_bf16_reference(&x_host, &norm_w_host, batch, hidden, eps);
+    let gate_out_host = linear_bf16_reference(&normed_host, &gate_w_host, batch, inter, hidden, 1.0, 0.0, None);
+    let up_out_host   = linear_bf16_reference(&normed_host, &up_w_host,   batch, inter, hidden, 1.0, 0.0, None);
+
+    const K0: f32 = 0.7978845608028654;
+    const K1: f32 = 0.044715;
+    let act_host: Vec<bf16> = gate_out_host.iter().zip(up_out_host.iter()).map(|(g, u)| {
+        let gv = g.to_f32();
+        let uv = u.to_f32();
+        let inner = K0 * (gv + K1 * gv * gv * gv);
+        let gelu = 0.5 * gv * (1.0 + inner.tanh());
+        bf16::from_f32(gelu * uv)
+    }).collect();
+    let cpu_out = linear_bf16_reference(&act_host, &down_w_host, batch, hidden, inter, 1.0, 0.0, None);
+    let ref_ms = ref_start.elapsed().as_secs_f64() * 1e3;
+
+    let (max_abs, _, global_rel) = compare_bf16(&gpu_out, &cpu_out);
+
+    // Magnitude check: if GPU output is mostly zero or NaN, something's wrong
+    // structurally even if GPU and CPU happen to agree on the zeros.
+    let gpu_max: f32 = gpu_out.iter().map(|v| v.to_f32().abs()).fold(0.0, f32::max);
+    let gpu_finite = gpu_out.iter().all(|v| v.to_f32().is_finite());
+
+    println!();
+    println!("upload + dequant        {:>7.1} ms", upload_ms);
+    println!("gpu forward (avg)       {:>7.2} ms", fwd_ms);
+    println!("cpu reference forward   {:>7.1} ms", ref_ms);
+    println!("gpu output max |.|      {:>8.3}", gpu_max);
+    println!("gpu finite              {}", gpu_finite);
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("global rel diff         {:.3e}", global_rel);
+    anyhow::ensure!(gpu_finite, "GPU output contains NaN/inf");
+    anyhow::ensure!(gpu_max > 0.0, "GPU output is identically zero");
+    let tol_rel: f32 = 5e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel diff {global_rel} exceeds tolerance {tol_rel}");
+    println!("OK: full MLP matches host reference within {tol_rel:.1e}.");
     Ok(())
 }

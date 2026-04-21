@@ -280,4 +280,126 @@ impl MmapWeights {
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
         self.header.tensors.get(name)
     }
+
+    /// Raw bytes of a plain bf16 tensor, with dtype + length validation.
+    pub fn load_bf16(&self, name: &str) -> Result<&[u8]> {
+        let info = self
+            .info(name)
+            .ok_or_else(|| Error::Config(format!("missing tensor '{name}'")))?;
+        if info.dtype != "BF16" {
+            return Err(Error::Config(format!(
+                "'{name}' dtype {} (expected BF16)",
+                info.dtype
+            )));
+        }
+        let expected = info.shape.iter().copied().product::<usize>() * 2;
+        let bytes = self.tensor_bytes(name)?;
+        if bytes.len() != expected {
+            return Err(Error::Config(format!(
+                "'{name}' has {} bytes but shape {:?} implies {}",
+                bytes.len(),
+                info.shape,
+                expected
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Load the three tensors making up an NVFP4 quantized linear:
+    /// `{prefix}.weight` (U8 packed), `{prefix}.weight_scale` (F8_E4M3 block scales),
+    /// `{prefix}.weight_scale_2` (F32 per-tensor global scale).
+    ///
+    /// Validates shape invariants: `weight` is `[out, in/2]`, `weight_scale` is
+    /// `[out, in/16]`, `weight_scale_2` is a scalar. `in_features` must be a
+    /// multiple of 16. Returns references tied to the mmap.
+    pub fn load_quant_linear(&self, prefix: &str) -> Result<QuantLinearRef<'_>> {
+        let w_name  = format!("{prefix}.weight");
+        let s_name  = format!("{prefix}.weight_scale");
+        let s2_name = format!("{prefix}.weight_scale_2");
+
+        let w_info  = self.info(&w_name).ok_or_else(|| Error::Config(format!("missing '{w_name}'")))?;
+        let s_info  = self.info(&s_name).ok_or_else(|| Error::Config(format!("missing '{s_name}'")))?;
+        let s2_info = self.info(&s2_name).ok_or_else(|| Error::Config(format!("missing '{s2_name}'")))?;
+
+        if w_info.dtype != "U8" {
+            return Err(Error::Config(format!("'{w_name}' dtype {} (want U8)", w_info.dtype)));
+        }
+        if s_info.dtype != "F8_E4M3" {
+            return Err(Error::Config(format!("'{s_name}' dtype {} (want F8_E4M3)", s_info.dtype)));
+        }
+        if s2_info.dtype != "F32" {
+            return Err(Error::Config(format!("'{s2_name}' dtype {} (want F32)", s2_info.dtype)));
+        }
+        if w_info.shape.len() != 2 {
+            return Err(Error::Config(format!("'{w_name}' rank {} (want 2)", w_info.shape.len())));
+        }
+
+        let out = w_info.shape[0];
+        let in_packed = w_info.shape[1];
+        let in_features = in_packed * 2;
+        if in_features % 16 != 0 {
+            return Err(Error::Config(format!(
+                "'{w_name}' in_features {in_features} not a multiple of 16"
+            )));
+        }
+
+        let expected_scale_shape = vec![out, in_features / 16];
+        if s_info.shape != expected_scale_shape {
+            return Err(Error::Config(format!(
+                "'{s_name}' shape {:?} != expected {:?}",
+                s_info.shape, expected_scale_shape
+            )));
+        }
+        if !s2_info.shape.is_empty() && s2_info.shape != vec![1] {
+            return Err(Error::Config(format!(
+                "'{s2_name}' shape {:?} is not scalar",
+                s2_info.shape
+            )));
+        }
+
+        let packed = self.tensor_bytes(&w_name)?;
+        let scales = self.tensor_bytes(&s_name)?;
+        let s2_bytes = self.tensor_bytes(&s2_name)?;
+        if packed.len() != out * in_packed {
+            return Err(Error::Config(format!(
+                "'{w_name}' byte length {} != expected {}",
+                packed.len(),
+                out * in_packed
+            )));
+        }
+        if scales.len() != out * in_features / 16 {
+            return Err(Error::Config(format!(
+                "'{s_name}' byte length {} != expected {}",
+                scales.len(),
+                out * in_features / 16
+            )));
+        }
+        if s2_bytes.len() != 4 {
+            return Err(Error::Config(format!(
+                "'{s2_name}' has {} bytes (want 4 for f32)",
+                s2_bytes.len()
+            )));
+        }
+        let global_scale = f32::from_le_bytes([s2_bytes[0], s2_bytes[1], s2_bytes[2], s2_bytes[3]]);
+
+        Ok(QuantLinearRef {
+            module: prefix.to_string(),
+            out_features: out,
+            in_features,
+            packed,
+            scales,
+            global_scale,
+        })
+    }
+}
+
+/// A loaded NVFP4 quantized linear layer. Byte slices point into the mmap.
+#[derive(Debug)]
+pub struct QuantLinearRef<'a> {
+    pub module: String,
+    pub out_features: usize,
+    pub in_features: usize,
+    pub packed: &'a [u8],    // [out, in/2]
+    pub scales: &'a [u8],    // [out, in/16] UE4M3
+    pub global_scale: f32,   // per-tensor fp32 multiplier
 }

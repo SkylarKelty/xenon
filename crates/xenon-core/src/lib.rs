@@ -10,4 +10,6 @@ pub mod weights;
 
 pub use config::{GemmaConfig, LayerKind, QuantConfig};
 pub use error::{Error, Result};
-pub use weights::{MmapWeights, QuantPair, SafetensorsHeader, TensorInfo, WeightBreakdown};
+pub use weights::{
+    MmapWeights, QuantLinearRef, QuantPair, SafetensorsHeader, TensorInfo, WeightBreakdown,
+};
