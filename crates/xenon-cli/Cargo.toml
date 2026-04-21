@@ -1,0 +1,19 @@
+[package]
+name = "xenon-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "xenon command-line tool (debug/inspect/generate)."
+
+[[bin]]
+name = "xenon-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+xenon-core = { path = "../xenon-core" }

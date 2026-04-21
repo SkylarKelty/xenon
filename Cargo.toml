@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xenon-core",
+    "crates/xenon-kernels",
+    "crates/xenon-server",
+    "crates/xenon-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+opt-level = 1
