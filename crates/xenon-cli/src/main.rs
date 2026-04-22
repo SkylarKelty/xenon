@@ -2421,133 +2421,51 @@ fn forward_step(
 }
 
 fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usize, chat: bool) -> anyhow::Result<()> {
-    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let cfg = GemmaConfig::from_path(&model_dir.join("config.json"))?;
-    let tc = &cfg.text_config;
-    let shape = ModelShape {
-        hidden: tc.hidden_size,
-        inter: tc.intermediate_size,
-        vocab: tc.vocab_size,
-        h_heads: tc.num_attention_heads,
-        h_kv: tc.num_key_value_heads,
-        per_layer: tc.hidden_size_per_layer_input.ok_or_else(|| anyhow::anyhow!("hidden_size_per_layer_input missing"))?,
-        n_layers: tc.num_hidden_layers,
-        ple_width: tc.hidden_size_per_layer_input.unwrap_or(0) * tc.num_hidden_layers,
-        eps: tc.rms_norm_eps as f32,
-        softcap: tc.final_logit_softcapping.unwrap_or(30.0) as f32,
-    };
-
-    let tok = Tokenizer::from_dir(&model_dir)?;
-    let mm = MmapWeights::open(&model_dir.join("model.safetensors"))?;
-
-    // Wrap in Gemma 4 chat template if requested. Gemma 4 uses <|turn> (105)
-    // and <turn|> (106) as the turn markers (not <start_of_turn>/<end_of_turn>
-    // like Gemma 2/3). Template: <|turn>user\n{prompt}<turn|>\n<|turn>model\n
-    let text = if chat {
-        format!("<|turn>user\n{}<turn|>\n<|turn>model\n", prompt)
-    } else {
-        prompt.clone()
-    };
-    let prompt_ids_u: Vec<u32> = tok.encode(&text, true)?;
-    let prompt_ids: Vec<i32> = prompt_ids_u.iter().map(|&x| x as i32).collect();
-    anyhow::ensure!(prompt_ids.len() + max_new <= max_len,
-        "prompt ({}) + max_new ({}) exceeds max_len ({})",
-        prompt_ids.len(), max_new, max_len);
-
-    // ---- Load all 42 layers (FP4-resident). ----
+    use std::io::Write;
     let t_load = Instant::now();
-    let mut layers: Vec<LayerWeights> = Vec::with_capacity(shape.n_layers);
-    for l in 0..shape.n_layers {
-        layers.push(load_layer_weights(&mm, &cfg, l, &stream)?);
-    }
-    let top = TopLevelWeights {
-        per_layer_model_projection: QuantLinearDev::load(
-            &mm.load_quant_linear("model.language_model.per_layer_model_projection")?)?,
-        per_layer_projection_norm: {
-            let b = mm.load_bf16("model.language_model.per_layer_projection_norm.weight")?;
-            let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
-            d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
-            d
-        },
-        norm: {
-            let b = mm.load_bf16("model.language_model.norm.weight")?;
-            let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-            d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
-            d
-        },
-        lm_head_pinned: {
-            let b = mm.load_bf16("model.language_model.embed_tokens.weight")?;
-            let mut p: PinnedBuffer<bf16> = PinnedBuffer::new(shape.vocab * shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-            p.as_mut_bytes().copy_from_slice(b);
-            p
-        },
-    };
-    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    let mut engine = xenon_engine::Engine::load(&model_dir, max_len)?;
     let (mem_free, mem_total) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+    let text = if chat { xenon_engine::wrap_chat_prompt(&prompt) } else { prompt.clone() };
+    let prompt_ids: Vec<u32> = engine.tokenize(&text, true)?;
     eprintln!(
         "[xenon] loaded {} layers in {:.1} s; vram {:.2}/{:.2} GiB free; prompt {} tokens",
-        shape.n_layers, load_ms / 1000.0,
+        engine.shape.n_layers, load_ms / 1000.0,
         mem_free as f64 / 1073741824.0, mem_total as f64 / 1073741824.0,
         prompt_ids.len()
     );
 
-    let mut kv = build_kv_cache(&mm, &cfg, max_len)?;
-
-    let eos: Vec<i32> = vec![1, 106]; // Gemma 4 stop tokens
-
-    // ---- Prefill ----
-    let t_prefill = Instant::now();
-    let stream_lm = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let logits0 = forward_step(&mm, &cfg, shape, &layers, &top, &mut kv,
-                                &prompt_ids, 0, &mut lt, &stream, &stream_lm)?;
-    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
-    let mut next: i32 = argmax_bf16(&logits0);
-    eprintln!("[xenon] prefill {:.1} ms ({:.1} tok/s)",
-             prefill_ms, prompt_ids.len() as f64 / (prefill_ms / 1000.0));
-
-    // Stream tokens as they're generated. For incremental decoding, keep
-    // the accumulated decoded string and print the diff after each token
-    // so subword pieces assemble into proper UTF-8 without partial chars.
-    use std::io::Write;
+    // Stream tokens as they're generated. Decode the accumulated ids after
+    // each step and emit the diff so subword pieces assemble into proper UTF-8.
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut generated: Vec<u32> = vec![next as u32];
+    let mut generated: Vec<u32> = Vec::new();
     let mut prev_decoded = String::new();
-    let emit = |gen: &[u32], prev: &mut String, out: &mut std::io::StdoutLock| -> anyhow::Result<()> {
-        let s = tok.decode(gen, /*skip_special*/ true)?;
-        if s.len() >= prev.len() && s.starts_with(prev.as_str()) {
-            out.write_all(s[prev.len()..].as_bytes())?;
-            out.flush()?;
-        }
-        *prev = s;
-        Ok(())
-    };
-    emit(&generated, &mut prev_decoded, &mut out)?;
+    let tok = engine.tokenizer.clone();
 
-    let t_decode_all = Instant::now();
-    let mut decoded_steps = 0usize;
-    for step in 0..max_new {
-        if eos.contains(&next) && step > 0 {
-            break;
+    let stats = engine.generate(&prompt_ids, max_new, xenon_engine::GEMMA4_EOS, |id| {
+        if xenon_engine::GEMMA4_EOS.contains(&id) && !generated.is_empty() { return true; }
+        generated.push(id);
+        if let Ok(s) = tok.decode(&generated, /*skip_special*/ true) {
+            if s.len() >= prev_decoded.len() && s.starts_with(prev_decoded.as_str()) {
+                let _ = out.write_all(s[prev_decoded.len()..].as_bytes());
+                let _ = out.flush();
+                prev_decoded = s;
+            }
         }
-        let q_pos = kv.len() as i32;
-        let logits = forward_step(&mm, &cfg, shape, &layers, &top, &mut kv,
-                                   &[next], q_pos, &mut lt, &stream, &stream_lm)?;
-        next = argmax_bf16(&logits);
-        generated.push(next as u32);
-        emit(&generated, &mut prev_decoded, &mut out)?;
-        decoded_steps += 1;
-    }
-    let decode_ms = t_decode_all.elapsed().as_secs_f64() * 1e3;
+        true
+    })?;
     writeln!(out)?;
     drop(out);
+
+    let decode_total_ms: f64 = stats.decode_ms.iter().sum();
+    eprintln!("[xenon] prefill {:.1} ms ({:.1} tok/s)",
+             stats.prefill_ms,
+             stats.prompt_len as f64 / (stats.prefill_ms / 1000.0));
     eprintln!("[xenon] decoded {} tokens in {:.1} ms ({:.1} tok/s, prefill excluded)",
-             decoded_steps, decode_ms,
-             decoded_steps as f64 / (decode_ms / 1000.0));
+             stats.decode_ms.len(), decode_total_ms,
+             stats.decode_ms.len() as f64 / (decode_total_ms / 1000.0));
     Ok(())
 }
 

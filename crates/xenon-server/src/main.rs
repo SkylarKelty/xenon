@@ -318,6 +318,185 @@ fn chat_stream_response(
     Sse::new(base.chain(done)).keep_alive(KeepAlive::default())
 }
 
+// ---- Legacy /v1/completions ----
+
+#[derive(Deserialize)]
+struct CompletionRequest {
+    #[allow(dead_code)]
+    model: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct CompletionChoice {
+    index: usize,
+    text: String,
+    finish_reason: String,
+}
+
+#[derive(Serialize)]
+struct CompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChoice>,
+    usage: UsageStats,
+}
+
+#[derive(Serialize)]
+struct CompletionStreamChoice {
+    index: usize,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CompletionStreamChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionStreamChoice>,
+}
+
+async fn post_completions(
+    State(st): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let _ = (req.temperature, req.top_p);
+    let max_new = req.max_tokens.unwrap_or(128);
+    let want_stream = req.stream.unwrap_or(false);
+
+    let prompt_ids = {
+        let eng = st.engine.lock().await;
+        // Raw text, no chat wrapping — caller controls the full prompt.
+        eng.tokenize(&req.prompt, /*add_specials*/ true)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokenize: {e}")))?
+    };
+    if prompt_ids.len() + max_new > st.max_len {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("prompt ({}) + max_new ({}) exceeds max_len ({})",
+                    prompt_ids.len(), max_new, st.max_len)));
+    }
+
+    if want_stream {
+        Ok(completion_stream_response(st, prompt_ids, max_new).into_response())
+    } else {
+        Ok(completion_full_response(st, prompt_ids, max_new).await?.into_response())
+    }
+}
+
+async fn completion_full_response(
+    st: AppState,
+    prompt_ids: Vec<u32>,
+    max_new: usize,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let engine = st.engine.clone();
+    let model_id = st.model_id.clone();
+    let prompt_len = prompt_ids.len();
+    let (text, completion_tokens) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, usize)> {
+        let mut eng = engine.blocking_lock();
+        let mut out_ids: Vec<u32> = Vec::with_capacity(max_new);
+        let _stats = eng.generate(&prompt_ids, max_new, GEMMA4_EOS, |tok| {
+            out_ids.push(tok);
+            true
+        })?;
+        let decode_ids: Vec<u32> = out_ids.iter().copied()
+            .filter(|id| !GEMMA4_EOS.contains(id)).collect();
+        let text = eng.decode(&decode_ids, true)?;
+        Ok((text, out_ids.len()))
+    }).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("generate: {e}")))?;
+
+    Ok(JsonResponse(CompletionResponse {
+        id: format!("cmpl-{}", now_epoch()),
+        object: "text_completion",
+        created: now_epoch(),
+        model: model_id,
+        choices: vec![CompletionChoice { index: 0, text, finish_reason: "stop".into() }],
+        usage: UsageStats {
+            prompt_tokens: prompt_len,
+            completion_tokens,
+            total_tokens: prompt_len + completion_tokens,
+        },
+    }))
+}
+
+fn completion_stream_response(
+    st: AppState,
+    prompt_ids: Vec<u32>,
+    max_new: usize,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<CompletionStreamChunk>(64);
+    let engine = st.engine.clone();
+    let model_id = st.model_id.clone();
+    let id = format!("cmpl-{}", now_epoch());
+
+    let id_send = id.clone();
+    let model_send = model_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut eng = engine.blocking_lock();
+        let tok_dec = eng.tokenizer.clone();
+
+        let mut generated: Vec<u32> = Vec::new();
+        let mut prev_decoded = String::new();
+        let _ = eng.generate(&prompt_ids, max_new, GEMMA4_EOS, |tok| {
+            if GEMMA4_EOS.contains(&tok) && !generated.is_empty() {
+                return true;
+            }
+            generated.push(tok);
+            if let Ok(s) = tok_clone_decode(&tok_dec, &generated, true) {
+                if s.len() >= prev_decoded.len() && s.starts_with(prev_decoded.as_str()) {
+                    let piece = s[prev_decoded.len()..].to_string();
+                    if !piece.is_empty() {
+                        let chunk = CompletionStreamChunk {
+                            id: id_send.clone(),
+                            object: "text_completion.chunk",
+                            created: now_epoch(),
+                            model: model_send.clone(),
+                            choices: vec![CompletionStreamChoice {
+                                index: 0, text: piece, finish_reason: None,
+                            }],
+                        };
+                        if tx.blocking_send(chunk).is_err() {
+                            return false;
+                        }
+                    }
+                    prev_decoded = s;
+                }
+            }
+            true
+        });
+        let _ = tx.blocking_send(CompletionStreamChunk {
+            id: id_send,
+            object: "text_completion.chunk",
+            created: now_epoch(),
+            model: model_send,
+            choices: vec![CompletionStreamChoice {
+                index: 0, text: String::new(), finish_reason: Some("stop".into()),
+            }],
+        });
+    });
+
+    let base = ReceiverStream::new(rx)
+        .map(|chunk| Ok::<_, std::convert::Infallible>(
+            Event::default().data(serde_json::to_string(&chunk).unwrap())
+        ));
+    let done = futures::stream::once(async { Ok(Event::default().data("[DONE]")) });
+    Sse::new(base.chain(done)).keep_alive(KeepAlive::default())
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -354,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/v1/models", get(get_models))
         .route("/v1/chat/completions", post(post_chat_completions))
+        .route("/v1/completions", post(post_completions))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
