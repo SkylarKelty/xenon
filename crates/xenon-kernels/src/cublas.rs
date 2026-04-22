@@ -43,18 +43,25 @@ struct MatmulHeuristicResult {
 // cudaDataType enum values (from library_types.h).
 const CUDA_R_16BF: i32 = 14;
 const CUDA_R_32F:  i32 = 0;
+const CUDA_R_4F_E2M1: i32 = 33;
 
 // cublasComputeType_t values (from cublas_api.h).
 const CUBLAS_COMPUTE_32F: i32 = 68;
 
 // cublasOperation_t values.
 const CUBLAS_OP_N: i32 = 0;
-#[allow(dead_code)] // wanted once we do transposed / FP4 operand GEMMs.
 const CUBLAS_OP_T: i32 = 1;
 
 // cublasLtMatmulDescAttributes_t.
 const CUBLASLT_MATMUL_DESC_TRANSA: u32 = 3;
 const CUBLASLT_MATMUL_DESC_TRANSB: u32 = 4;
+const CUBLASLT_MATMUL_DESC_A_SCALE_POINTER: u32 = 17;
+const CUBLASLT_MATMUL_DESC_B_SCALE_POINTER: u32 = 18;
+const CUBLASLT_MATMUL_DESC_A_SCALE_MODE: u32 = 31;
+const CUBLASLT_MATMUL_DESC_B_SCALE_MODE: u32 = 32;
+
+// cublasLtMatmulMatrixScale_t.
+const CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3: i32 = 1;
 
 // cublasLtMatmulPreferenceAttributes_t.
 const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES: u32 = 1;
@@ -465,6 +472,146 @@ impl CublasLt {
             )
         })?;
 
+        Ok(())
+    }
+}
+
+impl CublasLt {
+    /// Native NVFP4 × NVFP4 GEMM producing bf16 output:
+    ///   `y[M,N] = alpha * global_scale * x[M,K] @ W^T  + beta * c`
+    ///
+    /// Both operands are in NVFP4 storage (packed FP4 E2M1 + UE4M3 per-16
+    /// block scales). Blackwell tensor cores require BOTH operands to be
+    /// FP4 — mixed FP4×bf16 isn't supported — so activations must be
+    /// pre-quantized via `nvfp4_quantize_bf16` each forward. `global_scale`
+    /// is the per-tensor f32 weight multiplier (from modelopt); it is
+    /// folded into alpha.
+    ///
+    /// `w_packed`: `[N, K/2]` U8. `w_scales`: `[N, K/16]` UE4M3.
+    /// `x_packed`: `[M, K/2]` U8. `x_scales`: `[M, K/16]` UE4M3.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_nvfp4(
+        &mut self,
+        y: &mut DeviceBuffer<bf16>,
+        x_packed: &DeviceBuffer<u8>,
+        x_scales: &DeviceBuffer<u8>,
+        w_packed: &DeviceBuffer<u8>,
+        w_scales: &DeviceBuffer<u8>,
+        global_scale: f32,
+        c: Option<&DeviceBuffer<bf16>>,
+        m: usize, n: usize, k: usize,
+        alpha: f32, beta: f32,
+        stream: Option<&Stream>,
+    ) -> Result<(), GemmError> {
+        assert!(k % 16 == 0, "NVFP4 requires K divisible by 16");
+        assert_eq!(x_packed.len(), m * (k / 2), "nvfp4: x_packed length");
+        assert_eq!(x_scales.len(), m * (k / 16), "nvfp4: x_scales length");
+        assert_eq!(y.len(), m * n, "nvfp4: y length");
+        assert_eq!(w_packed.len(), n * (k / 2), "nvfp4: w_packed length");
+        assert_eq!(w_scales.len(), n * (k / 16), "nvfp4: w_scales length");
+        if let Some(c) = c { assert_eq!(c.len(), m * n); }
+
+        let alpha_effective = alpha * global_scale;
+
+        let mut desc: MatmulDescRaw = std::ptr::null_mut();
+        ck(unsafe { cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) })?;
+        let _g_desc = DescGuard(desc);
+
+        // opA = T (same trick as linear_bf16: W stored row-major [N, K] is
+        // col-major [K, N] ld=K; opA=T flips it for the col-major-output GEMM).
+        // opB = N.
+        let op_t = CUBLAS_OP_T;
+        let op_n = CUBLAS_OP_N;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                &op_t as *const i32 as *const c_void, std::mem::size_of::<i32>())
+        })?;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                &op_n as *const i32 as *const c_void, std::mem::size_of::<i32>())
+        })?;
+        // Both operands carry UE4M3 per-16-element block scales along K.
+        let w_scales_ptr: *const c_void = w_scales.as_device_ptr() as *const c_void;
+        let x_scales_ptr: *const c_void = x_scales.as_device_ptr() as *const c_void;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                &w_scales_ptr as *const _ as *const c_void,
+                std::mem::size_of::<*const c_void>())
+        })?;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                &x_scales_ptr as *const _ as *const c_void,
+                std::mem::size_of::<*const c_void>())
+        })?;
+        let scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                &scale_mode as *const i32 as *const c_void, std::mem::size_of::<i32>())
+        })?;
+        ck(unsafe {
+            cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                &scale_mode as *const i32 as *const c_void, std::mem::size_of::<i32>())
+        })?;
+
+        // Matrix layouts (col-major semantics; ld in operand-type elements).
+        // A = W [N, K] row-major → col-major [K, N] ld=K (K in FP4 elements).
+        // B = x [M, K] row-major → col-major [K, M] ld=K.
+        // D = y [M, N] row-major → col-major [N, M] ld=N bf16.
+        let mut a_layout: MatrixLayoutRaw = std::ptr::null_mut();
+        let mut b_layout: MatrixLayoutRaw = std::ptr::null_mut();
+        let mut d_layout: MatrixLayoutRaw = std::ptr::null_mut();
+        ck(unsafe { cublasLtMatrixLayoutCreate(&mut a_layout, CUDA_R_4F_E2M1, k as u64, n as u64, k as i64) })?;
+        let _g_a = LayoutGuard(a_layout);
+        ck(unsafe { cublasLtMatrixLayoutCreate(&mut b_layout, CUDA_R_4F_E2M1, k as u64, m as u64, k as i64) })?;
+        let _g_b = LayoutGuard(b_layout);
+        ck(unsafe { cublasLtMatrixLayoutCreate(&mut d_layout, CUDA_R_16BF, n as u64, m as u64, n as i64) })?;
+        let _g_d = LayoutGuard(d_layout);
+
+        // No algo caching yet: NVFP4 key space is separate; add if needed.
+        let mut pref: MatmulPreferenceRaw = std::ptr::null_mut();
+        ck(unsafe { cublasLtMatmulPreferenceCreate(&mut pref) })?;
+        let _g_pref = PrefGuard(pref);
+        let ws_bytes: u64 = self.workspace.bytes() as u64;
+        ck(unsafe {
+            cublasLtMatmulPreferenceSetAttribute(pref,
+                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const u64 as *const c_void, std::mem::size_of::<u64>())
+        })?;
+
+        let mut heur = MatmulHeuristicResult {
+            algo: MatmulAlgo { data: [0; 8] },
+            workspace_size: 0, state: 0, waves_count: 0.0, _reserved: [0; 4],
+        };
+        let mut returned: i32 = 0;
+        ck(unsafe {
+            cublasLtMatmulAlgoGetHeuristic(
+                self.handle, desc,
+                a_layout, b_layout, d_layout, d_layout,
+                pref, 1, &mut heur, &mut returned,
+            )
+        })?;
+        if returned == 0 { return Err(GemmError::NoAlgorithm); }
+
+        let c_ptr: *const c_void = match c {
+            Some(c) => c.as_device_ptr() as *const c_void,
+            None => y.as_device_ptr() as *const c_void,
+        };
+        let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+
+        ck(unsafe {
+            cublasLtMatmul(
+                self.handle, desc,
+                &alpha_effective as *const f32 as *const c_void,
+                w_packed.as_device_ptr() as *const c_void, a_layout,
+                x_packed.as_device_ptr() as *const c_void, b_layout,
+                &beta as *const f32 as *const c_void,
+                c_ptr, d_layout,
+                y.as_device_ptr(), d_layout,
+                &heur.algo as *const MatmulAlgo,
+                self.workspace.as_device_ptr(), self.workspace.bytes(),
+                stream_ptr,
+            )
+        })?;
         Ok(())
     }
 }

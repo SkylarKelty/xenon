@@ -115,6 +115,14 @@ unsafe extern "C" {
         cap: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_nvfp4_quantize_bf16(
+        packed: *mut c_void,
+        scales: *mut c_void,
+        input: *const c_void,
+        rows: i32,
+        cols: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn xk_attn_flash_bf16(
         out: *mut c_void,
         q: *const c_void,
@@ -605,6 +613,41 @@ pub fn per_layer_slice_bf16(
             num_layers as i32,
             per_layer_dim as i32,
             layer_idx as i32,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Block-scaled bf16 → NVFP4 quantization for activations.
+///
+/// Input: bf16 `[rows, cols]`. Output: packed FP4 `[rows, cols/2]` u8 and
+/// UE4M3 block scales `[rows, cols/16]` u8. `cols` must be a multiple of 16.
+///
+/// Per 16-element block along the inner dim: max_abs → UE4M3 scale (= max/6),
+/// elements quantized to nearest E2M1 via that scale. Output matches the
+/// storage format of our weight tensors, so the cuBLASLt NVFP4 GEMM sees
+/// both operands in the same VEC16_UE4M3 layout.
+pub fn nvfp4_quantize_bf16(
+    packed: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<u8>,
+    input: &DeviceBuffer<bf16>,
+    rows: usize,
+    cols: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(packed.len(), rows * (cols / 2), "quant: packed length");
+    assert_eq!(scales.len(), rows * (cols / 16), "quant: scales length");
+    assert_eq!(input.len(), rows * cols, "quant: input length");
+    assert!(cols % 16 == 0);
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_nvfp4_quantize_bf16(
+            packed.as_device_ptr(),
+            scales.as_device_ptr(),
+            input.as_device_ptr(),
+            rows as i32,
+            cols as i32,
             stream_ptr,
         )
     };

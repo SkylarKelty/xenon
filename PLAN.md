@@ -246,6 +246,23 @@ The dominant remaining cost is MLP FP4→bf16 dequant bandwidth per layer
 per step (~40 ms across the 42 layers). Only native FP4 GEMM fixes
 that — deferred to the open-questions / future-phase bucket.
 
+### Phase 4.1 — native NVFP4 GEMM (experimental) [~]
+- [x] `CublasLt::linear_nvfp4`: FP4×FP4 GEMM, bf16 output, fp32 accumulate.
+      Both operands use `CUDA_R_4F_E2M1` + `VEC16_UE4M3` per-block scales.
+      Per-tensor weight global_scale folded into alpha.
+- [x] `nvfp4_quantize_bf16` kernel: bf16 → packed FP4 + UE4M3 block scales.
+      Round-trip rel ~13% on random bf16 in [-3, 3] (expected for FP4).
+- [x] `test-nvfp4-roundtrip` and `test-nvfp4-linear` CLI tests.
+- [ ] **Integration blocked by tensor-core M-threshold.** On this box
+      (sm_120a / Blackwell), NVFP4 GEMM silently returns garbage at
+      M < ~128 — minimum tile size for FP4 WGMMA. cuBLASLt does not
+      error, which is dangerous.
+      - At M=1 (decode) and M=4..32 (typical prefill for a short prompt),
+        native NVFP4 is unusable.
+      - Only starts giving reasonable answers at M ≥ 128.
+      - Kept as a future-ready primitive for batched serving (phase 5+)
+        and long-prefill paths, NOT wired into `layer_forward`.
+
 ### Phase 5 — server + OpenAI API [ ]
 - [ ] `POST /v1/chat/completions` with Gemma chat template
 - [ ] SSE streaming
@@ -258,6 +275,9 @@ that — deferred to the open-questions / future-phase bucket.
       decode steps, not a one-shot CLI. Prereqs land here too —
       persistent scratch pool, raw-pointer kernel variants, decode via
       flash-attn (fixed shmem).
+- [ ] **Dispatch NVFP4 GEMM for large-M paths.** With concurrent-request
+      batching (prefill M ≥ 128), the NVFP4 primitive (phase 4.1) becomes
+      viable for MLP GEMMs. Keep the bf16 fallback for small-M.
 
 ### Phase 6 — polish + bench [ ]
 - [ ] Nsight Compute profile passes, fix obvious tuning wins

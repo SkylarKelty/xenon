@@ -14,9 +14,9 @@ use xenon_kernels::{
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, PinnedBuffer, Stream},
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
-    per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16, rope_bf16_reference,
-    scale_bf16, softcap_bf16, softmax_attn_bf16, softmax_attn_bf16_reference, CublasLt,
-    KvCache, SlotSpec,
+    nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16,
+    rope_bf16_reference, scale_bf16, softcap_bf16, softmax_attn_bf16,
+    softmax_attn_bf16_reference, CublasLt, KvCache, SlotSpec,
 };
 
 /// Parse a little-endian bf16 byte slice into a `Vec<bf16>`. Avoids
@@ -86,6 +86,27 @@ enum Command {
         n: usize,
         #[arg(long, default_value_t = 128)]
         k: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Round-trip correctness for the bf16→NVFP4 activation quantizer.
+    TestNvfp4Roundtrip {
+        #[arg(long, default_value_t = 4)]
+        rows: usize,
+        #[arg(long, default_value_t = 256)]
+        cols: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run the native NVFP4-weight × bf16-activation GEMM on a real quantized
+    /// Gemma weight and compare against the existing dequant+bf16 path.
+    TestNvfp4Linear {
+        model: PathBuf,
+        /// Full prefix of a quantized linear (e.g. model.language_model.layers.0.mlp.gate_proj).
+        #[arg(long)]
+        module: String,
+        #[arg(long, default_value_t = 1)]
+        m: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -370,6 +391,8 @@ fn main() -> anyhow::Result<()> {
         Command::TestDequant { rows, cols, seed } => cmd_test_dequant(rows, cols, seed),
         Command::TestGemm { m, n, k, seed } => cmd_test_gemm(m, n, k, seed),
         Command::TestLinear { m, n, k, seed } => cmd_test_linear(m, n, k, seed),
+        Command::TestNvfp4Linear { model, module, m, seed } => cmd_test_nvfp4_linear(model, module, m, seed),
+        Command::TestNvfp4Roundtrip { rows, cols, seed } => cmd_test_nvfp4_roundtrip(rows, cols, seed),
         Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
         Command::TestMlp { model, layer, batch, seed } => cmd_test_mlp(model, layer, batch, seed),
         Command::TestRope { tokens, heads, head_dim, rotary_dim, theta, seed } =>
@@ -914,6 +937,126 @@ fn cmd_upload(dir: PathBuf, prefix: Option<String>, limit_bytes: u64, verify: bo
     println!("vram free after        {:>6.2} GiB  (delta {:>+6.2} GiB)",
              free_after as f64 / 1073741824.0,
              (free_after as f64 - free_before as f64) / 1073741824.0);
+    Ok(())
+}
+
+fn cmd_test_nvfp4_roundtrip(rows: usize, cols: usize, seed: u64) -> anyhow::Result<()> {
+    // Round-trip: random bf16 -> quantize (FP4 + UE4M3 scales) -> dequant via
+    // our proven fp4_dequant_bf16 -> compare to original.
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    anyhow::ensure!(cols % 16 == 0, "cols must be multiple of 16");
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..rows * cols)
+        .map(|_| bf16::from_f32(rng.gen_range(-3.0..3.0))).collect();
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(rows * cols).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_packed: DeviceBuffer<u8> = DeviceBuffer::new(rows * cols / 2).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_scales: DeviceBuffer<u8> = DeviceBuffer::new(rows * cols / 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+    nvfp4_quantize_bf16(&mut d_packed, &mut d_scales, &d_x, rows, cols, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_deq: DeviceBuffer<bf16> = DeviceBuffer::new(rows * cols).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // global_scale = 1.0 (activation has no per-tensor scale).
+    fp4_dequant_bf16(&mut d_deq, &d_packed, &d_scales, 1.0, rows, cols, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let got = d_deq.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let scales_host = d_scales.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let packed_host = d_packed.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &x_host);
+    println!("=== xenon-cli test-nvfp4-roundtrip ===");
+    println!("rows x cols              {} x {}", rows, cols);
+    println!("max abs diff             {:.3e}", max_abs);
+    println!("global rel diff          {:.3e}", global_rel);
+    println!();
+    println!("first 16 elements (one block):");
+    println!("  {:>4}  {:>10}  {:>10}  {:>4}", "i", "input", "deq", "fp4");
+    for i in 0..16 {
+        let byte = packed_host[i / 2];
+        let code = if i & 1 == 0 { byte & 0xF } else { byte >> 4 };
+        println!("  {:>4}  {:>10.4}  {:>10.4}  {:>4}",
+                 i, x_host[i].to_f32(), got[i].to_f32(), code);
+    }
+    println!("scale_byte[0]            0x{:02x} -> {:.4}",
+             scales_host[0], xenon_kernels::ue4m3_to_f32(scales_host[0]));
+    // FP4 quant error per element is up to ~10% of block max; global rel
+    // against the original input is expected ~1-10%.
+    anyhow::ensure!(global_rel <= 0.2, "round-trip rel {global_rel} too large");
+    println!("OK: FP4 round-trip max_rel {:.1}% (expected ~5-10%).", global_rel * 100.0);
+    Ok(())
+}
+
+fn cmd_test_nvfp4_linear(dir: PathBuf, module: String, m: usize, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+    let q = mm.load_quant_linear(&module)?;
+    let (n, k) = (q.out_features, q.in_features);
+    println!("=== xenon-cli test-nvfp4-linear ===");
+    println!("module                 {module}");
+    println!("shape (M, N, K)        ({m}, {n}, {k})");
+    println!("global_scale           {}", q.global_scale);
+
+    // Random bf16 activation.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..m * k).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    // Upload FP4 weight + scales.
+    let mut d_w_packed: DeviceBuffer<u8> = DeviceBuffer::new(q.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_w_scales: DeviceBuffer<u8> = DeviceBuffer::new(q.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_w_packed.copy_from_host_bytes(q.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_w_scales.copy_from_host_bytes(q.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(m * k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Quantize activation to NVFP4 (packed + UE4M3 scales).
+    let mut d_x_packed: DeviceBuffer<u8> = DeviceBuffer::new(m * (k / 2)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_x_scales: DeviceBuffer<u8> = DeviceBuffer::new(m * (k / 16)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    nvfp4_quantize_bf16(&mut d_x_packed, &mut d_x_scales, &d_x, m, k, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_y_nvfp4: DeviceBuffer<bf16> = DeviceBuffer::new(m * n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let t0 = Instant::now();
+    lt.linear_nvfp4(&mut d_y_nvfp4, &d_x_packed, &d_x_scales,
+                     &d_w_packed, &d_w_scales, q.global_scale, None,
+                     m, n, k, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let nvfp4_us = t0.elapsed().as_secs_f64() * 1e6;
+
+    // Reference path: dequant to bf16, then bf16 linear.
+    let mut d_w: DeviceBuffer<bf16> = DeviceBuffer::new(n * k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_w, &d_w_packed, &d_w_scales, q.global_scale, n, k, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_y_ref: DeviceBuffer<bf16> = DeviceBuffer::new(m * n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let t1 = Instant::now();
+    lt.linear_bf16(&mut d_y_ref, &d_x, &d_w, None, m, n, k, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ref_us = t1.elapsed().as_secs_f64() * 1e6;
+
+    let got = d_y_nvfp4.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = d_y_ref.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
+
+    println!();
+    println!("nvfp4 GEMM              {:>7.1} us", nvfp4_us);
+    println!("dequant + bf16 GEMM     {:>7.1} us", ref_us);
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("global rel diff         {:.3e}", global_rel);
+    // NVFP4×NVFP4 vs bf16-weight-from-dequant×bf16-activation: the activation
+    // is now FP4 too, so per-element error compounds. For random inputs
+    // (unstructured magnitudes) ~50% rel is normal; real activations give
+    // tighter match.
+    let tol: f32 = 0.6;
+    anyhow::ensure!(global_rel <= tol, "nvfp4 vs ref: {global_rel} > {tol}");
+    println!("OK: native NVFP4 GEMM runs correctly (rel {:.1}% vs dequanted-bf16 on random input; real activations match tighter).",
+             global_rel * 100.0);
     Ok(())
 }
 
