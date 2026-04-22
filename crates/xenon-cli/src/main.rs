@@ -255,6 +255,21 @@ enum Command {
         #[arg(long, default_value = "2,108,107,1")]
         ids: String,
     },
+    /// Run N copies of a prompt in a single batched generate call.
+    /// Reports per-request decode ms + total tok/s (summed) vs wall time.
+    BenchBatch {
+        model: PathBuf,
+        #[arg(long, default_value = "Write a haiku about GPUs.")]
+        prompt: String,
+        #[arg(long)]
+        chat: bool,
+        #[arg(long, default_value_t = 4)]
+        batch: usize,
+        #[arg(long, default_value_t = 20)]
+        max_new: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_len: usize,
+    },
     /// Measure prefill + decode throughput. Runs N warmup iterations then M
     /// measured iterations with a fixed prompt, records per-step timings,
     /// dumps summary + JSON to results/.
@@ -422,6 +437,8 @@ fn main() -> anyhow::Result<()> {
             cmd_generate(model, prompt, max_new, max_len, chat),
         Command::Bench { model, prompt, chat, max_new, max_len, warmup, iters, label } =>
             cmd_bench(model, prompt, chat, max_new, max_len, warmup, iters, label),
+        Command::BenchBatch { model, prompt, chat, batch, max_new, max_len } =>
+            cmd_bench_batch(model, prompt, chat, batch, max_new, max_len),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -2418,6 +2435,65 @@ fn forward_step(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(d_capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?)
+}
+
+fn cmd_bench_batch(
+    model_dir: PathBuf,
+    prompt: String,
+    chat: bool,
+    batch: usize,
+    max_new: usize,
+    max_len: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(batch >= 1, "batch must be >= 1");
+    let t_load = Instant::now();
+    let mut engine = xenon_engine::Engine::load(&model_dir, max_len)?;
+    let load_s = t_load.elapsed().as_secs_f64();
+
+    let text = if chat { xenon_engine::wrap_chat_prompt(&prompt) } else { prompt.clone() };
+    let prompt_ids: Vec<u32> = engine.tokenize(&text, true)?;
+    println!("=== xenon-cli bench-batch ===");
+    println!("loaded in              {:.1} s", load_s);
+    println!("batch / prompt_len     {} / {}", batch, prompt_ids.len());
+    println!("max_new per request    {}", max_new);
+
+    let requests: Vec<xenon_engine::BatchRequest> = (0..batch)
+        .map(|_| xenon_engine::BatchRequest {
+            prompt_ids: prompt_ids.clone(),
+            max_new,
+        }).collect();
+
+    let t0 = Instant::now();
+    let results = engine.generate_batch(requests, xenon_engine::GEMMA4_EOS, |_i, _tok| true)?;
+    let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    let total_tokens: usize = results.iter().map(|r| r.generated.len()).sum();
+    let prefill_total_ms: f64 = results.iter().map(|r| r.prefill_ms).sum();
+    let decode_ms_total: f64 = if !results[0].decode_ms.is_empty() {
+        results[0].decode_ms.iter().sum()
+    } else { 0.0 };
+    let decode_steps = results[0].decode_ms.len();
+    let per_step_mean = if decode_steps > 0 { decode_ms_total / decode_steps as f64 } else { 0.0 };
+
+    println!();
+    println!("prefill  (total serial)  {:>7.1} ms", prefill_total_ms);
+    println!("decode   ({} steps batched) {:>7.1} ms  ({:.2} ms/step)",
+             decode_steps, decode_ms_total, per_step_mean);
+    println!("wall                     {:>7.1} ms", wall_ms);
+    println!();
+    println!("tokens   total           {}", total_tokens);
+    println!("tok/s    aggregate       {:>6.2}  (total tokens / wall)",
+             total_tokens as f64 / (wall_ms / 1000.0));
+    println!("tok/s    per-request     {:>6.2}  (aggregate / batch)",
+             total_tokens as f64 / (wall_ms / 1000.0) / batch as f64);
+    println!("tok/s    decode-only agg {:>6.2}  (tokens in decode phase / decode wall)",
+             (decode_steps * batch) as f64 / (decode_ms_total / 1000.0));
+
+    // Print one request's output as a sanity check.
+    let first_text = engine.decode(&results[0].generated, true)?;
+    println!();
+    println!("request 0 output: {}", first_text);
+    Ok(())
 }
 
 fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usize, chat: bool) -> anyhow::Result<()> {

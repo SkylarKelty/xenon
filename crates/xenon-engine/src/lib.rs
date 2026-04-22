@@ -469,6 +469,315 @@ pub fn forward_step(
     Ok(d_capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?)
 }
 
+// -------------------- Batched forward (multi-request decode) --------------------
+
+/// Per-request state for a batched decode step. One slot per concurrent
+/// request. Each carries its own KV cache (independent storage) and
+/// current absolute position.
+pub struct BatchSlot {
+    pub kv_cache: KvCache,
+    pub cur_pos: i32,
+    pub completed: bool,
+}
+
+impl BatchSlot {
+    pub fn new(mm: &MmapWeights, cfg: &GemmaConfig, max_len: usize) -> anyhow::Result<Self> {
+        Ok(Self { kv_cache: build_kv_cache(mm, cfg, max_len)?, cur_pos: 0, completed: false })
+    }
+}
+
+/// One decode step for N requests at once. All GEMMs run with M=N (batched
+/// over requests naturally); attention loops per request because each slot
+/// has its own K/V buffer.
+///
+/// `new_tokens.len() == slots.len()`. Each `new_tokens[i]` is request `i`'s
+/// newly sampled token, fed in at its own `slots[i].cur_pos`. This call
+/// appends K/V into `slots[i].kv_cache` and bumps `cur_pos` by 1.
+///
+/// Returns `Vec<Vec<bf16>>` of length N, each inner vec is `[vocab]` softcap
+/// logits — caller picks next tokens independently per request.
+pub fn forward_step_batched(
+    mm: &MmapWeights,
+    cfg: &GemmaConfig,
+    shape: ModelShape,
+    layers: &[LayerWeights],
+    top: &TopLevelWeights,
+    slots: &mut [BatchSlot],
+    new_tokens: &[i32],
+    lt: &mut CublasLt,
+    stream: &Stream,
+    stream_lm: &Stream,
+) -> anyhow::Result<Vec<Vec<bf16>>> {
+    let n = slots.len();
+    assert_eq!(new_tokens.len(), n, "new_tokens length must match slots");
+    let tc = &cfg.text_config;
+    let ModelShape { hidden, inter, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
+
+    // Kick off async lm_head H2D.
+    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_lm_head.copy_from_host_bytes_async(top.lm_head_pinned.as_bytes(), stream_lm)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Positions array: one per request row. rope_bf16 already accepts a
+    // positions vector of length `tokens`, one position per row.
+    let positions_host: Vec<i32> = slots.iter().map(|s| s.cur_pos).collect();
+    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_positions.copy_from_host(&positions_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Input embedding: host-gather N rows of embed_tokens, scale, upload.
+    let ie_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens.weight", new_tokens, hidden)?;
+    let embed_scale = (hidden as f32).sqrt();
+    let ie_scaled: Vec<bf16> = ie_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
+    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(n * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host(&ie_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // PLE assembly across the N-row batch.
+    let raw_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens_per_layer.weight", new_tokens, ple_width)?;
+    let raw_scale = (per_layer as f32).sqrt();
+    let raw_scaled: Vec<bf16> = raw_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
+    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_raw.copy_from_host(&raw_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_plmp_w: DeviceBuffer<bf16> = DeviceBuffer::new(ple_width * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    top.per_layer_model_projection.dequant_to(&mut d_plmp_w, stream)?;
+    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_ctx, &d_h, &d_plmp_w, None,
+                    n, ple_width, hidden, (hidden as f32).powf(-0.5), 0.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_ctx_normed, &d_ctx, Some(&top.per_layer_projection_norm),
+                  n * n_layers, per_layer, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(&mut d_combined, &d_ctx_normed, &d_raw, (0.5f32).sqrt(), Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(d_plmp_w); drop(d_raw); drop(d_ctx); drop(d_ctx_normed);
+
+    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new(n * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for layer_idx in 0..n_layers {
+        per_layer_slice_bf16(&mut d_ple_layer, &d_combined,
+                              n, n_layers, per_layer, layer_idx, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer_idx);
+        let d_layer = cfg.head_dim_for_layer(layer_idx);
+        let window = match tc.layer_types[layer_idx] {
+            LayerKind::SlidingAttention => tc.sliding_window.unwrap_or(0) as i32,
+            LayerKind::FullAttention => 0,
+        };
+        layer_forward_batched(&layers[layer_idx], BatchedLayerMeta {
+            layer_idx,
+            n, hidden, inter, h_heads, h_kv,
+            head_dim: d_layer, per_layer, eps, window, rope_theta, rotary_dim,
+            owns_kv: mm.layer_owns_kv(layer_idx),
+        }, &mut d_h, &d_ple_layer, &d_positions, slots, lt, stream)?;
+    }
+
+    // Bump cur_pos AND advance each slot's KV cache. Missing the advance
+    // would leave cur_len at 0 and every subsequent append() would rewrite
+    // the same physical slot, which silently corrupts generation.
+    for s in slots.iter_mut() {
+        s.cur_pos += 1;
+        s.kv_cache.advance(1);
+    }
+
+    // Final norm + lm_head + softcap for all N rows.
+    let mut d_normed_all: DeviceBuffer<bf16> = DeviceBuffer::new(n * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_normed_all, &d_h, Some(&top.norm), n, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream_lm.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(n * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_logits, &d_normed_all, &d_lm_head, None,
+                    n, vocab, hidden, 1.0, 0.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(n * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    softcap_bf16(&mut d_capped, &d_logits, softcap, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let all = d_capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Split [N, vocab] into N per-request rows.
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(all[i * vocab .. (i + 1) * vocab].to_vec());
+    }
+    Ok(out)
+}
+
+/// Per-call meta for batched layer_forward.
+#[derive(Clone, Copy)]
+struct BatchedLayerMeta {
+    layer_idx: usize,
+    n: usize,
+    hidden: usize,
+    inter: usize,
+    h_heads: usize,
+    h_kv: usize,
+    head_dim: usize,
+    per_layer: usize,
+    eps: f32,
+    window: i32,
+    rope_theta: f32,
+    rotary_dim: usize,
+    owns_kv: bool,
+}
+
+fn layer_forward_batched(
+    lw: &LayerWeights,
+    meta: BatchedLayerMeta,
+    h: &mut DeviceBuffer<bf16>,
+    ple_layer: &DeviceBuffer<bf16>,
+    positions: &DeviceBuffer<i32>,
+    slots: &mut [BatchSlot],
+    lt: &mut CublasLt,
+    stream: &Stream,
+) -> anyhow::Result<()> {
+    let BatchedLayerMeta {
+        layer_idx, n, hidden, inter, h_heads, h_kv, head_dim: d, per_layer,
+        eps, window, rope_theta, rotary_dim, owns_kv,
+    } = meta;
+
+    let mut d_residual: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_normed:   DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_tmp:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let dequant = |ql: &QuantLinearDev| -> anyhow::Result<DeviceBuffer<bf16>> {
+        let mut out: DeviceBuffer<bf16> = DeviceBuffer::new_async(ql.out_features * ql.in_features, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        ql.dequant_to(&mut out, stream)?;
+        Ok(out)
+    };
+
+    // Attention block.
+    d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), n, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let qw = dequant(&lw.q_proj)?;
+        lt.linear_bf16(&mut d_q, &d_normed, &qw, None, n, h_heads * d, hidden, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    {
+        let q_tmp = clone_buffer_async(&d_q, stream)?;
+        rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), n * h_heads, d, eps, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    rope_bf16(&mut d_q, positions, n, h_heads, d, rotary_dim, rope_theta, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if owns_kv {
+        let kl = lw.k_proj.as_ref().expect("owner layer missing k_proj");
+        let vl = lw.v_proj.as_ref().expect("owner layer missing v_proj");
+        let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
+        let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        {
+            let kw = dequant(kl)?;
+            lt.linear_bf16(&mut d_k, &d_normed, &kw, None, n, h_kv * d, hidden, 1.0, 0.0, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        {
+            let vw = dequant(vl)?;
+            lt.linear_bf16(&mut d_v, &d_normed, &vw, None, n, h_kv * d, hidden, 1.0, 0.0, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        {
+            let k_tmp = clone_buffer_async(&d_k, stream)?;
+            rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), n * h_kv, d, eps, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let v_tmp = clone_buffer_async(&d_v, stream)?;
+            rmsnorm_bf16(&mut d_v, &v_tmp, None, n * h_kv, d, eps, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        rope_bf16(&mut d_k, positions, n, h_kv, d, rotary_dim, rope_theta, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Scatter each row into its slot's KV cache.
+        let row_kv = h_kv * d;
+        for i in 0..n {
+            let mut d_k_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_kv, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut d_v_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_kv, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d_k_row.copy_region_from_device(0, &d_k, i * row_kv, row_kv).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d_v_row.copy_region_from_device(0, &d_v, i * row_kv, row_kv).map_err(|e| anyhow::anyhow!("{e}"))?;
+            slots[i].kv_cache.append(layer_idx, &d_k_row, &d_v_row, 1)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
+
+    // Per-request attention (kv_len varies per slot, so we loop). GEMMs
+    // elsewhere remain batched at M=N.
+    let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row_q = h_heads * d;
+    for i in 0..n {
+        // At this point we've appended 1 token but not advanced cur_len yet.
+        // The newly-written token lives at offset cur_len (which is
+        // slots[i].cur_pos). Attention should see kv_len = cur_pos + 1 so
+        // the new token is included.
+        let t_kv_i = slots[i].cur_pos as usize + 1;
+        let q_pos_i = slots[i].cur_pos;
+        let mut d_q_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_q, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_out_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_q, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        d_q_row.copy_region_from_device(0, &d_q, i * row_q, row_q).map_err(|e| anyhow::anyhow!("{e}"))?;
+        attn_naive_bf16(&mut d_out_row, &d_q_row,
+                         slots[i].kv_cache.k_buf(layer_idx),
+                         slots[i].kv_cache.v_buf(layer_idx),
+                         1, t_kv_i, h_heads, h_kv, d, 1.0, q_pos_i, window, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Scatter result back into d_attn_out[i].
+        d_attn_out.copy_slice_from_device(i * row_q, &d_out_row).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let ow = dequant(&lw.o_proj)?;
+        lt.linear_bf16(&mut d_attn_hidden, &d_attn_out, &ow, None,
+                        n, hidden, h_heads * d, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    rmsnorm_bf16(&mut d_tmp, &d_attn_hidden, Some(&lw.post_attention_layernorm),
+                  n, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // MLP block — all batched at M=N.
+    d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_normed, h, Some(&lw.pre_feedforward_layernorm),
+                  n, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    { let gw = dequant(&lw.gate_proj)?; lt.linear_bf16(&mut d_gate_out, &d_normed, &gw, None, n, inter, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    { let uw = dequant(&lw.up_proj)?;   lt.linear_bf16(&mut d_up_out,   &d_normed, &uw, None, n, inter, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    { let dw = dequant(&lw.down_proj)?; lt.linear_bf16(&mut d_mlp_out,  &d_act,    &dw, None, n, hidden, inter, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    rmsnorm_bf16(&mut d_tmp, &d_mlp_out, Some(&lw.post_feedforward_layernorm), n, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // PLE block — batched.
+    d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_glu:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_proj_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    { let plg = dequant(&lw.per_layer_input_gate)?; lt.linear_bf16(&mut d_ple_gate_out, h, &plg, None, n, per_layer, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    gelu_tanh_glu_bf16(&mut d_ple_glu, &d_ple_gate_out, ple_layer, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    { let plp = dequant(&lw.per_layer_projection)?; lt.linear_bf16(&mut d_ple_proj_out, &d_ple_glu, &plp, None, n, hidden, per_layer, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    rmsnorm_bf16(&mut d_tmp, &d_ple_proj_out, Some(&lw.post_per_layer_input_norm), n, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // layer_scalar tail multiply (applies to all N rows equally).
+    let h_in = clone_buffer_async(h, stream)?;
+    scale_bf16(h, &h_in, lw.layer_scalar, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
 pub fn argmax_bf16(row: &[bf16]) -> i32 {
     let mut best_i = 0;
     let mut best_v = row[0].to_f32();
@@ -511,6 +820,19 @@ pub fn wrap_chat_prompt(prompt: &str) -> String {
 pub struct GenerateStats {
     pub prompt_len: usize,
     pub generated: usize,
+    pub prefill_ms: f64,
+    pub decode_ms: Vec<f64>,
+}
+
+/// One logical request inside a batched generate call.
+pub struct BatchRequest {
+    pub prompt_ids: Vec<u32>,
+    pub max_new: usize,
+}
+
+#[derive(Default, Clone)]
+pub struct BatchGenResult {
+    pub generated: Vec<u32>,
     pub prefill_ms: f64,
     pub decode_ms: Vec<f64>,
 }
@@ -637,5 +959,98 @@ impl Engine {
         }
 
         Ok(GenerateStats { prompt_len: prompt_ids.len(), generated, prefill_ms, decode_ms })
+    }
+
+    /// Batched generate for up to N concurrent requests. GEMMs batch at M=N
+    /// so weight bandwidth is amortized across requests; attention loops
+    /// per request internally (each has its own KV cache).
+    ///
+    /// Prefill runs serially per request (v1 simplification — prefill
+    /// batching across different prompt lengths would need ragged-batch
+    /// attention). Decode is batched. Requests that hit EOS or max_new
+    /// early keep their slot in the batch until all complete — wastes
+    /// some compute but keeps the implementation simple.
+    ///
+    /// `on_token(request_idx, token) -> bool` is called for each newly
+    /// sampled token. Return `false` to stop the entire batch.
+    pub fn generate_batch(
+        &mut self,
+        requests: Vec<BatchRequest>,
+        stop_tokens: &[u32],
+        mut on_token: impl FnMut(usize, u32) -> bool,
+    ) -> anyhow::Result<Vec<BatchGenResult>> {
+        use std::time::Instant;
+        let n = requests.len();
+        anyhow::ensure!(n > 0, "generate_batch: empty request list");
+        for (i, r) in requests.iter().enumerate() {
+            anyhow::ensure!(r.prompt_ids.len() + r.max_new <= self.max_len,
+                "request {i}: prompt ({}) + max_new ({}) exceeds max_len ({})",
+                r.prompt_ids.len(), r.max_new, self.max_len);
+        }
+
+        // Per-request BatchSlots with independent KV caches.
+        let mut slots: Vec<BatchSlot> = (0..n)
+            .map(|_| BatchSlot::new(&self.mm, &self.cfg, self.max_len))
+            .collect::<anyhow::Result<_>>()?;
+        let mut results: Vec<BatchGenResult> = vec![BatchGenResult::default(); n];
+        let mut last_tokens: Vec<i32> = vec![0; n];
+        let mut done: Vec<bool> = vec![false; n];
+
+        // --- Serial prefill ---
+        for i in 0..n {
+            let prompt_i32: Vec<i32> = requests[i].prompt_ids.iter().map(|&x| x as i32).collect();
+            let q_pos_base = slots[i].cur_pos;
+            let t0 = Instant::now();
+            let logits = forward_step(&self.mm, &self.cfg, self.shape,
+                                       &self.layers, &self.top, &mut slots[i].kv_cache,
+                                       &prompt_i32, q_pos_base,
+                                       &mut self.lt, &self.stream, &self.stream_lm)?;
+            results[i].prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
+            slots[i].cur_pos += requests[i].prompt_ids.len() as i32;
+            let next = argmax_bf16(&logits) as u32;
+            results[i].generated.push(next);
+            last_tokens[i] = next as i32;
+            if !on_token(i, next) { done[i] = true; }
+            // EOS on the prefill-sampled token is not a stop for step 0
+            // (must generate at least one non-EOS token); decode loop
+            // checks at the start of each step.
+        }
+
+        // --- Batched decode ---
+        let max_max_new = requests.iter().map(|r| r.max_new).max().unwrap_or(0);
+        for step in 0..max_max_new {
+            // Check which requests finished since the last step.
+            for i in 0..n {
+                if done[i] { continue; }
+                let gen_len = results[i].generated.len();
+                if gen_len >= requests[i].max_new {
+                    done[i] = true;
+                    continue;
+                }
+                if step > 0 && stop_tokens.contains(results[i].generated.last().unwrap()) {
+                    done[i] = true;
+                }
+            }
+            if done.iter().all(|&d| d) { break; }
+
+            let t_step = Instant::now();
+            let logits_per_req = forward_step_batched(
+                &self.mm, &self.cfg, self.shape,
+                &self.layers, &self.top, &mut slots, &last_tokens,
+                &mut self.lt, &self.stream, &self.stream_lm,
+            )?;
+            let ms = t_step.elapsed().as_secs_f64() * 1e3;
+
+            for i in 0..n {
+                if done[i] { continue; }
+                let next = argmax_bf16(&logits_per_req[i]) as u32;
+                results[i].decode_ms.push(ms);
+                results[i].generated.push(next);
+                last_tokens[i] = next as i32;
+                if !on_token(i, next) { done[i] = true; }
+            }
+        }
+
+        Ok(results)
     }
 }
