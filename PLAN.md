@@ -193,10 +193,15 @@ during serving; phase 4 CUDA Graph capture subsumes this.
 - [x] HF diff tests: embed (4e-3), PLE assembly (8e-3), per-layer forward
       (3e-4 to 1e-2 across all own-KV layers), tail (5e-3), full chain
       (logits global_rel 2.85e-2, top-1/top-5 predictions identical to HF).
-- [ ] Host-offloaded `lm_head` with cudaMemcpyAsync overlap (reclaims
-      1.28 GiB VRAM). Currently uploaded; works but uses ~1.25 GiB.
-- [ ] Host-offloaded per-layer embedding tables — already effectively
-      host-resident; only the gathered rows (~21 KiB/token) touch device.
+- [x] Host-offloaded `lm_head` (tied to embed_tokens): transient 1.25 GiB
+      upload for the GEMM then freed. Saves 1.25 GiB *permanent* VRAM at
+      the cost of ~110 ms H2D+GEMM per call. Async overlap with decoder
+      compute is a phase-4 optimization.
+- [x] Host-offloaded per-layer embedding table — already host-resident
+      via `MmapWeights::gather_rows_bf16`; only ~21 KiB/token touches
+      device per forward.
+- [x] Host-offloaded input embedding: `embed_tokens` rows gathered on
+      host and uploaded as [T, H] instead of the full [V, H] table.
 
 ### Phase 4 — decode + CUDA Graphs [ ]
 - [ ] Single-token decode path (Q=1 over cached K/V)

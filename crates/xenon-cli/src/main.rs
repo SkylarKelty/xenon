@@ -2001,10 +2001,13 @@ fn cmd_test_vs_hf_full(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) ->
     let tokens = ids_host.len();
     let pos_host: Vec<i32> = (0..tokens as i32).collect();
 
+    let (mem_free_start, mem_total) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("=== xenon-cli test-vs-hf-full ===");
     println!("tokens                   {}", tokens);
     println!("hidden / vocab / layers  {} / {} / {}", hidden, vocab, n_layers);
     println!("num_kv_shared            {}", num_kv_shared);
+    println!("vram at start            {:>6.2} / {:>6.2} GiB free",
+             mem_free_start as f64 / 1073741824.0, mem_total as f64 / 1073741824.0);
 
     let mm = MmapWeights::open(&model_dir.join("model.safetensors"))?;
     let hf_mm = MmapWeights::open(&hf_path)?;
@@ -2033,18 +2036,18 @@ fn cmd_test_vs_hf_full(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) ->
     let mut kv = KvCache::new(slot_specs, slot_for_layer, tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // ---- TOP-LEVEL: embed + PLE assembly ----
-    let embed_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
-    let mut d_embed_table: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_embed_table.copy_from_host_bytes(embed_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ids: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_ids.copy_from_host(&ids_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Input embedding is host-offloaded: gather just the T rows we need on
+    // the host and upload [T, H] instead of the full [V, H] table (saves
+    // 1.25 GiB resident VRAM vs. the naive "upload whole table" approach).
+    let embed_scale = (hidden as f32).sqrt();
+    let ie_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens.weight", &ids_host, hidden)?;
+    let ie_scaled: Vec<bf16> = ie_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
     let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
     d_positions.copy_from_host(&pos_host).map_err(|e| anyhow::anyhow!("{e}"))?;
-
     let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    embed_gather_bf16(&mut d_h, &d_embed_table, &d_ids, tokens, vocab, hidden,
-                       (hidden as f32).sqrt(), Some(&stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host(&ie_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // PLE assembly.
     let raw_host = mm.gather_rows_bf16(
@@ -2127,15 +2130,40 @@ fn cmd_test_vs_hf_full(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) ->
     let mut d_final_norm: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_final_norm, &d_h, Some(&d_norm_w), tokens, hidden, eps, Some(&stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // lm_head: tied to embed_tokens, so d_embed_table doubles as weight.
+    // lm_head is host-offloaded: transient 1.25 GiB upload just for this
+    // GEMM, then freed. Saves permanent VRAM at the cost of ~60 ms H2D
+    // per call (can be overlapped with decoder compute in phase 4).
+    let (mem_free_before_lm, _) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let lm_head_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
     let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_logits, &d_final_norm, &d_embed_table, None,
-                    tokens, vocab, hidden, 1.0, 0.0, Some(&stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_logits_capped: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (mem_free_peak, t_lm);
+    {
+        let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+        t_lm = Instant::now();
+        d_lm_head.copy_from_host_bytes(lm_head_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        (mem_free_peak, _) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(&mut d_logits, &d_final_norm, &d_lm_head, None,
+                        tokens, vocab, hidden, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        // d_lm_head drops here, VRAM freed.
+    }
+    let lm_ms = t_lm.elapsed().as_secs_f64() * 1e3;
     softcap_bf16(&mut d_logits_capped, &d_logits, softcap, Some(&stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (mem_free_after_lm, _) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let gib = 1073741824.0f64;
+    println!();
+    println!("-- lm_head (host-offloaded) --");
+    println!("  vram free pre  {:>6.2} GiB", mem_free_before_lm as f64 / gib);
+    println!("  vram free peak {:>6.2} GiB   (transient {:.2} GiB)",
+             mem_free_peak as f64 / gib,
+             (mem_free_before_lm as f64 - mem_free_peak as f64) / gib);
+    println!("  vram free post {:>6.2} GiB", mem_free_after_lm as f64 / gib);
+    println!("  H2D+GEMM       {:.1} ms", lm_ms);
 
     // Diff final logits.
     let hf_post = bytes_to_bf16_vec(hf_mm.load_bf16("logits_post_softcap")?);
