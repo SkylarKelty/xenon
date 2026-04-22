@@ -84,6 +84,14 @@ unsafe extern "C" {
         window: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_add_scale_bf16(
+        out: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        n: i32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn xk_attn_flash_bf16(
         out: *mut c_void,
         q: *const c_void,
@@ -497,6 +505,30 @@ pub fn attn_naive_bf16(
             scale,
             q_pos_base,
             window,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Element-wise `out[i] = (a[i] + b[i]) * scale`, bf16 I/O with fp32 ops.
+pub fn add_scale_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    a: &DeviceBuffer<bf16>,
+    b: &DeviceBuffer<bf16>,
+    scale: f32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(out.len(), a.len(), "add_scale: out/a length");
+    assert_eq!(out.len(), b.len(), "add_scale: out/b length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_add_scale_bf16(
+            out.as_device_ptr(),
+            a.as_device_ptr(),
+            b.as_device_ptr(),
+            out.len() as i32,
+            scale,
             stream_ptr,
         )
     };

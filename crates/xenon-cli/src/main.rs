@@ -10,7 +10,7 @@ use xenon_core::{
     GemmaConfig, LayerKind, Tokenizer,
 };
 use xenon_kernels::{
-    attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
+    add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
@@ -180,6 +180,27 @@ enum Command {
         #[arg(long, default_value_t = true)]
         add_specials: bool,
     },
+    /// Diff our embed_gather output against an HF reference activation dump.
+    /// Runs embed_tokens(ids) * sqrt(hidden) on device and compares to
+    /// HF's `embed_tokens_scaled` tensor captured by tools/hf-ref/capture.py.
+    TestVsHfEmbed {
+        model: PathBuf,
+        #[arg(long)]
+        hf: PathBuf,
+        #[arg(long, default_value = "2,108,107,1")]
+        ids: String,
+    },
+    /// Diff PLE assembly (raw + projected) against HF. Runs the full top-
+    /// level PLE pipeline: embed_tokens_per_layer gather + sqrt(Hl) scale,
+    /// per_layer_model_projection linear + 1/sqrt(H) scale, per-layer
+    /// RMSNorm, combine (ctx + raw) * 1/sqrt(2).
+    TestVsHfPle {
+        model: PathBuf,
+        #[arg(long)]
+        hf: PathBuf,
+        #[arg(long, default_value = "2,108,107,1")]
+        ids: String,
+    },
     /// Run the FlashAttention-2 tiled kernel vs the naive kernel on random
     /// Q/K/V and verify they agree. Exercises the online-softmax path at
     /// T_kv values where the naive kernel would run out of shared memory.
@@ -296,6 +317,8 @@ fn main() -> anyhow::Result<()> {
             cmd_test_tokenizer(model, text, add_specials),
         Command::TestAttnFlash { t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed } =>
             cmd_test_attn_flash(t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed),
+        Command::TestVsHfEmbed { model, hf, ids } => cmd_test_vs_hf_embed(model, hf, ids),
+        Command::TestVsHfPle { model, hf, ids } => cmd_test_vs_hf_ple(model, hf, ids),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -1384,6 +1407,181 @@ struct PrefillAttn {
     scale: f32,
     window: i32,
     kind: LayerKind,
+}
+
+fn cmd_test_vs_hf_embed(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&model_dir.join("config.json"))?;
+    let vocab = cfg.text_config.vocab_size;
+    let hidden = cfg.text_config.hidden_size;
+    let embed_scale = (hidden as f32).sqrt();
+
+    let ids_host: Vec<i32> = ids_csv
+        .split(',')
+        .map(|s| s.trim().parse::<i32>())
+        .collect::<std::result::Result<_, _>>()?;
+    let tokens = ids_host.len();
+
+    println!("=== xenon-cli test-vs-hf-embed ===");
+    println!("ids                      {:?}", ids_host);
+    println!("vocab / hidden / scale   {} / {} / {:.4}", vocab, hidden, embed_scale);
+
+    // Our path.
+    let mm = MmapWeights::open(&model_dir.join("model.safetensors"))?;
+    let table_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+
+    let mut d_table: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ids: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_table.copy_from_host_bytes(table_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_ids.copy_from_host(&ids_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    embed_gather_bf16(&mut d_out, &d_table, &d_ids, tokens, vocab, hidden, embed_scale, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ours = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // HF reference. Saved as bf16 [1, T, H]; we flatten to [T, H].
+    let hf_mm = MmapWeights::open(&hf_path)?;
+    let hf_bytes = hf_mm.load_bf16("embed_tokens_scaled")?;
+    anyhow::ensure!(hf_bytes.len() == tokens * hidden * 2,
+        "HF embed_tokens_scaled has {} bytes; expected {}",
+        hf_bytes.len(), tokens * hidden * 2);
+    let theirs = bytes_to_bf16_vec(hf_bytes);
+
+    let (max_abs, _per, global_rel) = compare_bf16(&ours, &theirs);
+    let mut mismatches = 0usize;
+    for (a, b) in ours.iter().zip(theirs.iter()) {
+        if a.to_bits() != b.to_bits() { mismatches += 1; }
+    }
+
+    println!();
+    println!("our max |.|              {:>8.3}", ours.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max));
+    println!("hf  max |.|              {:>8.3}", theirs.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max));
+    println!("mismatched bf16 elements {} / {}", mismatches, tokens * hidden);
+    println!("max abs diff             {:.3e}", max_abs);
+    println!("global rel diff          {:.3e}", global_rel);
+    // bf16 ULP is ~7.8e-3 relative; allow a few for any summation-order noise.
+    let tol_rel: f32 = 1e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: embed_tokens * sqrt(H) matches HF within {tol_rel:.1e}.");
+    Ok(())
+}
+
+fn cmd_test_vs_hf_ple(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&model_dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    let vocab = tc.vocab_size;
+    let hidden = tc.hidden_size;
+    let per_layer = tc.hidden_size_per_layer_input
+        .ok_or_else(|| anyhow::anyhow!("hidden_size_per_layer_input missing"))?;
+    let n_layers = tc.num_hidden_layers;
+    let ple_width = per_layer * n_layers;
+    let eps = tc.rms_norm_eps as f32;
+
+    let ids_host: Vec<i32> = ids_csv
+        .split(',')
+        .map(|s| s.trim().parse::<i32>())
+        .collect::<std::result::Result<_, _>>()?;
+    let tokens = ids_host.len();
+
+    println!("=== xenon-cli test-vs-hf-ple ===");
+    println!("ids                      {:?}", ids_host);
+    println!("L / Hl / ple_width       {} / {} / {}", n_layers, per_layer, ple_width);
+
+    let mm = MmapWeights::open(&model_dir.join("model.safetensors"))?;
+
+    // ---- per_layer_inputs_raw: host-gather the 5.25 GiB PLE table, scale sqrt(Hl).
+    let raw_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens_per_layer.weight", &ids_host, ple_width)?;
+    let raw_scale = (per_layer as f32).sqrt();
+    let raw_scaled: Vec<bf16> = raw_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
+    // Compare raw_scaled against HF per_layer_inputs_raw.
+    let hf_mm = MmapWeights::open(&hf_path)?;
+    let hf_raw_bytes = hf_mm.load_bf16("per_layer_inputs_raw")?;
+    anyhow::ensure!(hf_raw_bytes.len() == tokens * ple_width * 2,
+        "hf raw length mismatch: {} vs {}", hf_raw_bytes.len(), tokens * ple_width * 2);
+    let hf_raw = bytes_to_bf16_vec(hf_raw_bytes);
+    let (raw_abs, _, raw_rel) = compare_bf16(&raw_scaled, &hf_raw);
+    println!();
+    println!("-- per_layer_inputs_raw (scaled gather) --");
+    println!("  max abs diff           {:.3e}", raw_abs);
+    println!("  global rel diff        {:.3e}", raw_rel);
+    anyhow::ensure!(raw_rel <= 1e-2, "raw gather vs HF: global rel {raw_rel}");
+
+    // ---- per_layer_model_projection linear: need inputs_embeds (scaled) on device.
+    let embed_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+    let mut d_embed_table: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ids: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_inputs_embeds: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_embed_table.copy_from_host_bytes(embed_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_ids.copy_from_host(&ids_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let embed_scale = (hidden as f32).sqrt();
+    embed_gather_bf16(&mut d_inputs_embeds, &d_embed_table, &d_ids, tokens, vocab, hidden, embed_scale, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Dequant per_layer_model_projection (FP4 [ple_width, hidden]) onto device.
+    let plmp = mm.load_quant_linear("model.language_model.per_layer_model_projection")?;
+    anyhow::ensure!(plmp.out_features == ple_width && plmp.in_features == hidden,
+        "plmp shape");
+    let mut d_plmp_w: DeviceBuffer<bf16> = DeviceBuffer::new(ple_width * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_plmp_p: DeviceBuffer<u8> = DeviceBuffer::new(plmp.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_plmp_s: DeviceBuffer<u8> = DeviceBuffer::new(plmp.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_plmp_p.copy_from_host_bytes(plmp.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_plmp_s.copy_from_host_bytes(plmp.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_plmp_w, &d_plmp_p, &d_plmp_s, plmp.global_scale,
+                     plmp.out_features, plmp.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Linear with alpha = 1/sqrt(H) (HF scales the projection before reshape).
+    let proj_scale = (hidden as f32).powf(-0.5);
+    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_ctx, &d_inputs_embeds, &d_plmp_w, None,
+                   tokens, ple_width, hidden, proj_scale, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // RMSNorm with per_layer_projection_norm over the Hl axis for each (t, l).
+    // View ctx as [tokens*L, Hl] rows.
+    let pln_bytes = mm.load_bf16("model.language_model.per_layer_projection_norm.weight")?;
+    anyhow::ensure!(pln_bytes.len() == per_layer * 2, "pln weight size");
+    let mut d_pln: DeviceBuffer<bf16> = DeviceBuffer::new(per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_pln.copy_from_host_bytes(pln_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_ctx_normed, &d_ctx, Some(&d_pln),
+                 tokens * n_layers, per_layer, eps, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Combine: (ctx_normed + raw_scaled) * 1/sqrt(2). Upload raw_scaled first.
+    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_raw.copy_from_host(&raw_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let combine_scale = (0.5f32).sqrt();  // 1/sqrt(2)
+    add_scale_bf16(&mut d_combined, &d_ctx_normed, &d_raw, combine_scale, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let combined = d_combined.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hf_proj_bytes = hf_mm.load_bf16("per_layer_inputs_projected")?;
+    anyhow::ensure!(hf_proj_bytes.len() == tokens * ple_width * 2,
+        "hf projected length mismatch");
+    let hf_proj = bytes_to_bf16_vec(hf_proj_bytes);
+    let (proj_abs, _, proj_rel) = compare_bf16(&combined, &hf_proj);
+    println!();
+    println!("-- per_layer_inputs_projected (full assembly) --");
+    println!("  max abs diff           {:.3e}", proj_abs);
+    println!("  global rel diff        {:.3e}", proj_rel);
+    let tol: f32 = 5e-2;
+    anyhow::ensure!(proj_rel <= tol, "projected vs HF: global rel {proj_rel} > {tol}");
+    println!("OK: full PLE assembly matches HF within {tol:.1e}.");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
