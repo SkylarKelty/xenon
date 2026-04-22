@@ -6,3 +6,4 @@ Cargo.lock.bak
 tools/gpubench/gpubench
 /results/
 /profiles/
+.claude
