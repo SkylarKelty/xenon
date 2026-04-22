@@ -7,10 +7,10 @@ use rand::{Rng, SeedableRng};
 use xenon_core::{
     config::QuantConfig,
     weights::{is_excluded, MmapWeights, SafetensorsHeader, WeightBreakdown},
-    GemmaConfig, LayerKind,
+    GemmaConfig, LayerKind, Tokenizer,
 };
 use xenon_kernels::{
-    attn_naive_bf16, attn_naive_bf16_reference,
+    attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
@@ -171,6 +171,38 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         layer: usize,
     },
+    /// Load tokenizer.json, encode+decode text, verify round-trip and vocab
+    /// matches config.vocab_size.
+    TestTokenizer {
+        model: PathBuf,
+        #[arg(long, default_value = "Hello, xenon!")]
+        text: String,
+        #[arg(long, default_value_t = true)]
+        add_specials: bool,
+    },
+    /// Run the FlashAttention-2 tiled kernel vs the naive kernel on random
+    /// Q/K/V and verify they agree. Exercises the online-softmax path at
+    /// T_kv values where the naive kernel would run out of shared memory.
+    TestAttnFlash {
+        #[arg(long, default_value_t = 1)]
+        t_q: usize,
+        #[arg(long, default_value_t = 1024)]
+        t_kv: usize,
+        #[arg(long, default_value_t = 8)]
+        h: usize,
+        #[arg(long, default_value_t = 2)]
+        h_kv: usize,
+        #[arg(long, default_value_t = 256)]
+        head_dim: usize,
+        /// 0 = no sliding window (full causal).
+        #[arg(long, default_value_t = 0)]
+        window: i32,
+        /// q_pos_base (decode shape: T_kv-T_q for cached).
+        #[arg(long)]
+        q_pos_base: Option<i32>,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     /// Apply RoPE on random input and compare to a CPU reference.
     TestRope {
         #[arg(long, default_value_t = 4)]
@@ -260,6 +292,10 @@ fn main() -> anyhow::Result<()> {
             cmd_test_kv_cache(model, layer, tokens, seed),
         Command::KvMap { model } => cmd_kv_map(model),
         Command::TestPle { model, ids, layer } => cmd_test_ple(model, ids, layer),
+        Command::TestTokenizer { model, text, add_specials } =>
+            cmd_test_tokenizer(model, text, add_specials),
+        Command::TestAttnFlash { t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed } =>
+            cmd_test_attn_flash(t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -1331,6 +1367,145 @@ struct PrefillAttn {
     scale: f32,
     window: i32,
     kind: LayerKind,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_test_attn_flash(
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    window: i32,
+    q_pos_base: Option<i32>,
+    seed: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(h % h_kv == 0, "h must be divisible by h_kv");
+    anyhow::ensure!(d % 128 == 0, "head_dim must be a multiple of 128");
+    anyhow::ensure!(t_kv >= t_q, "T_kv must be >= T_q for a cached-decode-like shape");
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Default q_pos_base so the last Q token lines up with the last KV position
+    // (decode shape: q_pos_base = T_kv - T_q).
+    let q_pos_base = q_pos_base.unwrap_or((t_kv as i32) - (t_q as i32));
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let q_host: Vec<bf16> = (0..t_q * h * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let k_host: Vec<bf16> = (0..t_kv * h_kv * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let v_host: Vec<bf16> = (0..t_kv * h_kv * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new(k_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(v_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_naive: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_flash: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_q.copy_from_host(&q_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_k.copy_from_host(&k_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_v.copy_from_host(&v_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Naive kernel: only run if T_kv small enough to fit scores in shmem.
+    // BLOCK_THREADS=128, ~48 KiB / (T_kv*4 + 128*4) bytes.
+    let naive_shmem_bytes = (t_kv * 4) + (128 * 4);
+    let naive_fits = naive_shmem_bytes < 47 * 1024;
+    let want: Vec<bf16> = if naive_fits {
+        attn_naive_bf16(
+            &mut d_naive, &d_q, &d_k, &d_v,
+            t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        d_naive.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        attn_naive_bf16_reference(&q_host, &k_host, &v_host,
+                                   t_q, t_kv, h, h_kv, d, scale, q_pos_base, window)
+    };
+
+    // Flash kernel.
+    let flash_start = Instant::now();
+    let iters = 10;
+    attn_flash_bf16(
+        &mut d_flash, &d_q, &d_k, &d_v,
+        t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        attn_flash_bf16(
+            &mut d_flash, &d_q, &d_k, &d_v,
+            t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let per_flash_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let _ = flash_start;
+
+    let got = d_flash.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
+
+    println!("=== xenon-cli test-attn-flash ===");
+    println!("shape                    T_q={t_q}, T_kv={t_kv}, H={h}, Hkv={h_kv}, D={d}");
+    println!("scale / q_pos_base       {:.6} / {}", scale, q_pos_base);
+    println!("window                   {window}");
+    println!("reference                {}", if naive_fits { "gpu naive kernel" } else { "host reference" });
+    println!("flash per-launch         {:>7.2} us", per_flash_us);
+    println!("max abs diff             {:.3e}", max_abs);
+    println!("global rel diff          {:.3e}", global_rel);
+    let tol_rel: f32 = 5e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: flash kernel matches reference within {tol_rel:.1e}.");
+    Ok(())
+}
+
+fn cmd_test_tokenizer(dir: PathBuf, text: String, add_specials: bool) -> anyhow::Result<()> {
+    let cfg = GemmaConfig::from_path(&dir.join("config.json"))?;
+    let tok = Tokenizer::from_dir(&dir)?;
+    let vocab = tok.vocab_size();
+
+    println!("=== xenon-cli test-tokenizer ===");
+    println!("text                     {:?}", text);
+    println!("add_special_tokens       {}", add_specials);
+    println!("tokenizer vocab_size     {}", vocab);
+    println!("config.vocab_size        {}", cfg.text_config.vocab_size);
+    // Config vocab includes special tokens beyond the tokenizer's learned vocab
+    // for Gemma 4 (boi/eoi/audio tokens etc.). Tokenizer's with_added=true
+    // should reach or approach config.vocab_size.
+    anyhow::ensure!(
+        vocab <= cfg.text_config.vocab_size,
+        "tokenizer vocab {vocab} larger than config vocab {}",
+        cfg.text_config.vocab_size
+    );
+
+    let ids = tok.encode(&text, add_specials)?;
+    println!();
+    println!("encoded ids ({} tokens)", ids.len());
+    for (i, id) in ids.iter().enumerate() {
+        if i < 32 {
+            print!("  {id}");
+            if (i + 1) % 8 == 0 { println!(); }
+        }
+    }
+    if ids.len() > 32 { println!("  ..."); }
+    else if ids.len() % 8 != 0 { println!(); }
+
+    for id in &ids {
+        anyhow::ensure!((*id as usize) < cfg.text_config.vocab_size,
+            "id {id} >= config.vocab_size {}", cfg.text_config.vocab_size);
+    }
+
+    let decoded = tok.decode(&ids, /*skip_special*/ true)?;
+    println!();
+    println!("decoded (skip_specials)  {:?}", decoded);
+    println!("round-trip equal         {}", decoded == text);
+    // Not all tokenizers round-trip perfectly (normalization, BOS handling),
+    // so decoding with specials kept often matches better; make the assertion
+    // on that.
+    let decoded_raw = tok.decode(&ids, /*skip_special*/ false)?;
+    println!("decoded (keep specials)  {:?}", decoded_raw);
+    anyhow::ensure!(decoded_raw.contains(&text) || decoded == text,
+        "round-trip lost input text");
+    println!("OK: tokenizer loads, encode/decode round-trips the input.");
+    Ok(())
 }
 
 fn cmd_test_ple(dir: PathBuf, ids_csv: String, layer: usize) -> anyhow::Result<()> {

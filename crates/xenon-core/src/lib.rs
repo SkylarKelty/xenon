@@ -6,10 +6,12 @@
 pub mod config;
 pub mod error;
 pub mod model;
+pub mod tokenizer;
 pub mod weights;
 
 pub use config::{GemmaConfig, LayerKind, QuantConfig};
 pub use error::{Error, Result};
+pub use tokenizer::Tokenizer;
 pub use weights::{
     MmapWeights, QuantLinearRef, QuantPair, SafetensorsHeader, TensorInfo, WeightBreakdown,
 };

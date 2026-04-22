@@ -83,6 +83,21 @@ unsafe extern "C" {
         window: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_attn_flash_bf16(
+        out: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        t_q: i32,
+        t_kv: i32,
+        h: i32,
+        h_kv: i32,
+        d: i32,
+        scale: f32,
+        q_pos_base: i32,
+        window: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Runs the hello kernel. Proves the Rust -> nvcc -> CUDA runtime link works.
@@ -468,6 +483,48 @@ pub fn attn_naive_bf16(
             q_pos_base,
             window,
             stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// FlashAttention-2 style tiled attention. Same signature and math as
+/// `attn_naive_bf16`, but uses online softmax so shared memory is O(BR * D)
+/// regardless of T_kv — handles arbitrary context length.
+///
+/// Requires `d % 128 == 0` (the block size is 128).
+#[allow(clippy::too_many_arguments)]
+pub fn attn_flash_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    q: &DeviceBuffer<bf16>,
+    k: &DeviceBuffer<bf16>,
+    v: &DeviceBuffer<bf16>,
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(q.len(), t_q * h * d, "attn_flash: q length");
+    assert_eq!(k.len(), t_kv * h_kv * d, "attn_flash: k length");
+    assert_eq!(v.len(), t_kv * h_kv * d, "attn_flash: v length");
+    assert_eq!(out.len(), t_q * h * d, "attn_flash: out length");
+    assert!(h % h_kv == 0);
+    assert!(d % 128 == 0, "attn_flash: d must be a multiple of 128");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_attn_flash_bf16(
+            out.as_device_ptr(),
+            q.as_device_ptr(),
+            k.as_device_ptr(),
+            v.as_device_ptr(),
+            t_q as i32, t_kv as i32,
+            h as i32, h_kv as i32, d as i32,
+            scale, q_pos_base, window, stream_ptr,
         )
     };
     if code == 0 { Ok(()) } else { Err(CudaError(-code)) }

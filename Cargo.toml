@@ -27,6 +27,7 @@ memmap2 = "0.9"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 rand = "0.8"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
 [profile.release]
 opt-level = 3

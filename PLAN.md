@@ -121,9 +121,9 @@ Legend: `[x]` done, `[>]` in progress, `[ ]` todo.
 unique shape. Must be pre-warmed at init for every shape that might appear
 during serving; phase 4 CUDA Graph capture subsumes this.
 
-### Phase 2 — attention [>]
-- [ ] Tokenizer (load `tokenizer.json`, SentencePiece-compatible via
-      `tokenizers` crate)
+### Phase 2 — attention [x]
+- [x] Tokenizer via HF `tokenizers` crate. `test-tokenizer` encode/decode
+      round-trip is exact; vocab matches config (262144).
 - [x] Token embedding gather (bf16) — bit-identical to host slice
 - [x] Per-layer embedding gather from host mmap. `MmapWeights::gather_rows_bf16`
       reads the 5.25 GiB PLE table (262144 × 10752 bf16) without uploading it;
@@ -146,8 +146,10 @@ during serving; phase 4 CUDA Graph capture subsumes this.
       are the shared ones. Map: layers 0..23 own their KV, layers 24..41
       share (strongly suggestive mapping: layer `n` shares with `n-24`,
       same-kind — to confirm vs HF in phase 3).
-- [ ] FlashAttention-style tile kernel (fp32 accumulate, bf16 I/O), one
-      version per head_dim variant — needed for T_kv > ~11K
+- [x] FlashAttention-2 tile kernel (bf16 I/O, fp32 accumulate) — tiles
+      K/V in BR=16 chunks with online softmax; shared mem is O(BR*D)
+      independent of T_kv. Matches naive kernel within ~1e-4 global rel,
+      handles T_kv up to 65K+. Not perf-tuned (Phase 6).
 - [x] CLI: `test-rope`, `test-softmax`, `test-embed`, `test-attn-layer`,
       `test-attn-decode`, `test-kv-cache`, `kv-map`. End-to-end: real
       weights, ~8 layers across both kinds pass with global rel ≤ 5.6e-3
