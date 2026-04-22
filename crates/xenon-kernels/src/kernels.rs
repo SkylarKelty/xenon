@@ -39,6 +39,50 @@ unsafe extern "C" {
         n: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_rope_bf16(
+        x: *mut c_void,
+        positions: *const c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        theta: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn xk_softmax_attn_bf16(
+        scores: *mut c_void,
+        rows: i32,
+        t_q: i32,
+        t_kv: i32,
+        scale: f32,
+        q_pos_base: i32,
+        window: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn xk_embed_gather_bf16(
+        out: *mut c_void,
+        table: *const c_void,
+        ids: *const c_void,
+        tokens: i32,
+        vocab: i32,
+        hidden: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn xk_attn_naive_bf16(
+        out: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        t_q: i32,
+        t_kv: i32,
+        h: i32,
+        h_kv: i32,
+        d: i32,
+        scale: f32,
+        q_pos_base: i32,
+        window: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Runs the hello kernel. Proves the Rust -> nvcc -> CUDA runtime link works.
@@ -231,4 +275,299 @@ pub fn gelu_tanh_bf16_reference(input: &[bf16]) -> Vec<bf16> {
             bf16::from_f32(0.5 * x * (1.0 + inner.tanh()))
         })
         .collect()
+}
+
+/// RoPE (rotate_half convention) in-place on `[tokens, heads, head_dim]`.
+/// Only the first `rotary_dim` dims rotate (partial-rotary layers pass the
+/// tail through unchanged). `positions` is `[tokens]` of i32.
+pub fn rope_bf16(
+    x: &mut DeviceBuffer<bf16>,
+    positions: &DeviceBuffer<i32>,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(x.len(), tokens * heads * head_dim, "rope: x length");
+    assert_eq!(positions.len(), tokens, "rope: positions length");
+    assert!(rotary_dim <= head_dim, "rope: rotary_dim > head_dim");
+    assert!(rotary_dim % 2 == 0, "rope: rotary_dim must be even");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_rope_bf16(
+            x.as_device_ptr(),
+            positions.as_device_ptr(),
+            tokens as i32,
+            heads as i32,
+            head_dim as i32,
+            rotary_dim as i32,
+            theta,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Host reference for RoPE matching the kernel's math.
+pub fn rope_bf16_reference(
+    x: &[bf16],
+    positions: &[i32],
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f32,
+) -> Vec<bf16> {
+    assert_eq!(x.len(), tokens * heads * head_dim);
+    assert_eq!(positions.len(), tokens);
+    let mut out = x.to_vec();
+    let half = rotary_dim / 2;
+    for t in 0..tokens {
+        let pos = positions[t] as f32;
+        for h in 0..heads {
+            let base = (t * heads + h) * head_dim;
+            for i in 0..half {
+                let inv_freq = theta.powf(-2.0 * i as f32 / rotary_dim as f32);
+                let angle = pos * inv_freq;
+                let (s, c) = angle.sin_cos();
+                let x0 = x[base + i].to_f32();
+                let x1 = x[base + i + half].to_f32();
+                out[base + i] = bf16::from_f32(x0 * c - x1 * s);
+                out[base + i + half] = bf16::from_f32(x1 * c + x0 * s);
+            }
+        }
+    }
+    out
+}
+
+/// Attention softmax with causal + optional sliding-window mask, in-place.
+/// `scores` is `[rows, t_kv]` where `rows = batch*heads*t_q`. For row `r`,
+/// the query position is `q_pos_base + (r % t_q)`. `window == 0` = no window.
+pub fn softmax_attn_bf16(
+    scores: &mut DeviceBuffer<bf16>,
+    rows: usize,
+    t_q: usize,
+    t_kv: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(scores.len(), rows * t_kv, "softmax: scores length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_softmax_attn_bf16(
+            scores.as_device_ptr(),
+            rows as i32,
+            t_q as i32,
+            t_kv as i32,
+            scale,
+            q_pos_base,
+            window,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Host reference for masked attention softmax.
+pub fn softmax_attn_bf16_reference(
+    scores: &[bf16],
+    rows: usize,
+    t_q: usize,
+    t_kv: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+) -> Vec<bf16> {
+    assert_eq!(scores.len(), rows * t_kv);
+    let mut out = vec![bf16::ZERO; rows * t_kv];
+    for r in 0..rows {
+        let q_local = (r % t_q) as i32;
+        let q_pos = q_pos_base + q_local;
+        let kv_min = if window > 0 { (q_pos - window + 1).max(0) } else { 0 };
+        let kv_max = q_pos;
+        let row = &scores[r * t_kv..(r + 1) * t_kv];
+        let mut m = f32::NEG_INFINITY;
+        for j in 0..t_kv {
+            let jj = j as i32;
+            if jj >= kv_min && jj <= kv_max {
+                let v = row[j].to_f32() * scale;
+                if v > m {
+                    m = v;
+                }
+            }
+        }
+        let mut sum = 0.0f32;
+        let mut buf = vec![0.0f32; t_kv];
+        for j in 0..t_kv {
+            let jj = j as i32;
+            if jj >= kv_min && jj <= kv_max {
+                let v = row[j].to_f32() * scale;
+                let e = (v - m).exp();
+                buf[j] = e;
+                sum += e;
+            }
+        }
+        let inv = 1.0 / sum;
+        for j in 0..t_kv {
+            let jj = j as i32;
+            let v = if jj >= kv_min && jj <= kv_max { buf[j] * inv } else { 0.0 };
+            out[r * t_kv + j] = bf16::from_f32(v);
+        }
+    }
+    out
+}
+
+/// Naive multi-head attention (GQA-aware) with causal + optional sliding-window
+/// mask. All tensors row-major bf16.
+///
+/// Shapes:
+/// - `q`: `[t_q, h, d]`
+/// - `k`: `[t_kv, h_kv, d]`
+/// - `v`: `[t_kv, h_kv, d]`
+/// - `out`: `[t_q, h, d]`
+///
+/// `h` must be a multiple of `h_kv`. `scale` is usually `1/sqrt(d)`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_naive_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    q: &DeviceBuffer<bf16>,
+    k: &DeviceBuffer<bf16>,
+    v: &DeviceBuffer<bf16>,
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(q.len(), t_q * h * d, "attn: q length");
+    assert_eq!(k.len(), t_kv * h_kv * d, "attn: k length");
+    assert_eq!(v.len(), t_kv * h_kv * d, "attn: v length");
+    assert_eq!(out.len(), t_q * h * d, "attn: out length");
+    assert!(h % h_kv == 0, "attn: h must be divisible by h_kv");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_attn_naive_bf16(
+            out.as_device_ptr(),
+            q.as_device_ptr(),
+            k.as_device_ptr(),
+            v.as_device_ptr(),
+            t_q as i32,
+            t_kv as i32,
+            h as i32,
+            h_kv as i32,
+            d as i32,
+            scale,
+            q_pos_base,
+            window,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Host reference for naive attention. Same math as the kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_naive_bf16_reference(
+    q: &[bf16],
+    k: &[bf16],
+    v: &[bf16],
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+) -> Vec<bf16> {
+    assert_eq!(q.len(), t_q * h * d);
+    assert_eq!(k.len(), t_kv * h_kv * d);
+    assert_eq!(v.len(), t_kv * h_kv * d);
+    assert!(h % h_kv == 0);
+    let gqa = h / h_kv;
+    let mut out = vec![bf16::ZERO; t_q * h * d];
+    for q_tok in 0..t_q {
+        let q_pos = q_pos_base + q_tok as i32;
+        let kv_min = if window > 0 { (q_pos - window + 1).max(0) } else { 0 };
+        let kv_max = q_pos;
+        for q_head in 0..h {
+            let kv_head = q_head / gqa;
+            let q_base = (q_tok * h + q_head) * d;
+            let mut scores = vec![f32::NEG_INFINITY; t_kv];
+            let mut max_v = f32::NEG_INFINITY;
+            for j in 0..t_kv {
+                if (j as i32) < kv_min || (j as i32) > kv_max {
+                    continue;
+                }
+                let k_base = (j * h_kv + kv_head) * d;
+                let mut acc = 0.0f32;
+                for i in 0..d {
+                    acc += q[q_base + i].to_f32() * k[k_base + i].to_f32();
+                }
+                let s = acc * scale;
+                scores[j] = s;
+                if s > max_v {
+                    max_v = s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for j in 0..t_kv {
+                if (j as i32) < kv_min || (j as i32) > kv_max {
+                    continue;
+                }
+                let e = (scores[j] - max_v).exp();
+                scores[j] = e;
+                sum += e;
+            }
+            let inv = 1.0 / sum;
+            let out_base = (q_tok * h + q_head) * d;
+            for dd in 0..d {
+                let mut acc = 0.0f32;
+                for j in 0..t_kv {
+                    if (j as i32) < kv_min || (j as i32) > kv_max {
+                        continue;
+                    }
+                    acc += scores[j] * v[(j * h_kv + kv_head) * d + dd].to_f32();
+                }
+                out[out_base + dd] = bf16::from_f32(acc * inv);
+            }
+        }
+    }
+    out
+}
+
+/// Gather embeddings: `out[t] = table[ids[t]]` across the hidden dim.
+pub fn embed_gather_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    table: &DeviceBuffer<bf16>,
+    ids: &DeviceBuffer<i32>,
+    tokens: usize,
+    vocab: usize,
+    hidden: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(out.len(), tokens * hidden, "embed: out length");
+    assert_eq!(table.len(), vocab * hidden, "embed: table length");
+    assert_eq!(ids.len(), tokens, "embed: ids length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_embed_gather_bf16(
+            out.as_device_ptr(),
+            table.as_device_ptr(),
+            ids.as_device_ptr(),
+            tokens as i32,
+            vocab as i32,
+            hidden as i32,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
 }

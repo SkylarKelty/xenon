@@ -121,18 +121,28 @@ Legend: `[x]` done, `[>]` in progress, `[ ]` todo.
 unique shape. Must be pre-warmed at init for every shape that might appear
 during serving; phase 4 CUDA Graph capture subsumes this.
 
-### Phase 2 — attention [ ]
+### Phase 2 — attention [>]
 - [ ] Tokenizer (load `tokenizer.json`, SentencePiece-compatible via
       `tokenizers` crate)
-- [ ] Token embedding gather (bf16)
+- [x] Token embedding gather (bf16) — bit-identical to host slice
 - [ ] Per-layer embedding gather from pinned host memory
-- [ ] RoPE kernel (dual head_dim: 256 for sliding, 512 for global layers)
-- [ ] Naive attention (Q@Kᵀ → softmax → @V) for correctness baseline
+- [x] RoPE kernel (dual head_dim: 256 sliding full rotary, 128/512 partial
+      for full-attention layers; rope_theta 10k / 1M via config)
+- [x] Naive attention (Q@Kᵀ → softmax → @V, GQA-aware) for correctness
+      baseline. Shared-memory scores; bounded at T_kv ≤ ~11K fp32 entries.
+- [x] Softmax kernel (causal + optional sliding-window mask) — exact match
+      vs ref, row-sum within ~1e-3 of 1.0
 - [ ] KV cache allocator with GQA layout (2 KV heads × head_dim per layer)
-- [ ] Sliding-window mask (window 512) + full attention variants
+- [x] Sliding-window mask (window 512) + full attention variants — same
+      kernel, window=0 for full attention
 - [ ] KV sharing: 18 of 42 layers reuse KV from earlier layers — map indices
+      (hint: layers missing `k_proj.input_scale`/`v_proj.input_scale` are
+      the ones that reuse KV)
 - [ ] FlashAttention-style tile kernel (fp32 accumulate, bf16 I/O), one
-      version per head_dim variant
+      version per head_dim variant — needed for T_kv > ~11K
+- [x] CLI: `test-rope`, `test-softmax`, `test-embed`, `test-attn-layer`.
+      End-to-end: real weights, layer 0/4/5/11/17/24/35/41 all pass with
+      global rel ≤ 5.6e-3 at T=4.
 
 ### Phase 3 — full forward pass [ ]
 - [ ] 42-layer chain: embed → (norm → attn → norm → mlp + PLE inject) × 42 →
@@ -158,27 +168,13 @@ during serving; phase 4 CUDA Graph capture subsumes this.
 - [ ] `GET /v1/models`
 - [ ] Concurrent-request queuing (one request at a time on device in v1)
 
-### Phase 6 — idle state machine [ ]
-State machine timings are targets, not deadlines; measured and tuned later.
-
-| State | After idle | Resident on device | TTFT on wake |
-| --- | --- | --- | --- |
-| Hot | (active) | weights + KV pool + graphs | <50 ms |
-| Warm | 30 s | weights + CUDA context (no KV, no graphs) | ~200 ms |
-| Cold | 5 min | CUDA context only | ~1.5 s |
-| Frozen | 1 h | process exited | ~2 s (systemd socket activation) |
-
-- [ ] Idle timer + transitions
-- [ ] Wake-path warmup kernel (PCIe ASPM resume stall mitigation)
-- [ ] systemd socket-activated unit file
-
-### Phase 7 — polish + bench [ ]
+### Phase 6 — polish + bench [ ]
 - [ ] Nsight Compute profile passes, fix obvious tuning wins
 - [ ] PLE prefetch overlap (one layer ahead)
 - [ ] H2D overlap during decode if bandwidth-bound
 - [ ] Benchmark suite vs Ollama (same prompts, same model, same GPU)
 
-### Phase 8 - emotion vectors [ ]
+### Phase 7 - emotion vectors [ ]
 - [ ] Investigate https://transformer-circuits.pub/2026/emotions/index.html#toc-15 - add in support for measuring/mapping emotion vectors
 - [ ] Implement extra api return "emotions": ["happy": 0.2, "anxious": 0.1], etc
 

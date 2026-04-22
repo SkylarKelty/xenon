@@ -10,10 +10,12 @@ use xenon_core::{
     GemmaConfig, LayerKind,
 };
 use xenon_kernels::{
+    attn_naive_bf16, attn_naive_bf16_reference,
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
-    fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16, gelu_tanh_bf16_reference,
-    gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference, rmsnorm_bf16,
-    rmsnorm_bf16_reference, CublasLt,
+    embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
+    gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
+    rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16, rope_bf16_reference, softmax_attn_bf16,
+    softmax_attn_bf16_reference, CublasLt,
 };
 
 /// Parse a little-endian bf16 byte slice into a `Vec<bf16>`. Avoids
@@ -116,6 +118,59 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Run a full attention block (norm + QKV + qk-norm + RoPE + naive attn +
+    /// o_proj) on real Gemma weights for one layer, comparing GPU to host ref.
+    TestAttnLayer {
+        model: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+        #[arg(long, default_value_t = 4)]
+        tokens: usize,
+        #[arg(long, default_value_t = 0)]
+        q_pos_base: i32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Apply RoPE on random input and compare to a CPU reference.
+    TestRope {
+        #[arg(long, default_value_t = 4)]
+        tokens: usize,
+        #[arg(long, default_value_t = 8)]
+        heads: usize,
+        #[arg(long, default_value_t = 256)]
+        head_dim: usize,
+        /// Rotary dim; must be <= head_dim and even. Defaults to head_dim.
+        #[arg(long)]
+        rotary_dim: Option<usize>,
+        #[arg(long, default_value_t = 10_000.0)]
+        theta: f32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run masked softmax on random scores and compare to a CPU reference.
+    TestSoftmax {
+        #[arg(long, default_value_t = 4)]
+        rows: usize,
+        #[arg(long, default_value_t = 1)]
+        t_q: usize,
+        #[arg(long, default_value_t = 64)]
+        t_kv: usize,
+        #[arg(long, default_value_t = 16.0)]
+        scale: f32,
+        #[arg(long, default_value_t = 0)]
+        q_pos_base: i32,
+        /// 0 = no sliding window (full causal).
+        #[arg(long, default_value_t = 0)]
+        window: i32,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Gather real token embeddings and verify against host mmap reference.
+    TestEmbed {
+        model: PathBuf,
+        #[arg(long, default_value = "2,108,107")]
+        ids: String,
+    },
     /// Memory-map the model and upload tensors (matching an optional prefix)
     /// to device memory. Reports bytes, elapsed, and effective GB/s.
     Upload {
@@ -152,6 +207,13 @@ fn main() -> anyhow::Result<()> {
         Command::TestLinear { m, n, k, seed } => cmd_test_linear(m, n, k, seed),
         Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
         Command::TestMlp { model, layer, batch, seed } => cmd_test_mlp(model, layer, batch, seed),
+        Command::TestRope { tokens, heads, head_dim, rotary_dim, theta, seed } =>
+            cmd_test_rope(tokens, heads, head_dim, rotary_dim.unwrap_or(head_dim), theta, seed),
+        Command::TestSoftmax { rows, t_q, t_kv, scale, q_pos_base, window, seed } =>
+            cmd_test_softmax(rows, t_q, t_kv, scale, q_pos_base, window, seed),
+        Command::TestEmbed { model, ids } => cmd_test_embed(model, ids),
+        Command::TestAttnLayer { model, layer, tokens, q_pos_base, seed } =>
+            cmd_test_attn_layer(model, layer, tokens, q_pos_base, seed),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -713,6 +775,390 @@ fn cmd_test_linear(m: usize, n: usize, k: usize, seed: u64) -> anyhow::Result<()
     anyhow::ensure!(global_rel <= tol_rel, "global rel diff {global_rel} exceeds tolerance {tol_rel}");
     println!("OK: within bf16 tolerance (global rel {tol_rel:.1e}).");
     Ok(())
+}
+
+fn cmd_test_rope(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f32,
+    seed: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(rotary_dim <= head_dim && rotary_dim % 2 == 0, "rotary_dim must be even and <= head_dim");
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let n = tokens * heads * head_dim;
+    let x_host: Vec<bf16> = (0..n).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let pos_host: Vec<i32> = (0..tokens).map(|i| i as i32 * 3 + 7).collect(); // non-trivial positions
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_pos: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_pos.copy_from_host(&pos_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    rope_bf16(&mut d_x, &d_pos, tokens, heads, head_dim, rotary_dim, theta, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let got = d_x.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = rope_bf16_reference(&x_host, &pos_host, tokens, heads, head_dim, rotary_dim, theta);
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
+
+    println!("=== xenon-cli test-rope ===");
+    println!("tokens x heads x head_dim  {} x {} x {}", tokens, heads, head_dim);
+    println!("rotary_dim                 {}", rotary_dim);
+    println!("theta                      {}", theta);
+    println!("max abs diff               {:.3e}", max_abs);
+    println!("global rel diff            {:.3e}", global_rel);
+    let tol_rel: f32 = 1e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: RoPE matches reference within {tol_rel:.1e}.");
+    Ok(())
+}
+
+fn cmd_test_softmax(
+    rows: usize,
+    t_q: usize,
+    t_kv: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+    seed: u64,
+) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let n = rows * t_kv;
+    let scores_host: Vec<bf16> = (0..n)
+        .map(|_| bf16::from_f32(rng.gen_range(-3.0..3.0)))
+        .collect();
+
+    let mut d_scores: DeviceBuffer<bf16> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_scores.copy_from_host(&scores_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    softmax_attn_bf16(&mut d_scores, rows, t_q, t_kv, scale, q_pos_base, window, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let got = d_scores.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = softmax_attn_bf16_reference(&scores_host, rows, t_q, t_kv, scale, q_pos_base, window);
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
+
+    // Row-sum check: probabilities in each row should sum to ~1 (or ~0 if row
+    // was fully masked; impossible when q_pos >= 0).
+    let mut worst_sum_dev: f32 = 0.0;
+    for r in 0..rows {
+        let s: f32 = got[r * t_kv..(r + 1) * t_kv].iter().map(|v| v.to_f32()).sum();
+        let dev = (s - 1.0).abs();
+        if dev > worst_sum_dev { worst_sum_dev = dev; }
+    }
+
+    println!("=== xenon-cli test-softmax ===");
+    println!("rows x t_q x t_kv          {} x {} x {}", rows, t_q, t_kv);
+    println!("scale / q_pos_base / window {} / {} / {}", scale, q_pos_base, window);
+    println!("worst row-sum dev from 1    {:.3e}", worst_sum_dev);
+    println!("max abs diff vs ref         {:.3e}", max_abs);
+    println!("global rel diff vs ref      {:.3e}", global_rel);
+    anyhow::ensure!(worst_sum_dev <= 3e-2, "row probs don't sum to 1 (worst dev {worst_sum_dev})");
+    let tol_rel: f32 = 2e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: masked softmax matches reference within {tol_rel:.1e}.");
+    Ok(())
+}
+
+fn cmd_test_embed(dir: PathBuf, ids_csv: String) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&dir.join("config.json"))?;
+    let vocab = cfg.text_config.vocab_size;
+    let hidden = cfg.text_config.hidden_size;
+
+    let ids_host: Vec<i32> = ids_csv
+        .split(',')
+        .map(|s| s.trim().parse::<i32>())
+        .collect::<std::result::Result<_, _>>()?;
+    for id in &ids_host {
+        anyhow::ensure!((*id as usize) < vocab, "id {id} >= vocab {vocab}");
+    }
+    let tokens = ids_host.len();
+
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+    let table_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+    anyhow::ensure!(table_bytes.len() == vocab * hidden * 2, "embed table size");
+
+    let mut d_table: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ids: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let upload_start = Instant::now();
+    d_table.copy_from_host_bytes(table_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_ids.copy_from_host(&ids_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    device_synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let upload_ms = upload_start.elapsed().as_secs_f64() * 1e3;
+
+    embed_gather_bf16(&mut d_out, &d_table, &d_ids, tokens, vocab, hidden, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Host reference: direct slice out of the mmap.
+    let table_host = bytes_to_bf16_vec(table_bytes);
+    let mut want = vec![bf16::ZERO; tokens * hidden];
+    for (t, &id) in ids_host.iter().enumerate() {
+        let src = &table_host[id as usize * hidden..(id as usize + 1) * hidden];
+        want[t * hidden..(t + 1) * hidden].copy_from_slice(src);
+    }
+
+    let mut mismatches = 0usize;
+    for (a, b) in got.iter().zip(want.iter()) {
+        if a.to_bits() != b.to_bits() { mismatches += 1; }
+    }
+
+    println!("=== xenon-cli test-embed ===");
+    println!("tokens                   {}", tokens);
+    println!("ids                      {:?}", ids_host);
+    println!("table upload             {:>6.1} ms ({:.2} GiB)", upload_ms, (vocab * hidden * 2) as f64 / 1073741824.0);
+    println!("mismatched bf16 elements {}", mismatches);
+    anyhow::ensure!(mismatches == 0, "embedding gather produced {mismatches} mismatches");
+    println!("OK: gather is bit-identical to host slice.");
+    Ok(())
+}
+
+fn cmd_test_attn_layer(
+    dir: PathBuf,
+    layer: usize,
+    tokens: usize,
+    q_pos_base: i32,
+    seed: u64,
+) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    anyhow::ensure!(layer < tc.num_hidden_layers, "layer out of range");
+
+    let hidden = tc.hidden_size;
+    let h = tc.num_attention_heads;
+    let h_kv = tc.num_key_value_heads;
+    let d = cfg.head_dim_for_layer(layer);
+    let kind = tc.layer_types[layer];
+    let window: i32 = if matches!(kind, LayerKind::SlidingAttention) {
+        tc.sliding_window.unwrap_or(0) as i32
+    } else { 0 };
+    let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer);
+    let eps = tc.rms_norm_eps as f32;
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    println!("=== xenon-cli test-attn-layer ===");
+    println!("layer {layer}  kind {:?}  T={tokens}  q_pos_base={q_pos_base}", kind);
+    println!("  hidden/H/Hkv/D         {hidden} / {h} / {h_kv} / {d}");
+    println!("  rope theta / rotary    {rope_theta} / {rotary_dim}");
+    println!("  window / scale         {window} / {:.6}", scale);
+
+    let prefix = format!("model.language_model.layers.{layer}");
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+
+    let in_norm_bytes = mm.load_bf16(&format!("{prefix}.input_layernorm.weight"))?;
+    let q_norm_bytes  = mm.load_bf16(&format!("{prefix}.self_attn.q_norm.weight"))?;
+    let k_norm_bytes  = mm.load_bf16(&format!("{prefix}.self_attn.k_norm.weight"))?;
+    let q_proj = mm.load_quant_linear(&format!("{prefix}.self_attn.q_proj"))?;
+    let k_proj = mm.load_quant_linear(&format!("{prefix}.self_attn.k_proj"))?;
+    let v_proj = mm.load_quant_linear(&format!("{prefix}.self_attn.v_proj"))?;
+    let o_proj = mm.load_quant_linear(&format!("{prefix}.self_attn.o_proj"))?;
+
+    anyhow::ensure!(q_proj.out_features == h * d && q_proj.in_features == hidden,
+        "q_proj: got [{}, {}], want [{}, {}]", q_proj.out_features, q_proj.in_features, h * d, hidden);
+    anyhow::ensure!(k_proj.out_features == h_kv * d && k_proj.in_features == hidden,
+        "k_proj: got [{}, {}]", k_proj.out_features, k_proj.in_features);
+    anyhow::ensure!(v_proj.out_features == h_kv * d && v_proj.in_features == hidden,
+        "v_proj: got [{}, {}]", v_proj.out_features, v_proj.in_features);
+    anyhow::ensure!(o_proj.out_features == hidden && o_proj.in_features == h * d,
+        "o_proj: got [{}, {}]", o_proj.out_features, o_proj.in_features);
+    anyhow::ensure!(q_norm_bytes.len() == d * 2, "q_norm size");
+    anyhow::ensure!(k_norm_bytes.len() == d * 2, "k_norm size");
+
+    // Random input.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..tokens * hidden)
+        .map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)))
+        .collect();
+    let pos_host: Vec<i32> = (0..tokens).map(|i| q_pos_base + i as i32).collect();
+
+    // ----- Device tensors -----
+    let upload_start = Instant::now();
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_in_norm_w: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_q_norm_w:  DeviceBuffer<bf16> = DeviceBuffer::new(d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_k_norm_w:  DeviceBuffer<bf16> = DeviceBuffer::new(d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Dequantized projection weights.
+    let mut d_qw: DeviceBuffer<bf16> = DeviceBuffer::new(q_proj.out_features * q_proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_kw: DeviceBuffer<bf16> = DeviceBuffer::new(k_proj.out_features * k_proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_vw: DeviceBuffer<bf16> = DeviceBuffer::new(v_proj.out_features * v_proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ow: DeviceBuffer<bf16> = DeviceBuffer::new(o_proj.out_features * o_proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Scratch buffers for dequant source (packed + scales).
+    let (mut d_qp, mut d_qs) = (
+        DeviceBuffer::<u8>::new(q_proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(q_proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    let (mut d_kp, mut d_ks) = (
+        DeviceBuffer::<u8>::new(k_proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(k_proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    let (mut d_vp, mut d_vs) = (
+        DeviceBuffer::<u8>::new(v_proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(v_proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    let (mut d_op, mut d_os) = (
+        DeviceBuffer::<u8>::new(o_proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(o_proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+
+    // Intermediate buffers.
+    let mut d_x_normed: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_positions.copy_from_host(&pos_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_in_norm_w.copy_from_host_bytes(in_norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_q_norm_w.copy_from_host_bytes(q_norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_k_norm_w.copy_from_host_bytes(k_norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_qp.copy_from_host_bytes(q_proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_qs.copy_from_host_bytes(q_proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_kp.copy_from_host_bytes(k_proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_ks.copy_from_host_bytes(k_proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_vp.copy_from_host_bytes(v_proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_vs.copy_from_host_bytes(v_proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_op.copy_from_host_bytes(o_proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_os.copy_from_host_bytes(o_proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    fp4_dequant_bf16(&mut d_qw, &d_qp, &d_qs, q_proj.global_scale, q_proj.out_features, q_proj.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_kw, &d_kp, &d_ks, k_proj.global_scale, k_proj.out_features, k_proj.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_vw, &d_vp, &d_vs, v_proj.global_scale, v_proj.out_features, v_proj.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_ow, &d_op, &d_os, o_proj.global_scale, o_proj.out_features, o_proj.in_features, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let upload_ms = upload_start.elapsed().as_secs_f64() * 1e3;
+
+    let run_forward = |lt: &mut CublasLt,
+                       d_q: &mut DeviceBuffer<bf16>,
+                       d_k: &mut DeviceBuffer<bf16>,
+                       d_v: &mut DeviceBuffer<bf16>,
+                       d_attn_out: &mut DeviceBuffer<bf16>,
+                       d_out: &mut DeviceBuffer<bf16>,
+                       d_x_normed: &mut DeviceBuffer<bf16>|
+     -> anyhow::Result<()> {
+        rmsnorm_bf16(d_x_normed, &d_x, &d_in_norm_w, tokens, hidden, eps, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(d_q, d_x_normed, &d_qw, None, tokens, h * d, hidden, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(d_k, d_x_normed, &d_kw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(d_v, d_x_normed, &d_vw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // q_norm / k_norm: per-head RMSNorm over D.
+        // Clone into scratch since rmsnorm takes &x (read) + &mut out.
+        let q_copy = clone_buffer(d_q)?;
+        rmsnorm_bf16(d_q, &q_copy, &d_q_norm_w, tokens * h, d, eps, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let k_copy = clone_buffer(d_k)?;
+        rmsnorm_bf16(d_k, &k_copy, &d_k_norm_w, tokens * h_kv, d, eps, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // RoPE in-place on q and k (the rotary dims only).
+        rope_bf16(d_q, &d_positions, tokens, h,    d, rotary_dim, rope_theta, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        rope_bf16(d_k, &d_positions, tokens, h_kv, d, rotary_dim, rope_theta, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Attention: Q[T, H, D] x K/V[T, Hkv, D] -> [T, H, D]
+        attn_naive_bf16(d_attn_out, d_q, d_k, d_v,
+                        tokens, tokens, h, h_kv, d, scale, q_pos_base, window, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // O projection back to hidden.
+        lt.linear_bf16(d_out, d_attn_out, &d_ow, None, tokens, hidden, h * d, 1.0, 0.0, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    };
+
+    // Warmup.
+    run_forward(&mut lt, &mut d_q, &mut d_k, &mut d_v, &mut d_attn_out, &mut d_out, &mut d_x_normed)?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let iters = 10;
+    let fwd_start = Instant::now();
+    for _ in 0..iters {
+        run_forward(&mut lt, &mut d_q, &mut d_k, &mut d_v, &mut d_attn_out, &mut d_out, &mut d_x_normed)?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let fwd_ms = fwd_start.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+    let gpu_out = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // ----- Host reference -----
+    let ref_start = Instant::now();
+    let in_norm_w_host = bytes_to_bf16_vec(in_norm_bytes);
+    let q_norm_w_host  = bytes_to_bf16_vec(q_norm_bytes);
+    let k_norm_w_host  = bytes_to_bf16_vec(k_norm_bytes);
+    let q_w_host = fp4_dequant_bf16_reference(q_proj.packed, q_proj.scales, q_proj.global_scale, q_proj.out_features, q_proj.in_features);
+    let k_w_host = fp4_dequant_bf16_reference(k_proj.packed, k_proj.scales, k_proj.global_scale, k_proj.out_features, k_proj.in_features);
+    let v_w_host = fp4_dequant_bf16_reference(v_proj.packed, v_proj.scales, v_proj.global_scale, v_proj.out_features, v_proj.in_features);
+    let o_w_host = fp4_dequant_bf16_reference(o_proj.packed, o_proj.scales, o_proj.global_scale, o_proj.out_features, o_proj.in_features);
+
+    let x_normed_host = rmsnorm_bf16_reference(&x_host, &in_norm_w_host, tokens, hidden, eps);
+    let q_flat = linear_bf16_reference(&x_normed_host, &q_w_host, tokens, h * d, hidden, 1.0, 0.0, None);
+    let k_flat = linear_bf16_reference(&x_normed_host, &k_w_host, tokens, h_kv * d, hidden, 1.0, 0.0, None);
+    let v_flat = linear_bf16_reference(&x_normed_host, &v_w_host, tokens, h_kv * d, hidden, 1.0, 0.0, None);
+    let q_normed = rmsnorm_bf16_reference(&q_flat, &q_norm_w_host, tokens * h, d, eps);
+    let k_normed = rmsnorm_bf16_reference(&k_flat, &k_norm_w_host, tokens * h_kv, d, eps);
+    let q_roped = rope_bf16_reference(&q_normed, &pos_host, tokens, h,    d, rotary_dim, rope_theta);
+    let k_roped = rope_bf16_reference(&k_normed, &pos_host, tokens, h_kv, d, rotary_dim, rope_theta);
+    let attn_out_host = attn_naive_bf16_reference(&q_roped, &k_roped, &v_flat,
+                                                  tokens, tokens, h, h_kv, d,
+                                                  scale, q_pos_base, window);
+    let cpu_out = linear_bf16_reference(&attn_out_host, &o_w_host, tokens, hidden, h * d, 1.0, 0.0, None);
+    let ref_ms = ref_start.elapsed().as_secs_f64() * 1e3;
+
+    let (max_abs, _, global_rel) = compare_bf16(&gpu_out, &cpu_out);
+    let gpu_max: f32 = gpu_out.iter().map(|v| v.to_f32().abs()).fold(0.0, f32::max);
+    let gpu_finite = gpu_out.iter().all(|v| v.to_f32().is_finite());
+
+    println!();
+    println!("upload + dequant        {:>7.1} ms", upload_ms);
+    println!("gpu forward (avg)       {:>7.2} ms", fwd_ms);
+    println!("cpu reference forward   {:>7.1} ms", ref_ms);
+    println!("gpu output max |.|      {:>8.3}", gpu_max);
+    println!("gpu finite              {}", gpu_finite);
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("global rel diff         {:.3e}", global_rel);
+    anyhow::ensure!(gpu_finite, "GPU output contains NaN/inf");
+    anyhow::ensure!(gpu_max > 0.0, "GPU output is identically zero");
+    let tol_rel: f32 = 5e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: full attention layer matches host reference within {tol_rel:.1e}.");
+    Ok(())
+}
+
+/// D2D-copy a device buffer. Used to avoid alias when a kernel wants separate
+/// read and write views of the same logical tensor.
+fn clone_buffer(src: &DeviceBuffer<bf16>) -> anyhow::Result<DeviceBuffer<bf16>> {
+    let mut dst = DeviceBuffer::<bf16>::new(src.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    dst.copy_from_device(src).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(dst)
 }
 
 fn cmd_test_mlp(dir: PathBuf, layer: usize, batch: usize, seed: u64) -> anyhow::Result<()> {

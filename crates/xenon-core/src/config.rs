@@ -14,6 +14,26 @@ pub enum LayerKind {
     FullAttention,
 }
 
+/// Rope params for one layer-kind (sliding or full). Gemma 4 uses different
+/// bases per layer kind; full-attention layers use `partial_rotary_factor` to
+/// rotate only the first fraction of head_dim.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RopeKindParams {
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub sliding_attention: Option<RopeKindParams>,
+    #[serde(default)]
+    pub full_attention: Option<RopeKindParams>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GemmaTextConfig {
     pub hidden_size: usize,
@@ -45,6 +65,8 @@ pub struct GemmaTextConfig {
     pub hidden_activation: Option<String>,
     #[serde(default)]
     pub attention_bias: Option<bool>,
+    #[serde(default)]
+    pub rope_parameters: RopeParameters,
 }
 
 /// Top-level model config. Multimodal fields are accepted but unused by the
@@ -89,6 +111,24 @@ impl GemmaConfig {
             LayerKind::FullAttention => tc.global_head_dim.unwrap_or(tc.head_dim),
             LayerKind::SlidingAttention => tc.head_dim,
         }
+    }
+
+    /// Rope base + number of dims that actually rotate for this layer.
+    /// For full-attention layers, `partial_rotary_factor` shrinks the rotated
+    /// count (e.g. 0.25 * 512 = 128 rotated, rest passes through unchanged).
+    pub fn rope_for_layer(&self, layer_idx: usize) -> (f32, usize) {
+        let tc = &self.text_config;
+        let head_dim = self.head_dim_for_layer(layer_idx);
+        let params = match tc.layer_types[layer_idx] {
+            LayerKind::SlidingAttention => tc.rope_parameters.sliding_attention.as_ref(),
+            LayerKind::FullAttention => tc.rope_parameters.full_attention.as_ref(),
+        };
+        let (theta, prf) = match params {
+            Some(p) => (p.rope_theta as f32, p.partial_rotary_factor.unwrap_or(1.0) as f32),
+            None => (10_000.0, 1.0),
+        };
+        let rotary_dim = ((head_dim as f32) * prf) as usize & !1; // even
+        (theta, rotary_dim)
     }
 }
 

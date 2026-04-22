@@ -25,6 +25,7 @@ unsafe extern "C" {
 
 const MEMCPY_HOST_TO_DEVICE: i32 = 1;
 const MEMCPY_DEVICE_TO_HOST: i32 = 2;
+const MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
 /// A CUDA runtime error code (non-zero). `0` is success and never wrapped.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,6 +225,17 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
         let mut v = vec![T::zeroed(); self.len];
         self.copy_to_host(&mut v)?;
         Ok(v)
+    }
+
+    /// D2D copy from another buffer of identical length.
+    pub fn copy_from_device(&mut self, src: &DeviceBuffer<T>) -> Result<(), CudaError> {
+        assert_eq!(src.len, self.len, "DeviceBuffer::copy_from_device length mismatch");
+        if self.len == 0 {
+            return Ok(());
+        }
+        CudaError::check(unsafe {
+            cudaMemcpy(self.ptr, src.ptr, self.bytes(), MEMCPY_DEVICE_TO_DEVICE)
+        })
     }
 }
 
