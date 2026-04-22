@@ -203,11 +203,48 @@ during serving; phase 4 CUDA Graph capture subsumes this.
 - [x] Host-offloaded input embedding: `embed_tokens` rows gathered on
       host and uploaded as [T, H] instead of the full [V, H] table.
 
-### Phase 4 — decode + CUDA Graphs [ ]
-- [ ] Single-token decode path (Q=1 over cached K/V)
-- [ ] Sampling: top-K, top-P, temperature (one kernel)
-- [ ] CUDA Graph capture per decode shape; lazy recapture on prompt-length change
-- [ ] First end-to-end `xenon-cli generate <prompt>` — report tok/s vs roofline
+### Phase 4 — decode + generate [x]
+- [x] Single-token decode path (t_q=1 over cached K/V). `LayerMeta` carries
+      `t_q` / `t_kv` / `q_pos_base` so `layer_forward` handles prefill and
+      decode identically.
+- [x] Persistent KV cache across steps via `KvCache::append`+`advance` on
+      each forward pass.
+- [x] First end-to-end `xenon-cli generate <prompt>` — tokenize, prefill,
+      greedy-decode, stop at EOS (`<turn|>`, 106). `--chat` flag wraps with
+      Gemma 4 turn markers.
+- [x] `xenon-cli bench` — warmup + N iters, per-step timing, JSON output
+      to `results/`. Phase profiler dumps per-block timings.
+- [x] Async `lm_head` H2D on a second stream. `PinnedBuffer<T>` via
+      `cudaMallocHost` so the 1.25 GiB PCIe transfer overlaps with the
+      decoder stack. Hidden inside runtime by the end.
+- [x] cuBLASLt algorithm cache per (m, n, k, opA, opB) on `CublasLt`.
+      Minor win on its own; prereq for graph captures later.
+- [x] `DeviceBuffer::new_async` via `cudaMallocAsync` on the default
+      stream-ordered pool. Transient scratch hits a cached block after
+      warmup. Biggest single decode win (~60%).
+- [ ] Sampling: top-K, top-P, temperature (one kernel). Greedy is host-
+      side argmax today. Add when we care about non-greedy.
+
+**Perf progression (T_prompt=15, max_new=15, haiku prompt):**
+
+| Config                | decode ms/step | decode tok/s | vs baseline |
+| --------------------- | -------------- | ------------ | ----------- |
+| baseline (phase 3)    | 311            | 3.21         | —           |
+| async `lm_head`       | 291            | 3.43         | +7%         |
+| + algo cache          | 296            | 3.38         | (flat)      |
+| + cudaMallocAsync     | **184**        | **5.43**     | **+69%**    |
+
+Profile after all three:
+```
+decoder stack (42 layers)   114 ms
+lm_head GEMM + softcap        4 ms
+wait for lm_head H2D          0 ms   (fully overlapped)
+other                         ~1 ms
+```
+
+The dominant remaining cost is MLP FP4→bf16 dequant bandwidth per layer
+per step (~40 ms across the 42 layers). Only native FP4 GEMM fixes
+that — deferred to the open-questions / future-phase bucket.
 
 ### Phase 5 — server + OpenAI API [ ]
 - [ ] `POST /v1/chat/completions` with Gemma chat template
@@ -215,6 +252,12 @@ during serving; phase 4 CUDA Graph capture subsumes this.
 - [ ] `POST /v1/completions` (legacy)
 - [ ] `GET /v1/models`
 - [ ] Concurrent-request queuing (one request at a time on device in v1)
+- [ ] **CUDA Graph capture per decode shape; graph-update for growing
+      `t_kv` each step.** Belongs here, not phase 4: graphs pay off when
+      a long-lived server process amortizes capture over thousands of
+      decode steps, not a one-shot CLI. Prereqs land here too —
+      persistent scratch pool, raw-pointer kernel variants, decode via
+      flash-attn (fixed shmem).
 
 ### Phase 6 — polish + bench [ ]
 - [ ] Nsight Compute profile passes, fix obvious tuning wins
