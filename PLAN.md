@@ -156,6 +156,25 @@ during serving; phase 4 CUDA Graph capture subsumes this.
       at T=4. Decode-shape and cache-append paths match prefill's last
       row bit-for-bit.
 
+### Phase 2 — HF-alignment fixes (applied after source review) [x]
+- [x] RoPE: inv_freq denominator uses `head_dim` (not `rotary_dim`); pair
+      stride is `head_dim/2` (not `rotary_dim/2`). Matches HF
+      `_compute_proportional_rope_parameters` + `rotate_half` for partial
+      rotary. For sliding layers (prf=1.0), both are equivalent.
+- [x] Attention scaling: pass `scaling=1.0` to attn (not `1/sqrt(D)`).
+      Gemma 4 lets the learned q_norm/k_norm weights control Q·K magnitude.
+      No attention softcap (unlike Gemma 2).
+- [x] V normalization: RMSNorm extended to accept `weight: Option<_>` —
+      null pointer = `with_scale=False` (pure RMS, no learned weight).
+      Applied to V after v_proj. No corresponding tensor in safetensors.
+- [x] Embedding scale: `embed_gather_bf16` takes a scalar multiplier.
+      Apply `sqrt(hidden_size) ≈ 50.6` for `embed_tokens` and
+      `sqrt(hidden_size_per_layer_input) = 16` for `embed_tokens_per_layer`
+      (matches `Gemma3TextScaledWordEmbedding`).
+- [ ] `layer_scalar`: per-layer `[1]`-bf16 multiplier at the very end of
+      each decoder layer. Deferred to Phase 3 full-layer forward (no
+      existing code path composes the full layer).
+
 ### Phase 3 — full forward pass [ ]
 - [ ] 42-layer chain: embed → (norm → attn → norm → mlp + PLE inject) × 42 →
       norm → lm_head → logits

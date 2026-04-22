@@ -13,7 +13,7 @@ static constexpr int BLOCK_THREADS = 256;
 __global__ void xk_rmsnorm_bf16_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ weight,  // nullable: null = no-scale RMS
     int hidden,
     float eps)
 {
@@ -41,10 +41,10 @@ __global__ void xk_rmsnorm_bf16_kernel(
     const float mean_sq = smem[0] / (float)hidden;
     const float scale   = rsqrtf(mean_sq + eps);
 
-    // Apply: fp32 arithmetic, bf16 writeback.
+    // Apply: fp32 arithmetic, bf16 writeback. If weight is null, treat as 1.
     for (int i = tid; i < hidden; i += BLOCK_THREADS) {
         float v = __bfloat162float(row_in[i]);
-        float w = __bfloat162float(weight[i]);
+        float w = weight ? __bfloat162float(weight[i]) : 1.0f;
         row_out[i] = __float2bfloat16_rn(v * scale * w);
     }
 }

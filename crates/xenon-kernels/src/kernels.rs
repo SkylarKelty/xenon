@@ -66,6 +66,7 @@ unsafe extern "C" {
         tokens: i32,
         vocab: i32,
         hidden: i32,
+        scale: f32,
         stream: *mut c_void,
     ) -> i32;
     fn xk_attn_naive_bf16(
@@ -112,10 +113,12 @@ pub fn hello(n: u32) -> Result<u32, CudaError> {
 }
 
 /// RMSNorm forward on bf16 tensors. Input and output are row-major `[rows, hidden]`.
+/// Pass `weight = None` for the no-scale variant (`with_scale=False` in HF) —
+/// the kernel uses weight 1.0 and produces pure RMS-normalized output.
 pub fn rmsnorm_bf16(
     out: &mut DeviceBuffer<bf16>,
     x: &DeviceBuffer<bf16>,
-    weight: &DeviceBuffer<bf16>,
+    weight: Option<&DeviceBuffer<bf16>>,
     rows: usize,
     hidden: usize,
     eps: f32,
@@ -123,13 +126,17 @@ pub fn rmsnorm_bf16(
 ) -> Result<(), CudaError> {
     assert_eq!(out.len(), rows * hidden, "rmsnorm: out length");
     assert_eq!(x.len(), rows * hidden, "rmsnorm: x length");
-    assert_eq!(weight.len(), hidden, "rmsnorm: weight length");
+    if let Some(w) = weight {
+        assert_eq!(w.len(), hidden, "rmsnorm: weight length");
+    }
     let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let weight_ptr = weight.map(|w| w.as_device_ptr() as *const std::ffi::c_void)
+        .unwrap_or(std::ptr::null());
     let code = unsafe {
         xk_rmsnorm_bf16(
             out.as_device_ptr(),
             x.as_device_ptr(),
-            weight.as_device_ptr(),
+            weight_ptr,
             rows as i32,
             hidden as i32,
             eps,
@@ -141,13 +148,15 @@ pub fn rmsnorm_bf16(
 
 pub fn rmsnorm_bf16_reference(
     x: &[bf16],
-    weight: &[bf16],
+    weight: Option<&[bf16]>,
     rows: usize,
     hidden: usize,
     eps: f32,
 ) -> Vec<bf16> {
     assert_eq!(x.len(), rows * hidden);
-    assert_eq!(weight.len(), hidden);
+    if let Some(w) = weight {
+        assert_eq!(w.len(), hidden);
+    }
     let mut out = vec![bf16::ZERO; rows * hidden];
     for r in 0..rows {
         let row_in = &x[r * hidden..(r + 1) * hidden];
@@ -158,7 +167,7 @@ pub fn rmsnorm_bf16_reference(
         let scale = (mean_sq + eps).sqrt().recip();
         for i in 0..hidden {
             let v = row_in[i].to_f32();
-            let w = weight[i].to_f32();
+            let w = weight.map(|w| w[i].to_f32()).unwrap_or(1.0);
             out[r * hidden + i] = bf16::from_f32(v * scale * w);
         }
     }
@@ -325,7 +334,9 @@ pub fn rope_bf16(
     if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
 }
 
-/// Host reference for RoPE matching the kernel's math.
+/// Host reference for RoPE matching the kernel's math. For partial rotary,
+/// pairs `(i, i + head_dim/2)` are rotated for `i in 0..rotary_dim/2`; the
+/// rest of the head_dim dimensions pass through.
 pub fn rope_bf16_reference(
     x: &[bf16],
     positions: &[i32],
@@ -337,20 +348,24 @@ pub fn rope_bf16_reference(
 ) -> Vec<bf16> {
     assert_eq!(x.len(), tokens * heads * head_dim);
     assert_eq!(positions.len(), tokens);
+    assert!(head_dim % 2 == 0);
+    assert!(rotary_dim % 2 == 0);
+    assert!(rotary_dim <= head_dim);
     let mut out = x.to_vec();
-    let half = rotary_dim / 2;
+    let head_half = head_dim / 2;
+    let rotary_pairs = rotary_dim / 2;
     for t in 0..tokens {
         let pos = positions[t] as f32;
         for h in 0..heads {
             let base = (t * heads + h) * head_dim;
-            for i in 0..half {
-                let inv_freq = theta.powf(-2.0 * i as f32 / rotary_dim as f32);
+            for i in 0..rotary_pairs {
+                let inv_freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
                 let angle = pos * inv_freq;
                 let (s, c) = angle.sin_cos();
                 let x0 = x[base + i].to_f32();
-                let x1 = x[base + i + half].to_f32();
+                let x1 = x[base + i + head_half].to_f32();
                 out[base + i] = bf16::from_f32(x0 * c - x1 * s);
-                out[base + i + half] = bf16::from_f32(x1 * c + x0 * s);
+                out[base + i + head_half] = bf16::from_f32(x1 * c + x0 * s);
             }
         }
     }
@@ -601,7 +616,11 @@ pub fn attn_naive_bf16_reference(
     out
 }
 
-/// Gather embeddings: `out[t] = table[ids[t]]` across the hidden dim.
+/// Gather embeddings: `out[t] = table[ids[t]] * scale` across the hidden dim.
+/// Pass `scale = 1.0` for a plain gather; Gemma uses `sqrt(hidden_size)` for
+/// `embed_tokens` and `sqrt(hidden_size_per_layer_input)` for the per-layer
+/// embedding table.
+#[allow(clippy::too_many_arguments)]
 pub fn embed_gather_bf16(
     out: &mut DeviceBuffer<bf16>,
     table: &DeviceBuffer<bf16>,
@@ -609,6 +628,7 @@ pub fn embed_gather_bf16(
     tokens: usize,
     vocab: usize,
     hidden: usize,
+    scale: f32,
     stream: Option<&Stream>,
 ) -> Result<(), CudaError> {
     assert_eq!(out.len(), tokens * hidden, "embed: out length");
@@ -623,6 +643,7 @@ pub fn embed_gather_bf16(
             tokens as i32,
             vocab as i32,
             hidden as i32,
+            scale,
             stream_ptr,
         )
     };

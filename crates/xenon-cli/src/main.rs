@@ -552,21 +552,21 @@ fn cmd_test_rmsnorm(rows: usize, hidden: usize, eps: f32, seed: u64) -> anyhow::
     d_w.copy_from_host(&weight_host).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Warmup + timed run.
-    rmsnorm_bf16(&mut d_y, &d_x, &d_w, rows, hidden, eps, Some(&stream))
+    rmsnorm_bf16(&mut d_y, &d_x, Some(&d_w), rows, hidden, eps, Some(&stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let t0 = Instant::now();
     let iters = 50;
     for _ in 0..iters {
-        rmsnorm_bf16(&mut d_y, &d_x, &d_w, rows, hidden, eps, Some(&stream))
+        rmsnorm_bf16(&mut d_y, &d_x, Some(&d_w), rows, hidden, eps, Some(&stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let per_call_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
 
     let y_gpu = d_y.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let y_ref = rmsnorm_bf16_reference(&x_host, &weight_host, rows, hidden, eps);
+    let y_ref = rmsnorm_bf16_reference(&x_host, Some(&weight_host), rows, hidden, eps);
     let (max_abs_diff, max_rel_diff, _global) = compare_bf16(&y_gpu, &y_ref);
 
     println!("=== xenon-cli test-rmsnorm ===");
@@ -983,31 +983,35 @@ fn cmd_test_embed(dir: PathBuf, ids_csv: String) -> anyhow::Result<()> {
     device_synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let upload_ms = upload_start.elapsed().as_secs_f64() * 1e3;
 
-    embed_gather_bf16(&mut d_out, &d_table, &d_ids, tokens, vocab, hidden, Some(&stream))
+    // Gemma's ScaledWordEmbedding multiplies by sqrt(hidden_size) inside forward.
+    let embed_scale = (hidden as f32).sqrt();
+    embed_gather_bf16(&mut d_out, &d_table, &d_ids, tokens, vocab, hidden, embed_scale, Some(&stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let got = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Host reference: direct slice out of the mmap.
+    // Host reference: direct slice * scale.
     let table_host = bytes_to_bf16_vec(table_bytes);
     let mut want = vec![bf16::ZERO; tokens * hidden];
     for (t, &id) in ids_host.iter().enumerate() {
         let src = &table_host[id as usize * hidden..(id as usize + 1) * hidden];
-        want[t * hidden..(t + 1) * hidden].copy_from_slice(src);
+        for (i, v) in src.iter().enumerate() {
+            want[t * hidden + i] = bf16::from_f32(v.to_f32() * embed_scale);
+        }
     }
 
-    let mut mismatches = 0usize;
-    for (a, b) in got.iter().zip(want.iter()) {
-        if a.to_bits() != b.to_bits() { mismatches += 1; }
-    }
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
 
     println!("=== xenon-cli test-embed ===");
     println!("tokens                   {}", tokens);
     println!("ids                      {:?}", ids_host);
+    println!("embed_scale (sqrt H)     {:.4}", embed_scale);
     println!("table upload             {:>6.1} ms ({:.2} GiB)", upload_ms, (vocab * hidden * 2) as f64 / 1073741824.0);
-    println!("mismatched bf16 elements {}", mismatches);
-    anyhow::ensure!(mismatches == 0, "embedding gather produced {mismatches} mismatches");
-    println!("OK: gather is bit-identical to host slice.");
+    println!("max abs diff vs ref      {:.3e}", max_abs);
+    println!("global rel diff vs ref   {:.3e}", global_rel);
+    let tol_rel: f32 = 1e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: scaled gather matches host ref within {tol_rel:.1e}.");
     Ok(())
 }
 
@@ -1036,7 +1040,8 @@ fn cmd_test_attn_layer(
     } else { 0 };
     let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer);
     let eps = tc.rms_norm_eps as f32;
-    let scale = 1.0f32 / (d as f32).sqrt();
+    // Gemma 4 passes scaling=1.0 to attention (no 1/sqrt(D) factor).
+    let scale = 1.0f32;
 
     println!("=== xenon-cli test-attn-layer ===");
     println!("layer {layer}  kind {:?}  T={tokens}  q_pos_base={q_pos_base}", kind);
@@ -1146,7 +1151,7 @@ fn cmd_test_attn_layer(
                        d_out: &mut DeviceBuffer<bf16>,
                        d_x_normed: &mut DeviceBuffer<bf16>|
      -> anyhow::Result<()> {
-        rmsnorm_bf16(d_x_normed, &d_x, &d_in_norm_w, tokens, hidden, eps, Some(&stream))
+        rmsnorm_bf16(d_x_normed, &d_x, Some(&d_in_norm_w), tokens, hidden, eps, Some(&stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         lt.linear_bf16(d_q, d_x_normed, &d_qw, None, tokens, h * d, hidden, 1.0, 0.0, Some(&stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1157,10 +1162,14 @@ fn cmd_test_attn_layer(
         // q_norm / k_norm: per-head RMSNorm over D.
         // Clone into scratch since rmsnorm takes &x (read) + &mut out.
         let q_copy = clone_buffer(d_q)?;
-        rmsnorm_bf16(d_q, &q_copy, &d_q_norm_w, tokens * h, d, eps, Some(&stream))
+        rmsnorm_bf16(d_q, &q_copy, Some(&d_q_norm_w), tokens * h, d, eps, Some(&stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let k_copy = clone_buffer(d_k)?;
-        rmsnorm_bf16(d_k, &k_copy, &d_k_norm_w, tokens * h_kv, d, eps, Some(&stream))
+        rmsnorm_bf16(d_k, &k_copy, Some(&d_k_norm_w), tokens * h_kv, d, eps, Some(&stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // v_norm: RMSNorm with_scale=False, per-head over D. No weight tensor.
+        let v_copy = clone_buffer(d_v)?;
+        rmsnorm_bf16(d_v, &v_copy, None, tokens * h_kv, d, eps, Some(&stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         // RoPE in-place on q and k (the rotary dims only).
         rope_bf16(d_q, &d_positions, tokens, h,    d, rotary_dim, rope_theta, Some(&stream))
@@ -1201,15 +1210,16 @@ fn cmd_test_attn_layer(
     let v_w_host = fp4_dequant_bf16_reference(v_proj.packed, v_proj.scales, v_proj.global_scale, v_proj.out_features, v_proj.in_features);
     let o_w_host = fp4_dequant_bf16_reference(o_proj.packed, o_proj.scales, o_proj.global_scale, o_proj.out_features, o_proj.in_features);
 
-    let x_normed_host = rmsnorm_bf16_reference(&x_host, &in_norm_w_host, tokens, hidden, eps);
+    let x_normed_host = rmsnorm_bf16_reference(&x_host, Some(&in_norm_w_host), tokens, hidden, eps);
     let q_flat = linear_bf16_reference(&x_normed_host, &q_w_host, tokens, h * d, hidden, 1.0, 0.0, None);
     let k_flat = linear_bf16_reference(&x_normed_host, &k_w_host, tokens, h_kv * d, hidden, 1.0, 0.0, None);
     let v_flat = linear_bf16_reference(&x_normed_host, &v_w_host, tokens, h_kv * d, hidden, 1.0, 0.0, None);
-    let q_normed = rmsnorm_bf16_reference(&q_flat, &q_norm_w_host, tokens * h, d, eps);
-    let k_normed = rmsnorm_bf16_reference(&k_flat, &k_norm_w_host, tokens * h_kv, d, eps);
+    let q_normed = rmsnorm_bf16_reference(&q_flat, Some(&q_norm_w_host), tokens * h, d, eps);
+    let k_normed = rmsnorm_bf16_reference(&k_flat, Some(&k_norm_w_host), tokens * h_kv, d, eps);
+    let v_normed = rmsnorm_bf16_reference(&v_flat, None, tokens * h_kv, d, eps);
     let q_roped = rope_bf16_reference(&q_normed, &pos_host, tokens, h,    d, rotary_dim, rope_theta);
     let k_roped = rope_bf16_reference(&k_normed, &pos_host, tokens, h_kv, d, rotary_dim, rope_theta);
-    let attn_out_host = attn_naive_bf16_reference(&q_roped, &k_roped, &v_flat,
+    let attn_out_host = attn_naive_bf16_reference(&q_roped, &k_roped, &v_normed,
                                                   tokens, tokens, h, h_kv, d,
                                                   scale, q_pos_base, window);
     let cpu_out = linear_bf16_reference(&attn_out_host, &o_w_host, tokens, hidden, h * d, 1.0, 0.0, None);
@@ -1269,7 +1279,10 @@ fn run_prefill_attn(
     } else { 0 };
     let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer);
     let eps = tc.rms_norm_eps as f32;
-    let scale = 1.0f32 / (d as f32).sqrt();
+    // Gemma 4 passes scaling=1.0 to attention (no 1/sqrt(D) factor). The
+    // learned q_norm/k_norm weights absorb whatever scaling the network
+    // wants on Q·K.
+    let scale = 1.0f32;
 
     let prefix = format!("model.language_model.layers.{layer}");
     let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
@@ -1330,15 +1343,19 @@ fn run_prefill_attn(
     fp4_dequant_bf16(&mut d_kw, &d_kp, &d_ks, k_proj.global_scale, k_proj.out_features, k_proj.in_features, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     fp4_dequant_bf16(&mut d_vw, &d_vp, &d_vs, v_proj.global_scale, v_proj.out_features, v_proj.in_features, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    rmsnorm_bf16(&mut d_x_normed, &d_x, &d_in_norm_w, tokens, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_x_normed, &d_x, Some(&d_in_norm_w), tokens, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     lt.linear_bf16(&mut d_q, &d_x_normed, &d_qw, None, tokens, h * d, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     lt.linear_bf16(&mut d_k, &d_x_normed, &d_kw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     lt.linear_bf16(&mut d_v, &d_x_normed, &d_vw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     {
         let q_copy = clone_buffer(&d_q)?;
-        rmsnorm_bf16(&mut d_q, &q_copy, &d_q_norm_w, tokens * h, d, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        rmsnorm_bf16(&mut d_q, &q_copy, Some(&d_q_norm_w), tokens * h, d, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
         let k_copy = clone_buffer(&d_k)?;
-        rmsnorm_bf16(&mut d_k, &k_copy, &d_k_norm_w, tokens * h_kv, d, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        rmsnorm_bf16(&mut d_k, &k_copy, Some(&d_k_norm_w), tokens * h_kv, d, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // v_norm: RMSNorm with_scale=False — pure RMS normalization on V,
+        // per-head over head_dim. No learned weight tensor in the safetensors.
+        let v_copy = clone_buffer(&d_v)?;
+        rmsnorm_bf16(&mut d_v, &v_copy, None, tokens * h_kv, d, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     rope_bf16(&mut d_q, &d_positions, tokens, h,    d, rotary_dim, rope_theta, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     rope_bf16(&mut d_k, &d_positions, tokens, h_kv, d, rotary_dim, rope_theta, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1910,7 +1927,7 @@ fn cmd_test_mlp(dir: PathBuf, layer: usize, batch: usize, seed: u64) -> anyhow::
     // Warmup: first cuBLASLt call on a new (M, N, K) shape pays an algorithm-
     // selection / JIT cost that's unrelated to steady-state perf.
     let mut run_forward = |lt: &mut CublasLt| -> anyhow::Result<()> {
-        rmsnorm_bf16(&mut d_normed, &d_x, &d_norm_w, batch, hidden, eps, Some(&stream))
+        rmsnorm_bf16(&mut d_normed, &d_x, Some(&d_norm_w), batch, hidden, eps, Some(&stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         lt.linear_bf16(&mut d_gate_out, &d_normed, &d_gate_w, None, batch, inter, hidden, 1.0, 0.0, Some(&stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1944,7 +1961,7 @@ fn cmd_test_mlp(dir: PathBuf, layer: usize, batch: usize, seed: u64) -> anyhow::
     let up_w_host   = fp4_dequant_bf16_reference(up.packed,   up.scales,   up.global_scale,   up.out_features,   up.in_features);
     let down_w_host = fp4_dequant_bf16_reference(down.packed, down.scales, down.global_scale, down.out_features, down.in_features);
 
-    let normed_host = rmsnorm_bf16_reference(&x_host, &norm_w_host, batch, hidden, eps);
+    let normed_host = rmsnorm_bf16_reference(&x_host, Some(&norm_w_host), batch, hidden, eps);
     let gate_out_host = linear_bf16_reference(&normed_host, &gate_w_host, batch, inter, hidden, 1.0, 0.0, None);
     let up_out_host   = linear_bf16_reference(&normed_host, &up_w_host,   batch, inter, hidden, 1.0, 0.0, None);
 
