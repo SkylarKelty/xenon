@@ -125,7 +125,10 @@ during serving; phase 4 CUDA Graph capture subsumes this.
 - [ ] Tokenizer (load `tokenizer.json`, SentencePiece-compatible via
       `tokenizers` crate)
 - [x] Token embedding gather (bf16) — bit-identical to host slice
-- [ ] Per-layer embedding gather from pinned host memory
+- [x] Per-layer embedding gather from host mmap. `MmapWeights::gather_rows_bf16`
+      reads the 5.25 GiB PLE table (262144 × 10752 bf16) without uploading it;
+      per-forward gather cost is T × 21 KiB. Host cold-cache ~7 ms, warm ~0 ms.
+      Pinning H2D buffer is a later optimization.
 - [x] RoPE kernel (dual head_dim: 256 sliding full rotary, 128/512 partial
       for full-attention layers; rope_theta 10k / 1M via config)
 - [x] Naive attention (Q@Kᵀ → softmax → @V, GQA-aware) for correctness

@@ -293,6 +293,45 @@ impl MmapWeights {
         self.header.tensors.contains_key(&name)
     }
 
+    /// Gather rows from a bf16 embedding table directly out of the mmap,
+    /// without uploading the table to device memory. Returns `ids.len() * width`
+    /// bf16 entries in a flat row-major buffer.
+    ///
+    /// Intended for the 5.4 GiB per-layer-embed table that never fits in VRAM.
+    pub fn gather_rows_bf16(
+        &self,
+        table_name: &str,
+        ids: &[i32],
+        width: usize,
+    ) -> Result<Vec<half::bf16>> {
+        let bytes = self.load_bf16(table_name)?;
+        let info = self
+            .info(table_name)
+            .ok_or_else(|| Error::Config(format!("missing '{table_name}'")))?;
+        if info.shape.len() != 2 || info.shape[1] != width {
+            return Err(Error::Config(format!(
+                "'{table_name}' shape {:?} incompatible with width {width}",
+                info.shape
+            )));
+        }
+        let vocab = info.shape[0];
+        let mut out = Vec::with_capacity(ids.len() * width);
+        for &id in ids {
+            if id < 0 || (id as usize) >= vocab {
+                return Err(Error::Config(format!(
+                    "id {id} out of range for vocab {vocab} in '{table_name}'"
+                )));
+            }
+            let row_begin = (id as usize) * width * 2;
+            let row_end = row_begin + width * 2;
+            let row = &bytes[row_begin..row_end];
+            for c in row.chunks_exact(2) {
+                out.push(half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])));
+            }
+        }
+        Ok(out)
+    }
+
     /// Raw bytes of a plain bf16 tensor, with dtype + length validation.
     pub fn load_bf16(&self, name: &str) -> Result<&[u8]> {
         let info = self

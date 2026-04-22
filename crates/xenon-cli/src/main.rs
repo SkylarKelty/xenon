@@ -160,6 +160,17 @@ enum Command {
     /// Print the KV-sharing map derived from the safetensors header (which
     /// layers own their KV vs reuse from elsewhere).
     KvMap { model: PathBuf },
+    /// Gather PLE (per-layer embedding) rows from host mmap for a few token
+    /// IDs, upload to device, and verify against a direct host slice. Then
+    /// splits out one layer's [T, 256] and runs per_layer_input_gate to
+    /// prove the dim pipeline works with real weights.
+    TestPle {
+        model: PathBuf,
+        #[arg(long, default_value = "2,108,107,1")]
+        ids: String,
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+    },
     /// Apply RoPE on random input and compare to a CPU reference.
     TestRope {
         #[arg(long, default_value_t = 4)]
@@ -248,6 +259,7 @@ fn main() -> anyhow::Result<()> {
         Command::TestKvCache { model, layer, tokens, seed } =>
             cmd_test_kv_cache(model, layer, tokens, seed),
         Command::KvMap { model } => cmd_kv_map(model),
+        Command::TestPle { model, ids, layer } => cmd_test_ple(model, ids, layer),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -1319,6 +1331,153 @@ struct PrefillAttn {
     scale: f32,
     window: i32,
     kind: LayerKind,
+}
+
+fn cmd_test_ple(dir: PathBuf, ids_csv: String, layer: usize) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    let hidden = tc.hidden_size;
+    let per_layer = tc.hidden_size_per_layer_input
+        .ok_or_else(|| anyhow::anyhow!("config missing hidden_size_per_layer_input"))?;
+    let n_layers = tc.num_hidden_layers;
+    let ple_width = per_layer * n_layers;
+    anyhow::ensure!(layer < n_layers, "layer out of range");
+
+    let ids_host: Vec<i32> = ids_csv
+        .split(',')
+        .map(|s| s.trim().parse::<i32>())
+        .collect::<std::result::Result<_, _>>()?;
+    let tokens = ids_host.len();
+
+    println!("=== xenon-cli test-ple ===");
+    println!("tokens                     {}", tokens);
+    println!("ids                        {:?}", ids_host);
+    println!("layers / per_layer         {} / {}", n_layers, per_layer);
+    println!("ple_width (L * per_layer)  {}", ple_width);
+
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+    let table_name = "model.language_model.embed_tokens_per_layer.weight";
+    let info = mm.info(table_name).ok_or_else(|| anyhow::anyhow!("no PLE table"))?;
+    anyhow::ensure!(
+        info.shape == vec![tc.vocab_size, ple_width],
+        "PLE table shape {:?} != [{}, {}]", info.shape, tc.vocab_size, ple_width
+    );
+    println!("ple table bytes            {:.2} GiB ({} rows)",
+             info.bytes() as f64 / 1073741824.0, info.shape[0]);
+
+    // Host gather + upload.
+    let gather_start = Instant::now();
+    let host_gather = mm.gather_rows_bf16(table_name, &ids_host, ple_width)?;
+    let gather_ms = gather_start.elapsed().as_secs_f64() * 1e3;
+    anyhow::ensure!(host_gather.len() == tokens * ple_width, "gather length");
+
+    let mut d_gather: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let upload_start = Instant::now();
+    d_gather.copy_from_host(&host_gather).map_err(|e| anyhow::anyhow!("{e}"))?;
+    device_synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let upload_ms = upload_start.elapsed().as_secs_f64() * 1e3;
+    let upload_gb = (tokens * ple_width * 2) as f64 / 1e9;
+    println!("host gather                {:>6.1} ms", gather_ms);
+    println!("h2d upload                 {:>6.1} ms ({:.2} GB/s)",
+             upload_ms, upload_gb / (upload_ms / 1e3));
+
+    // Spot-check: for each token, bytes from the mmap row should match the
+    // device round-trip at every layer slice.
+    let got = d_gather.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut mismatches = 0usize;
+    for (a, b) in got.iter().zip(host_gather.iter()) {
+        if a.to_bits() != b.to_bits() { mismatches += 1; }
+    }
+    anyhow::ensure!(mismatches == 0, "round-trip mismatch: {mismatches}");
+
+    // Slice: PLE for this layer is columns [layer*per_layer, (layer+1)*per_layer).
+    // Since the gather is [T, ple_width] row-major, a per-layer slice would be
+    // non-contiguous. For the test, rebuild a contiguous [T, per_layer] on the
+    // host and upload it.
+    let begin = layer * per_layer;
+    let end = begin + per_layer;
+    let mut slice_host = Vec::with_capacity(tokens * per_layer);
+    for t in 0..tokens {
+        let row = &host_gather[t * ple_width..(t + 1) * ple_width];
+        slice_host.extend_from_slice(&row[begin..end]);
+    }
+    let mut d_ple: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_ple.copy_from_host(&slice_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!();
+    println!("--- layer {layer} PLE slice ---");
+    println!("  slice shape            [{tokens}, {per_layer}]");
+    let ple_max = slice_host.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+    println!("  |max|                  {:.4}", ple_max);
+
+    // Now run per_layer_input_gate on a random hidden-state input, just to
+    // prove dim wiring. This is a sanity on the linear path, not the PLE math.
+    let prefix = format!("model.language_model.layers.{layer}");
+    let gate = mm.load_quant_linear(&format!("{prefix}.per_layer_input_gate"))?;
+    let proj = mm.load_quant_linear(&format!("{prefix}.per_layer_projection"))?;
+    anyhow::ensure!(gate.out_features == per_layer && gate.in_features == hidden,
+        "per_layer_input_gate: got [{}, {}] want [{per_layer}, {hidden}]",
+        gate.out_features, gate.in_features);
+    anyhow::ensure!(proj.out_features == hidden && proj.in_features == per_layer,
+        "per_layer_projection: got [{}, {}] want [{hidden}, {per_layer}]",
+        proj.out_features, proj.in_features);
+    println!("  per_layer_input_gate   FP4 [{per_layer} x {hidden}]");
+    println!("  per_layer_projection   FP4 [{hidden} x {per_layer}]");
+
+    // Simulate a hidden-state for the gate+proj dim plumbing:
+    // gate maps hidden -> per_layer, projection maps per_layer -> hidden.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+    let h_host: Vec<bf16> = (0..tokens * hidden)
+        .map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)))
+        .collect();
+
+    // Dequantize gate/proj weights on device.
+    let mut d_gate_w: DeviceBuffer<bf16> = DeviceBuffer::new(gate.out_features * gate.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_proj_w: DeviceBuffer<bf16> = DeviceBuffer::new(proj.out_features * proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (mut d_gp, mut d_gs) = (
+        DeviceBuffer::<u8>::new(gate.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(gate.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    let (mut d_pp, mut d_ps) = (
+        DeviceBuffer::<u8>::new(proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    d_gp.copy_from_host_bytes(gate.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_gs.copy_from_host_bytes(gate.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_pp.copy_from_host_bytes(proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_ps.copy_from_host_bytes(proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_gate_w, &d_gp, &d_gs, gate.global_scale,
+                     gate.out_features, gate.in_features, Some(&stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_proj_w, &d_pp, &d_ps, proj.global_scale,
+                     proj.out_features, proj.in_features, Some(&stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_gated: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_back: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host(&h_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    lt.linear_bf16(&mut d_gated, &d_h, &d_gate_w, None, tokens, per_layer, hidden, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_back, &d_gated, &d_proj_w, None, tokens, hidden, per_layer, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Host-ref check for gate path correctness.
+    let gate_w_host = fp4_dequant_bf16_reference(gate.packed, gate.scales, gate.global_scale, gate.out_features, gate.in_features);
+    let proj_w_host = fp4_dequant_bf16_reference(proj.packed, proj.scales, proj.global_scale, proj.out_features, proj.in_features);
+    let gated_host = linear_bf16_reference(&h_host, &gate_w_host, tokens, per_layer, hidden, 1.0, 0.0, None);
+    let back_host  = linear_bf16_reference(&gated_host, &proj_w_host, tokens, hidden, per_layer, 1.0, 0.0, None);
+    let got_back = d_back.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (max_abs, _p, global_rel) = compare_bf16(&got_back, &back_host);
+    println!("  gate+proj vs ref       global_rel {:.3e}", global_rel);
+    let tol_rel: f32 = 5e-2;
+    anyhow::ensure!(global_rel <= tol_rel, "gate+proj path diverges: {global_rel}");
+    let _ = (max_abs, d_ple);
+    println!("OK: PLE gather + per-layer gate/projection paths wired and correct.");
+    Ok(())
 }
 
 fn cmd_kv_map(dir: PathBuf) -> anyhow::Result<()> {
