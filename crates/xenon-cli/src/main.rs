@@ -3678,8 +3678,7 @@ fn cmd_test_attn_flash(
     };
 
     // Flash kernel.
-    let flash_start = Instant::now();
-    let iters = 10;
+    let iters = 30;
     attn_flash_bf16(
         &mut d_flash, &d_q, &d_k, &d_v,
         t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
@@ -3694,7 +3693,24 @@ fn cmd_test_attn_flash(
     }
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let per_flash_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-    let _ = flash_start;
+
+    // Naive kernel timing (only if it fits in shmem).
+    let per_naive_us = if naive_fits {
+        attn_naive_bf16(
+            &mut d_naive, &d_q, &d_k, &d_v,
+            t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            attn_naive_bf16(
+                &mut d_naive, &d_q, &d_k, &d_v,
+                t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+            ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        Some(t0.elapsed().as_secs_f64() * 1e6 / iters as f64)
+    } else { None };
 
     let got = d_flash.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
     let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
@@ -3704,7 +3720,13 @@ fn cmd_test_attn_flash(
     println!("scale / q_pos_base       {:.6} / {}", scale, q_pos_base);
     println!("window                   {window}");
     println!("reference                {}", if naive_fits { "gpu naive kernel" } else { "host reference" });
+    if let Some(n) = per_naive_us {
+        println!("naive per-launch         {:>7.2} us", n);
+    }
     println!("flash per-launch         {:>7.2} us", per_flash_us);
+    if let Some(n) = per_naive_us {
+        println!("flash / naive            {:>7.2}x", per_flash_us / n);
+    }
     println!("max abs diff             {:.3e}", max_abs);
     println!("global rel diff          {:.3e}", global_rel);
     let tol_rel: f32 = 5e-2;

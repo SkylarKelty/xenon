@@ -284,11 +284,58 @@ that — deferred to the open-questions / future-phase bucket.
       batching (prefill M ≥ 128), the NVFP4 primitive (phase 4.1) becomes
       viable for MLP GEMMs. Keep the bf16 fallback for small-M.
 
-### Phase 6 — polish + bench [ ]
+### Phase 6 — polish + bench [~]
 - [ ] Nsight Compute profile passes, fix obvious tuning wins
 - [ ] PLE prefetch overlap (one layer ahead)
 - [ ] H2D overlap during decode if bandwidth-bound
 - [ ] Benchmark suite vs Ollama (same prompts, same model, same GPU)
+- [x] **Pre-dequant `per_layer_model_projection` at load** (2026-04-23).
+      Was calling `dequant_to` (647 μs) every forward_step; now dequanted
+      once into a 43 MB bf16 buffer at load, mirroring the lm_head pattern.
+      `ple assembly` phase 1.20 → 0.24 ms.
+- [x] **`DeviceBuffer::new` → `new_async` in forward_step** (2026-04-23).
+      All 11 call sites in the outer forward_step driver switched to
+      stream-ordered alloc; H2D uploads use `copy_from_host_bytes_async`.
+      Same change mirrored to `forward_step_batched` for the server path.
+      `forward_step_profiled` left sync (its job is per-phase timing via
+      host syncs).
+- [ ] **Attention kernel rewrite — split-KV.** [Investigated 2026-04-23, see
+      below.] Current `xk_attn_naive_bf16_kernel` is 30% of decode GPU time.
+      One block per (q_tok, q_head) gives only 8 blocks for decode on a
+      ~26-SM GPU — grid-underparallel. Existing `xk_attn_flash_bf16_kernel`
+      is architecturally wrong for our shapes (optimizes shmem for long
+      context we don't have). Path: a "naive-style" (threads partition
+      T_kv, no intra-block reduction) kernel with split-KV parallelism —
+      multiple blocks per head, each owns a T_kv chunk, tree-reduce
+      across blocks. Expected 2-3× decode attention speedup.
+
+**Attention kernel findings (2026-04-23).**
+
+Per-launch on our shapes (D=256 sliding / D=512 full, T_kv ≤ 512 sliding
+or ≤ 155 for our bench), measured via `test-attn-flash`:
+
+| Shape | naive | flash (rewritten) | flash/naive |
+| --- | --- | --- | --- |
+| T_q=1, T_kv=255, D=256 | 48 μs | 119 μs | 2.48× |
+| T_q=1, T_kv=255, D=512 | 94 μs | 253 μs | 2.69× |
+| T_q=155, T_kv=155, D=256 | 442 μs | 1010 μs | 2.28× |
+| T_q=155, T_kv=155, D=512 | 858 μs | 3383 μs | 3.94× |
+
+Naive wins because threads partition the T_kv dimension and each thread
+does a full D-wide dot product independently — no intra-block reduction.
+Flash partitions D and cooperates per K row, requiring BR=16 block-wide
+reductions per tile; the reduction overhead only amortizes for T_kv in
+the 10K+ regime where naive's O(T_kv) shmem blows the 48 KiB budget.
+Flash kernel rewrite (batched reduction via warp-shuffle + shared memory)
+is ~1.5× faster than the original flash but still ~2× slower than naive.
+Kept wired to `attn_naive_bf16` in production; the improved flash remains
+the long-context fallback (naive shmem budget hard-caps around T_kv≈12K).
+
+*The real win for decode attention is grid parallelism, not kernel
+internals.* Decode has 1 query row × 8 heads = 8 blocks, so only 8 of
+~26 SMs active (~31% SM occupancy regardless of kernel design). Split-KV
+(blocks = q_tok × q_head × kv_chunk) is the fix — sketched in the TODO
+above, not attempted this session.
 
 ### Phase 7 - emotion vectors [ ]
 - [ ] Investigate https://transformer-circuits.pub/2026/emotions/index.html#toc-15 - add in support for measuring/mapping emotion vectors
@@ -320,9 +367,12 @@ that — deferred to the open-questions / future-phase bucket.
   KV, but the paper/config doesn't directly specify the mapping. Must be
   derived from the tensor presence pattern (layers without their own K/V
   proj weights reuse earlier ones). Resolve in phase 2.
-- **Attention kernel.** Hand-rolled vs CUTLASS FMHA vs FlashInfer C++. Start
-  hand-rolled for understanding and small-head-dim support; swap if perf
-  demands it.
+- **Attention kernel — split-KV rewrite.** Naive is fastest for our shapes
+  (see Phase 6 findings); the remaining 30% of decode GPU time comes from
+  low SM occupancy (8 blocks for decode on ~26 SMs). Split-KV parallelism
+  across a third grid dimension + tree-reduce is the expected 2-3× path.
+  Tensor-core (wgmma/mma.m16n8k16 bf16) attention is a further 3-5× on top
+  but significantly more code.
 - **Native FP4 GEMM migration.** Post-phase-3 we swap dequant+bf16 GEMM for
   cuBLASLt NVFP4 operand mode. Expected win: ~2-3× MLP throughput when
   compute-bound, nothing when bandwidth-bound (which is most of decode).

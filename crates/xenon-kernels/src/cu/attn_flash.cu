@@ -11,6 +11,10 @@
 // Constraints:
 // - D % BLOCK_THREADS == 0  (D = 256 or 512 with BLOCK_THREADS = 128 works).
 // - MAX_D_PER_THREAD >= D_PER_THREAD  (static bound for register arrays).
+//
+// Reduction: every thread accumulates BR partial dots in registers, then a
+// single block-wide reduction combines them via warp shuffle + shared memory.
+// That's ~O(log N_warps) syncs per tile instead of BR * log(BLOCK_THREADS).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -19,6 +23,8 @@
 static constexpr int BR = 16;
 static constexpr int BLOCK_THREADS = 128;
 static constexpr int MAX_D_PER_THREAD = 8;  // D up to 512 * 2 = 1024 headroom
+static constexpr int WARPS = BLOCK_THREADS / 32;
+static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be warp-multiple");
 
 __global__ void xk_attn_flash_bf16_kernel(
     __nv_bfloat16* __restrict__ out,
@@ -32,9 +38,13 @@ __global__ void xk_attn_flash_bf16_kernel(
     __nv_bfloat16* K_tile = (__nv_bfloat16*)smem_buf;
     __nv_bfloat16* V_tile = K_tile + BR * D;
     float* scores = (float*)(V_tile + BR * D);  // [BR]
-    float* reduce_scratch = scores + BR;        // [BLOCK_THREADS]
+    // Inter-warp reduction scratch: [WARPS * BR]. Laid out so warp w row j
+    // lives at [w * BR + j] — coalesced when warp 0's lane j reads lane w.
+    float* warp_sums = scores + BR;
 
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     const int blk = blockIdx.x;
     const int q_tok = blk / H;
     const int q_head = blk % H;
@@ -79,32 +89,59 @@ __global__ void xk_attn_flash_bf16_kernel(
         }
         __syncthreads();
 
-        // Compute scores[j] = scale * (Q · K_tile[j]) for each row in tile.
-        // Each thread contributes a partial dot; reduce across the block.
-        for (int j = 0; j < tile_len; ++j) {
-            int kv_pos = tile_start + j;
-            bool masked = (kv_pos < kv_min) || (kv_pos > kv_max);
-            float local = 0.0f;
-            if (!masked) {
-                #pragma unroll
-                for (int i = 0; i < MAX_D_PER_THREAD; ++i) {
-                    if (i < D_PER_THREAD) {
-                        int d = tid + i * BLOCK_THREADS;
-                        if (d < D) local += q_reg[i] * __bfloat162float(K_tile[j * D + d]);
+        // Batched QK-dot: each thread accumulates BR partial dots over its D
+        // slice in registers. Then one block-wide reduction combines all BR
+        // scores at once.
+        float partial[BR];
+        #pragma unroll
+        for (int j = 0; j < BR; ++j) partial[j] = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < MAX_D_PER_THREAD; ++i) {
+            if (i < D_PER_THREAD) {
+                int d = tid + i * BLOCK_THREADS;
+                if (d < D) {
+                    float q_d = q_reg[i];
+                    #pragma unroll
+                    for (int j = 0; j < BR; ++j) {
+                        if (j < tile_len) {
+                            partial[j] += q_d * __bfloat162float(K_tile[j * D + d]);
+                        }
                     }
                 }
             }
-            reduce_scratch[tid] = local;
-            __syncthreads();
-            for (int s = BLOCK_THREADS / 2; s > 0; s >>= 1) {
-                if (tid < s) reduce_scratch[tid] += reduce_scratch[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) {
-                scores[j] = masked ? -FLT_MAX : reduce_scratch[0] * scale;
-            }
-            __syncthreads();
         }
+
+        // Warp-level reduce for each of BR scores (no __syncthreads needed).
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride >>= 1) {
+            #pragma unroll
+            for (int j = 0; j < BR; ++j) {
+                partial[j] += __shfl_xor_sync(0xffffffff, partial[j], stride);
+            }
+        }
+
+        // Each warp's lane 0 now has that warp's contribution to each score.
+        if (lane == 0) {
+            #pragma unroll
+            for (int j = 0; j < BR; ++j) {
+                warp_sums[warp * BR + j] = partial[j];
+            }
+        }
+        __syncthreads();
+
+        // Reduce across warps. BR=16 scores, WARPS=4 (at BLOCK_THREADS=128);
+        // have the first BR threads each sum WARPS values.
+        if (tid < BR) {
+            int j = tid;
+            float s = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w) s += warp_sums[w * BR + j];
+            int kv_pos = tile_start + j;
+            bool masked = (j >= tile_len) || (kv_pos < kv_min) || (kv_pos > kv_max);
+            scores[j] = masked ? -FLT_MAX : s * scale;
+        }
+        __syncthreads();
 
         // All threads compute identical m_tile, m_new, alpha from scores.
         float m_tile = -FLT_MAX;
@@ -167,8 +204,8 @@ extern "C" int xk_attn_flash_bf16(
     dim3 grid(T_q * H);
     dim3 block(BLOCK_THREADS);
     size_t shmem = (size_t)BR * D * 2 * sizeof(__nv_bfloat16)
-                 + (size_t)BR * sizeof(float)
-                 + (size_t)BLOCK_THREADS * sizeof(float);
+                 + (size_t)BR * sizeof(float)                    // scores
+                 + (size_t)WARPS * BR * sizeof(float);           // warp_sums
     xk_attn_flash_bf16_kernel<<<grid, block, shmem, s>>>(
         (__nv_bfloat16*)out,
         (const __nv_bfloat16*)q,
