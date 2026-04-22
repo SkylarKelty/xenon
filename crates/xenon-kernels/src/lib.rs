@@ -20,5 +20,5 @@ pub use kernels::{
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, hello, per_layer_slice_bf16,
     rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16, rope_bf16_reference, scale_bf16,
-    softmax_attn_bf16, softmax_attn_bf16_reference, ue4m3_to_f32,
+    softcap_bf16, softmax_attn_bf16, softmax_attn_bf16_reference, ue4m3_to_f32,
 };

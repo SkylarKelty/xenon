@@ -15,7 +15,8 @@ use xenon_kernels::{
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16, rope_bf16_reference,
-    scale_bf16, softmax_attn_bf16, softmax_attn_bf16_reference, CublasLt, KvCache, SlotSpec,
+    scale_bf16, softcap_bf16, softmax_attn_bf16, softmax_attn_bf16_reference, CublasLt,
+    KvCache, SlotSpec,
 };
 
 /// Parse a little-endian bf16 byte slice into a `Vec<bf16>`. Avoids
@@ -215,6 +216,14 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         layer: usize,
     },
+    /// Diff the post-stack tail: take HF's `layer_41.final`, apply final
+    /// RMSNorm + tied lm_head + softcap, compare to HF at each of the three
+    /// stages.
+    TestVsHfTail {
+        model: PathBuf,
+        #[arg(long)]
+        hf: PathBuf,
+    },
     /// Run the FlashAttention-2 tiled kernel vs the naive kernel on random
     /// Q/K/V and verify they agree. Exercises the online-softmax path at
     /// T_kv values where the naive kernel would run out of shared memory.
@@ -335,6 +344,7 @@ fn main() -> anyhow::Result<()> {
         Command::TestVsHfPle { model, hf, ids } => cmd_test_vs_hf_ple(model, hf, ids),
         Command::TestVsHfLayer { model, hf, ids, layer } =>
             cmd_test_vs_hf_layer(model, hf, ids, layer),
+        Command::TestVsHfTail { model, hf } => cmd_test_vs_hf_tail(model, hf),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -1597,6 +1607,119 @@ fn cmd_test_vs_hf_ple(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) -> 
     let tol: f32 = 5e-2;
     anyhow::ensure!(proj_rel <= tol, "projected vs HF: global rel {proj_rel} > {tol}");
     println!("OK: full PLE assembly matches HF within {tol:.1e}.");
+    Ok(())
+}
+
+fn cmd_test_vs_hf_tail(model_dir: PathBuf, hf_path: PathBuf) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&model_dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    let hidden = tc.hidden_size;
+    let vocab = tc.vocab_size;
+    let n_layers = tc.num_hidden_layers;
+    let eps = tc.rms_norm_eps as f32;
+    let softcap = tc.final_logit_softcapping.unwrap_or(30.0) as f32;
+
+    println!("=== xenon-cli test-vs-hf-tail ===");
+    println!("hidden / vocab / softcap {} / {} / {}", hidden, vocab, softcap);
+
+    let mm = MmapWeights::open(&model_dir.join("model.safetensors"))?;
+    let hf_mm = MmapWeights::open(&hf_path)?;
+
+    // Input: HF's layer_{last}.final.
+    let last_final_name = format!("layer_{:02}.final", n_layers - 1);
+    let last_bytes = hf_mm.load_bf16(&last_final_name)?;
+    let tokens = last_bytes.len() / (hidden * 2);
+    anyhow::ensure!(last_bytes.len() == tokens * hidden * 2, "last_final shape");
+
+    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host_bytes(last_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Stage 1: final RMSNorm.
+    let norm_bytes = mm.load_bf16("model.language_model.norm.weight")?;
+    let mut d_norm_w: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_norm_w.copy_from_host_bytes(norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_final_norm: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_final_norm, &d_h, Some(&d_norm_w), tokens, hidden, eps, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ours_final_norm = d_final_norm.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hf_final_norm_bytes = hf_mm.load_bf16("final_norm_out")?;
+    let hf_final_norm = bytes_to_bf16_vec(hf_final_norm_bytes);
+    let (fn_abs, _, fn_rel) = compare_bf16(&ours_final_norm, &hf_final_norm);
+    println!();
+    println!("-- final RMSNorm --");
+    println!("  max abs diff           {:.3e}", fn_abs);
+    println!("  global rel diff        {:.3e}", fn_rel);
+    anyhow::ensure!(fn_rel <= 5e-2, "final norm rel {fn_rel}");
+
+    // Stage 2: lm_head (tied: y = h @ embed_tokens^T).
+    let embed_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let t_upload = Instant::now();
+    d_lm_head.copy_from_host_bytes(embed_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let upload_ms = t_upload.elapsed().as_secs_f64() * 1e3;
+    println!();
+    println!("-- lm_head upload --");
+    println!("  bytes                  {:.2} GiB", (vocab * hidden * 2) as f64 / 1073741824.0);
+    println!("  elapsed                {:.1} ms", upload_ms);
+
+    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let t_gemm = Instant::now();
+    lt.linear_bf16(&mut d_logits, &d_final_norm, &d_lm_head, None,
+                    tokens, vocab, hidden, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let gemm_ms = t_gemm.elapsed().as_secs_f64() * 1e3;
+    let ours_pre = d_logits.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hf_pre_bytes = hf_mm.load_bf16("logits_pre_softcap")?;
+    let hf_pre = bytes_to_bf16_vec(hf_pre_bytes);
+    let (pre_abs, _, pre_rel) = compare_bf16(&ours_pre, &hf_pre);
+    println!();
+    println!("-- lm_head (tied) --");
+    println!("  gemm                   {:.1} ms", gemm_ms);
+    println!("  max abs diff           {:.3e}", pre_abs);
+    println!("  global rel diff        {:.3e}", pre_rel);
+    anyhow::ensure!(pre_rel <= 5e-2, "logits_pre rel {pre_rel}");
+
+    // Stage 3: softcap.
+    let mut d_logits_capped: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    softcap_bf16(&mut d_logits_capped, &d_logits, softcap, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ours_post = d_logits_capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hf_post_bytes = hf_mm.load_bf16("logits_post_softcap")?;
+    let hf_post = bytes_to_bf16_vec(hf_post_bytes);
+    let (post_abs, _, post_rel) = compare_bf16(&ours_post, &hf_post);
+    println!();
+    println!("-- softcap tanh(x/{})*{} --", softcap, softcap);
+    println!("  max abs diff           {:.3e}", post_abs);
+    println!("  global rel diff        {:.3e}", post_rel);
+    anyhow::ensure!(post_rel <= 5e-2, "logits_post rel {post_rel}");
+
+    // Top-k sanity: our next-token predictions should match HF's.
+    let last_row = &ours_post[(tokens - 1) * vocab..];
+    let hf_last_row = &hf_post[(tokens - 1) * vocab..];
+    let mut ours_topk: Vec<(usize, f32)> = last_row.iter().enumerate()
+        .map(|(i, v)| (i, v.to_f32())).collect();
+    ours_topk.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut hf_topk: Vec<(usize, f32)> = hf_last_row.iter().enumerate()
+        .map(|(i, v)| (i, v.to_f32())).collect();
+    hf_topk.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    println!();
+    println!("-- top-5 next token for last row --");
+    println!("  {:<10}  {:<20}  {:<10}  {:<20}", "ours id", "ours logit", "hf id", "hf logit");
+    for i in 0..5 {
+        println!("  {:<10}  {:<20.3}  {:<10}  {:<20.3}",
+                 ours_topk[i].0, ours_topk[i].1,
+                 hf_topk[i].0, hf_topk[i].1);
+    }
+
+    println!();
+    println!("OK: post-stack tail (final norm + lm_head + softcap) matches HF.");
     Ok(())
 }
 

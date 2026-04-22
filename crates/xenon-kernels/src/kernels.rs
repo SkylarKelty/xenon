@@ -108,6 +108,13 @@ unsafe extern "C" {
         layer_idx: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_softcap_bf16(
+        out: *mut c_void,
+        input: *const c_void,
+        n: i32,
+        cap: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn xk_attn_flash_bf16(
         out: *mut c_void,
         q: *const c_void,
@@ -596,6 +603,28 @@ pub fn per_layer_slice_bf16(
             num_layers as i32,
             per_layer_dim as i32,
             layer_idx as i32,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Final-logit softcap: `out[i] = tanh(in[i] / cap) * cap`. Gemma uses
+/// `cap = 30.0` via `final_logit_softcapping`.
+pub fn softcap_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    input: &DeviceBuffer<bf16>,
+    cap: f32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(out.len(), input.len(), "softcap: out/in length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_softcap_bf16(
+            out.as_device_ptr(),
+            input.as_device_ptr(),
+            out.len() as i32,
+            cap,
             stream_ptr,
         )
     };
