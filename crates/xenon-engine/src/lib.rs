@@ -49,10 +49,18 @@ impl QuantLinearDev {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// `y = x @ W^T` with FP4 weight. For `m == 1` this takes the fused
-    /// FP4×bf16 gemv path (no intermediate bf16 weight); for `m > 1` it
-    /// dequants the weight into transient scratch and calls cuBLASLt bf16
-    /// linear, which amortizes the dequant cost across M.
+    /// `y = x @ W^T` with FP4 weight. For `m == 1` uses the fused
+    /// FP4×bf16 gemv path; for `m > 1` dequants to bf16 and calls
+    /// `linear_bf16`.
+    ///
+    /// Note on native NVFP4 at `m >= 128`: tried 2026-04-22. `linear_nvfp4`
+    /// requires BOTH operands FP4 on Blackwell, so we had to quantize the
+    /// activation to FP4 via `nvfp4_quantize_bf16`. Prefill sped up from
+    /// 952 → 2390 tok/s at T=155, but decode output collapsed to token 0
+    /// (complete garbage) — FP4 activations compound too much error over
+    /// 42 layers. Blackwell sm_120a doesn't offer a mixed FP4×bf16 tensor-
+    /// core path, so the primitive is kept dormant until someone does
+    /// smart-outlier-handling or switches to an FP8 activation format.
     pub fn forward(
         &self,
         lt: &mut CublasLt,
@@ -61,19 +69,19 @@ impl QuantLinearDev {
         m: usize,
         stream: &Stream,
     ) -> anyhow::Result<()> {
+        let n = self.out_features;
+        let k = self.in_features;
         if m == 1 {
             fp4_gemv_bf16(y, x, &self.packed, &self.scales, self.global_scale,
-                           self.out_features, self.in_features, Some(stream))
+                           n, k, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))
         } else {
-            let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(
-                self.out_features * self.in_features, stream)
+            let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * k, stream)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             fp4_dequant_bf16(&mut w, &self.packed, &self.scales, self.global_scale,
-                              self.out_features, self.in_features, Some(stream))
+                              n, k, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            lt.linear_bf16(y, x, &w, None, m, self.out_features, self.in_features,
-                            1.0, 0.0, Some(stream))
+            lt.linear_bf16(y, x, &w, None, m, n, k, 1.0, 0.0, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
     }

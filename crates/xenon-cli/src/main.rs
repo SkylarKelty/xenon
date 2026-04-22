@@ -2074,7 +2074,10 @@ impl QuantLinearDev {
     }
 
     /// `y = x @ W^T`. Dispatches to the fused FP4×bf16 gemv for M=1 decode,
-    /// and to dequant+bf16 linear for M>1 (where the dequant cost amortizes).
+    /// and to dequant+bf16 linear for M>1 (dequant amortizes across M).
+    /// Native NVFP4 was tried for M≥128 and reverted — it requires FP4
+    /// activations, which produce garbage output after 42 layers. See
+    /// the engine's QuantLinearDev::forward for details.
     fn forward(
         &self,
         lt: &mut CublasLt,
@@ -2083,19 +2086,19 @@ impl QuantLinearDev {
         m: usize,
         stream: &Stream,
     ) -> anyhow::Result<()> {
+        let n = self.out_features;
+        let k = self.in_features;
         if m == 1 {
             fp4_gemv_bf16(y, x, &self.packed, &self.scales, self.global_scale,
-                           self.out_features, self.in_features, Some(stream))
+                           n, k, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))
         } else {
-            let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(
-                self.out_features * self.in_features, stream)
+            let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * k, stream)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             fp4_dequant_bf16(&mut w, &self.packed, &self.scales, self.global_scale,
-                              self.out_features, self.in_features, Some(stream))
+                              n, k, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            lt.linear_bf16(y, x, &w, None, m, self.out_features, self.in_features,
-                            1.0, 0.0, Some(stream))
+            lt.linear_bf16(y, x, &w, None, m, n, k, 1.0, 0.0, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
     }
