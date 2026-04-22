@@ -5,3 +5,4 @@ Cargo.lock.bak
 .DS_Store
 tools/gpubench/gpubench
 /results/
+/profiles/
