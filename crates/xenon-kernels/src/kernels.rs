@@ -92,6 +92,22 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_scale_bf16(
+        out: *mut c_void,
+        input: *const c_void,
+        n: i32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn xk_per_layer_slice_bf16(
+        out: *mut c_void,
+        src: *const c_void,
+        tokens: i32,
+        num_layers: i32,
+        per_layer_dim: i32,
+        layer_idx: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn xk_attn_flash_bf16(
         out: *mut c_void,
         q: *const c_void,
@@ -529,6 +545,57 @@ pub fn add_scale_bf16(
             b.as_device_ptr(),
             out.len() as i32,
             scale,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Element-wise `out[i] = in[i] * scale`, bf16 I/O. In-place safe.
+pub fn scale_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    input: &DeviceBuffer<bf16>,
+    scale: f32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(out.len(), input.len(), "scale: out/in length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_scale_bf16(
+            out.as_device_ptr(),
+            input.as_device_ptr(),
+            out.len() as i32,
+            scale,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Extract layer `layer_idx`'s slice from a `[tokens, num_layers,
+/// per_layer_dim]` bf16 tensor into a contiguous `[tokens, per_layer_dim]`
+/// output. Used to split the PLE combined tensor for per-layer consumption.
+pub fn per_layer_slice_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    src: &DeviceBuffer<bf16>,
+    tokens: usize,
+    num_layers: usize,
+    per_layer_dim: usize,
+    layer_idx: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(out.len(), tokens * per_layer_dim, "slice: out length");
+    assert_eq!(src.len(), tokens * num_layers * per_layer_dim, "slice: src length");
+    assert!(layer_idx < num_layers, "slice: layer_idx out of range");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_per_layer_slice_bf16(
+            out.as_device_ptr(),
+            src.as_device_ptr(),
+            tokens as i32,
+            num_layers as i32,
+            per_layer_dim as i32,
+            layer_idx as i32,
             stream_ptr,
         )
     };
