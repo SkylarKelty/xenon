@@ -269,12 +269,17 @@ that — deferred to the open-questions / future-phase bucket.
 - [ ] `POST /v1/completions` (legacy)
 - [ ] `GET /v1/models`
 - [ ] Concurrent-request queuing (one request at a time on device in v1)
-- [ ] **CUDA Graph capture per decode shape; graph-update for growing
-      `t_kv` each step.** Belongs here, not phase 4: graphs pay off when
-      a long-lived server process amortizes capture over thousands of
-      decode steps, not a one-shot CLI. Prereqs land here too —
-      persistent scratch pool, raw-pointer kernel variants, decode via
-      flash-attn (fixed shmem).
+- [~] **CUDA Graph capture — investigated, deprioritized.** Prereq
+      (persistent [`DecodeScratch`] covering all per-step buffers) was
+      built and benched: no meaningful change vs the cudaMallocAsync
+      pool (189 ms/step either way; run variance ≈ ±2%). Profiling
+      shows the decoder stack alone is ~121 ms of kernel time, so
+      decode is compute- and bandwidth-bound, not launch-bound (42
+      layers × ~20 launches × 1.57 µs ≈ 1.3 ms total launch overhead
+      — <1% of wall time). Graphs won't recover ms here; reverted the
+      scratch wiring to keep the code lean. Kernel wrappers now accept
+      `buf.len() >= required` (was `==`) so the infrastructure is
+      still compatible if we revisit.
 - [ ] **Dispatch NVFP4 GEMM for large-M paths.** With concurrent-request
       batching (prefill M ≥ 128), the NVFP4 primitive (phase 4.1) becomes
       viable for MLP GEMMs. Keep the bf16 fallback for small-M.

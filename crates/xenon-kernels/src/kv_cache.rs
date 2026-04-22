@@ -94,8 +94,11 @@ impl KvCache {
     ) -> Result<(), CudaError> {
         let spec = self.slot_spec(layer);
         let row_elts = spec.h_kv * spec.head_dim;
-        assert_eq!(new_k.len(), n_tokens * row_elts, "append: new_k length");
-        assert_eq!(new_v.len(), n_tokens * row_elts, "append: new_v length");
+        let n_elts = n_tokens * row_elts;
+        // new_k/new_v may be oversized persistent scratch (e.g. sized for the
+        // larger head_dim variant); we only read the first `n_elts` elements.
+        assert!(new_k.len() >= n_elts, "append: new_k length {} < {}", new_k.len(), n_elts);
+        assert!(new_v.len() >= n_elts, "append: new_v length {} < {}", new_v.len(), n_elts);
         assert!(
             self.cur_len + n_tokens <= self.max_len,
             "append: overflows max_len (cur {}, add {}, max {})",
@@ -103,8 +106,8 @@ impl KvCache {
         );
         let slot = self.slot_for(layer);
         let offset = self.cur_len * row_elts;
-        self.k[slot].copy_slice_from_device(offset, new_k)?;
-        self.v[slot].copy_slice_from_device(offset, new_v)?;
+        self.k[slot].copy_region_from_device(offset, new_k, 0, n_elts)?;
+        self.v[slot].copy_region_from_device(offset, new_v, 0, n_elts)?;
         Ok(())
     }
 

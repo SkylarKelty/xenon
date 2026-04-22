@@ -366,9 +366,13 @@ impl CublasLt {
         beta: f32,
         stream: Option<&Stream>,
     ) -> Result<(), GemmError> {
-        assert_eq!(x.len(), m * k);
-        assert_eq!(w.len(), n * k);
-        assert_eq!(y.len(), m * n);
+        // x/w/y may be persistent oversized scratch (shared across weights
+        // of different shapes during one forward pass). cuBLASLt reads/writes
+        // exactly m*k/n*k/m*n elements laid out from the buffer origin, so
+        // `>=` is sufficient. Bias c stays exact.
+        assert!(x.len() >= m * k, "linear: x length");
+        assert!(w.len() >= n * k, "linear: w length");
+        assert!(y.len() >= m * n, "linear: y length");
         if let Some(c) = c {
             assert_eq!(c.len(), m * n);
         }

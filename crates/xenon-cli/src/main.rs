@@ -12,7 +12,7 @@ use xenon_core::{
 use xenon_kernels::{
     add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, PinnedBuffer, Stream},
-    embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
+    embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16,
     rope_bf16_reference, scale_bf16, softcap_bf16, softmax_attn_bf16,
@@ -107,6 +107,18 @@ enum Command {
         module: String,
         #[arg(long, default_value_t = 1)]
         m: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run the fused FP4×bf16 gemv (M=1 decode fast path) on a real quantized
+    /// Gemma weight; compare against dequant+linear_bf16 and time both.
+    TestFp4Gemv {
+        model: PathBuf,
+        /// Full prefix of a quantized linear (e.g. model.language_model.layers.0.mlp.gate_proj).
+        #[arg(long)]
+        module: String,
+        #[arg(long, default_value_t = 100)]
+        iters: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -407,6 +419,7 @@ fn main() -> anyhow::Result<()> {
         Command::TestGemm { m, n, k, seed } => cmd_test_gemm(m, n, k, seed),
         Command::TestLinear { m, n, k, seed } => cmd_test_linear(m, n, k, seed),
         Command::TestNvfp4Linear { model, module, m, seed } => cmd_test_nvfp4_linear(model, module, m, seed),
+        Command::TestFp4Gemv { model, module, iters, seed } => cmd_test_fp4_gemv(model, module, iters, seed),
         Command::TestNvfp4Roundtrip { rows, cols, seed } => cmd_test_nvfp4_roundtrip(rows, cols, seed),
         Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
         Command::TestMlp { model, layer, batch, seed } => cmd_test_mlp(model, layer, batch, seed),
@@ -1073,6 +1086,97 @@ fn cmd_test_nvfp4_linear(dir: PathBuf, module: String, m: usize, seed: u64) -> a
     let tol: f32 = 0.6;
     anyhow::ensure!(global_rel <= tol, "nvfp4 vs ref: {global_rel} > {tol}");
     println!("OK: native NVFP4 GEMM runs correctly (rel {:.1}% vs dequanted-bf16 on random input; real activations match tighter).",
+             global_rel * 100.0);
+    Ok(())
+}
+
+fn cmd_test_fp4_gemv(dir: PathBuf, module: String, iters: usize, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+    let q = mm.load_quant_linear(&module)?;
+    let (n, k) = (q.out_features, q.in_features);
+    println!("=== xenon-cli test-fp4-gemv ===");
+    println!("module                 {module}");
+    println!("shape (N, K)           ({n}, {k})");
+    println!("global_scale           {}", q.global_scale);
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..k).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_w_packed: DeviceBuffer<u8> = DeviceBuffer::new(q.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_w_scales: DeviceBuffer<u8> = DeviceBuffer::new(q.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_w_packed.copy_from_host_bytes(q.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_w_scales.copy_from_host_bytes(q.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Reference: dequant to bf16 weight, then bf16 linear.
+    let mut d_w_bf16: DeviceBuffer<bf16> = DeviceBuffer::new(n * k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_w_bf16, &d_w_packed, &d_w_scales, q.global_scale, n, k, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_y_ref: DeviceBuffer<bf16> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_y_ref, &d_x, &d_w_bf16, None, 1, n, k, 1.0, 0.0, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Fused: FP4×bf16 gemv directly.
+    let mut d_y_fused: DeviceBuffer<bf16> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_gemv_bf16(&mut d_y_fused, &d_x, &d_w_packed, &d_w_scales, q.global_scale, n, k, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let got = d_y_fused.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = d_y_ref.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
+    println!();
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("global rel diff         {:.3e}", global_rel);
+
+    // Timing: N iterations each, synchronize once at the end.
+    if iters > 0 {
+        // Warmup.
+        for _ in 0..5 {
+            fp4_gemv_bf16(&mut d_y_fused, &d_x, &d_w_packed, &d_w_scales, q.global_scale, n, k, Some(&stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            fp4_dequant_bf16(&mut d_w_bf16, &d_w_packed, &d_w_scales, q.global_scale, n, k, Some(&stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            lt.linear_bf16(&mut d_y_ref, &d_x, &d_w_bf16, None, 1, n, k, 1.0, 0.0, Some(&stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            fp4_gemv_bf16(&mut d_y_fused, &d_x, &d_w_packed, &d_w_scales, q.global_scale, n, k, Some(&stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let fused_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            fp4_dequant_bf16(&mut d_w_bf16, &d_w_packed, &d_w_scales, q.global_scale, n, k, Some(&stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            lt.linear_bf16(&mut d_y_ref, &d_x, &d_w_bf16, None, 1, n, k, 1.0, 0.0, Some(&stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ref_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        println!();
+        println!("fused fp4 gemv          {:>7.1} us  ({} iters)", fused_us, iters);
+        println!("dequant + bf16 gemv     {:>7.1} us  ({} iters)", ref_us, iters);
+        println!("speedup                 {:>7.2}x", ref_us / fused_us);
+    }
+
+    // Accumulation-order differences between the two reductions mean bit-for-
+    // bit equality isn't guaranteed, but global rel should be tiny.
+    let tol: f32 = 0.01;
+    anyhow::ensure!(global_rel <= tol, "fused vs dequant: rel {global_rel} > {tol}");
+    println!("OK: fused fp4 gemv matches dequant+bf16 linear within {:.3}% rel.",
              global_rel * 100.0);
     Ok(())
 }
@@ -1968,6 +2072,33 @@ impl QuantLinearDev {
                           self.out_features, self.in_features, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
+
+    /// `y = x @ W^T`. Dispatches to the fused FP4×bf16 gemv for M=1 decode,
+    /// and to dequant+bf16 linear for M>1 (where the dequant cost amortizes).
+    fn forward(
+        &self,
+        lt: &mut CublasLt,
+        y: &mut DeviceBuffer<bf16>,
+        x: &DeviceBuffer<bf16>,
+        m: usize,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        if m == 1 {
+            fp4_gemv_bf16(y, x, &self.packed, &self.scales, self.global_scale,
+                           self.out_features, self.in_features, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        } else {
+            let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(
+                self.out_features * self.in_features, stream)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            fp4_dequant_bf16(&mut w, &self.packed, &self.scales, self.global_scale,
+                              self.out_features, self.in_features, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            lt.linear_bf16(y, x, &w, None, m, self.out_features, self.in_features,
+                            1.0, 0.0, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+    }
 }
 
 /// Decoder-layer weights resident on device. Quantized linears stay FP4;
@@ -2113,24 +2244,13 @@ fn layer_forward(
     let mut d_normed:   DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_tmp:      DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let dequant = |ql: &QuantLinearDev| -> anyhow::Result<DeviceBuffer<bf16>> {
-        let mut out: DeviceBuffer<bf16> = DeviceBuffer::new_async(ql.out_features * ql.in_features, stream)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        ql.dequant_to(&mut out, stream)?;
-        Ok(out)
-    };
-
     // ---- Attention block ----
     d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let qw = dequant(&lw.q_proj)?;
-        lt.linear_bf16(&mut d_q, &d_normed, &qw, None, t_q, h_heads * d, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.q_proj.forward(lt, &mut d_q, &d_normed, t_q, stream)?;
     {
         let q_tmp = clone_buffer_async(&d_q, stream)?;
         rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), t_q * h_heads, d, eps, Some(stream))
@@ -2145,16 +2265,8 @@ fn layer_forward(
         let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
         let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        {
-            let kw = dequant(kl)?;
-            lt.linear_bf16(&mut d_k, &d_normed, &kw, None, t_q, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        {
-            let vw = dequant(vl)?;
-            lt.linear_bf16(&mut d_v, &d_normed, &vw, None, t_q, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        kl.forward(lt, &mut d_k, &d_normed, t_q, stream)?;
+        vl.forward(lt, &mut d_v, &d_normed, t_q, stream)?;
         {
             let k_tmp = clone_buffer_async(&d_k, stream)?;
             rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), t_q * h_kv, d, eps, Some(stream))
@@ -2174,12 +2286,7 @@ fn layer_forward(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let ow = dequant(&lw.o_proj)?;
-        lt.linear_bf16(&mut d_attn_hidden, &d_attn_out, &ow, None,
-                        t_q, hidden, h_heads * d, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.o_proj.forward(lt, &mut d_attn_hidden, &d_attn_out, t_q, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_attn_hidden, Some(&lw.post_attention_layernorm),
                   t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2196,23 +2303,11 @@ fn layer_forward(
     let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let gw = dequant(&lw.gate_proj)?;
-        lt.linear_bf16(&mut d_gate_out, &d_normed, &gw, None, t_q, inter, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    {
-        let uw = dequant(&lw.up_proj)?;
-        lt.linear_bf16(&mut d_up_out, &d_normed, &uw, None, t_q, inter, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.gate_proj.forward(lt, &mut d_gate_out, &d_normed, t_q, stream)?;
+    lw.up_proj.forward(lt, &mut d_up_out, &d_normed, t_q, stream)?;
     gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let dw = dequant(&lw.down_proj)?;
-        lt.linear_bf16(&mut d_mlp_out, &d_act, &dw, None, t_q, hidden, inter, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.down_proj.forward(lt, &mut d_mlp_out, &d_act, t_q, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_mlp_out, Some(&lw.post_feedforward_layernorm),
                   t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2224,20 +2319,10 @@ fn layer_forward(
     let mut d_ple_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_ple_glu:      DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_ple_proj_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let plg = dequant(&lw.per_layer_input_gate)?;
-        lt.linear_bf16(&mut d_ple_gate_out, h, &plg, None,
-                        t_q, per_layer, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.per_layer_input_gate.forward(lt, &mut d_ple_gate_out, h, t_q, stream)?;
     gelu_tanh_glu_bf16(&mut d_ple_glu, &d_ple_gate_out, ple_layer, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let plp = dequant(&lw.per_layer_projection)?;
-        lt.linear_bf16(&mut d_ple_proj_out, &d_ple_glu, &plp, None,
-                        t_q, hidden, per_layer, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.per_layer_projection.forward(lt, &mut d_ple_proj_out, &d_ple_glu, t_q, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_ple_proj_out, Some(&lw.post_per_layer_input_norm),
                   t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2652,7 +2737,6 @@ fn cmd_bench(
             next = argmax_bf16(&logits);
             steps += 1;
         }
-        let _ = steps;
         Ok((prefill_ms, decode_mss, steps))
     };
 

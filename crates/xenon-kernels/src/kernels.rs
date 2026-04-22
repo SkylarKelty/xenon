@@ -26,6 +26,16 @@ unsafe extern "C" {
         cols: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_fp4_gemv_bf16(
+        y: *mut c_void,
+        x: *const c_void,
+        w_packed: *const c_void,
+        w_scales: *const c_void,
+        global_scale: f32,
+        n: i32,
+        k: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn xk_gelu_tanh_bf16(
         out: *mut c_void,
         input: *const c_void,
@@ -163,8 +173,12 @@ pub fn rmsnorm_bf16(
     eps: f32,
     stream: Option<&Stream>,
 ) -> Result<(), CudaError> {
-    assert_eq!(out.len(), rows * hidden, "rmsnorm: out length");
-    assert_eq!(x.len(), rows * hidden, "rmsnorm: x length");
+    // Buffers may be oversized (e.g. persistent scratch that serves multiple
+    // shapes in the same decode step). The kernel reads/writes exactly
+    // rows*hidden elements, so `>=` is sufficient. Weight stays exact — it's
+    // a model parameter with a specific shape.
+    assert!(out.len() >= rows * hidden, "rmsnorm: out length");
+    assert!(x.len() >= rows * hidden, "rmsnorm: x length");
     if let Some(w) = weight {
         assert_eq!(w.len(), hidden, "rmsnorm: weight length");
     }
@@ -224,7 +238,9 @@ pub fn fp4_dequant_bf16(
     cols: usize,
     stream: Option<&Stream>,
 ) -> Result<(), CudaError> {
-    assert_eq!(out.len(), rows * cols);
+    // `out` may be oversized scratch shared across weights; packed/scales
+    // are always the weight's own exact-sized buffers.
+    assert!(out.len() >= rows * cols, "fp4_dequant: out length");
     assert_eq!(packed.len(), rows * cols / 2);
     assert_eq!(scales.len(), rows * cols / 16);
     assert!(cols % 16 == 0, "cols must be a multiple of 16");
@@ -237,6 +253,44 @@ pub fn fp4_dequant_bf16(
             global_scale,
             rows as i32,
             cols as i32,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Fused FP4×bf16 gemv (M=1). `y = x @ W^T` where the FP4 weight is read
+/// directly — no intermediate bf16 materialization. Decode fast path; for
+/// M>1 the existing `fp4_dequant_bf16` + `linear_bf16` path is faster.
+///
+/// `w_packed` is `[n, k/2]` U8, `w_scales` is `[n, k/16]` UE4M3,
+/// `global_scale` is the per-tensor f32 multiplier. `x` is `[k]` bf16,
+/// `y` is `[n]` bf16. `k` must be a multiple of 16.
+pub fn fp4_gemv_bf16(
+    y: &mut DeviceBuffer<bf16>,
+    x: &DeviceBuffer<bf16>,
+    w_packed: &DeviceBuffer<u8>,
+    w_scales: &DeviceBuffer<u8>,
+    global_scale: f32,
+    n: usize,
+    k: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert!(k % 16 == 0, "fp4_gemv: k must be a multiple of 16");
+    assert!(y.len() >= n, "fp4_gemv: y length");
+    assert!(x.len() >= k, "fp4_gemv: x length");
+    assert_eq!(w_packed.len(), n * k / 2, "fp4_gemv: w_packed length");
+    assert_eq!(w_scales.len(), n * k / 16, "fp4_gemv: w_scales length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_fp4_gemv_bf16(
+            y.as_device_ptr(),
+            x.as_device_ptr(),
+            w_packed.as_device_ptr(),
+            w_scales.as_device_ptr(),
+            global_scale,
+            n as i32,
+            k as i32,
             stream_ptr,
         )
     };
@@ -353,7 +407,11 @@ pub fn rope_bf16(
     theta: f32,
     stream: Option<&Stream>,
 ) -> Result<(), CudaError> {
-    assert_eq!(x.len(), tokens * heads * head_dim, "rope: x length");
+    // `x` may be persistent scratch sized for the largest head_dim variant
+    // (e.g. 4096 for full-attn) while this call uses a smaller head_dim
+    // (e.g. sliding's 256 → 2048). The kernel reads/writes exactly
+    // tokens*heads*head_dim elements.
+    assert!(x.len() >= tokens * heads * head_dim, "rope: x length");
     assert_eq!(positions.len(), tokens, "rope: positions length");
     assert!(rotary_dim <= head_dim, "rope: rotary_dim > head_dim");
     assert!(rotary_dim % 2 == 0, "rope: rotary_dim must be even");
@@ -516,12 +574,14 @@ pub fn attn_naive_bf16(
     window: i32,
     stream: Option<&Stream>,
 ) -> Result<(), CudaError> {
-    assert_eq!(q.len(), t_q * h * d, "attn: q length");
+    // q/out may be oversized persistent scratch sized for the largest
+    // head_dim; the kernel reads/writes exactly t_q*h*d elements.
+    assert!(q.len() >= t_q * h * d, "attn: q length");
     // K/V can be KvCache slots sized [max_len, h_kv, d] where max_len >= t_kv;
     // the kernel only reads the first t_kv rows.
     assert!(k.len() >= t_kv * h_kv * d, "attn: k length");
     assert!(v.len() >= t_kv * h_kv * d, "attn: v length");
-    assert_eq!(out.len(), t_q * h * d, "attn: out length");
+    assert!(out.len() >= t_q * h * d, "attn: out length");
     assert!(h % h_kv == 0, "attn: h must be divisible by h_kv");
     let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
     let code = unsafe {

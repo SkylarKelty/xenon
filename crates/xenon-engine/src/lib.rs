@@ -13,7 +13,7 @@ use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
     add_scale_bf16, attn_naive_bf16,
     cuda::{Device, DeviceBuffer, PinnedBuffer, Stream},
-    fp4_dequant_bf16, gelu_tanh_glu_bf16, per_layer_slice_bf16,
+    fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, per_layer_slice_bf16,
     rmsnorm_bf16, rope_bf16, scale_bf16, softcap_bf16, CublasLt, KvCache, SlotSpec,
 };
 
@@ -47,6 +47,35 @@ impl QuantLinearDev {
         fp4_dequant_bf16(out, &self.packed, &self.scales, self.global_scale,
                           self.out_features, self.in_features, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// `y = x @ W^T` with FP4 weight. For `m == 1` this takes the fused
+    /// FP4×bf16 gemv path (no intermediate bf16 weight); for `m > 1` it
+    /// dequants the weight into transient scratch and calls cuBLASLt bf16
+    /// linear, which amortizes the dequant cost across M.
+    pub fn forward(
+        &self,
+        lt: &mut CublasLt,
+        y: &mut DeviceBuffer<bf16>,
+        x: &DeviceBuffer<bf16>,
+        m: usize,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        if m == 1 {
+            fp4_gemv_bf16(y, x, &self.packed, &self.scales, self.global_scale,
+                           self.out_features, self.in_features, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        } else {
+            let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(
+                self.out_features * self.in_features, stream)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            fp4_dequant_bf16(&mut w, &self.packed, &self.scales, self.global_scale,
+                              self.out_features, self.in_features, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            lt.linear_bf16(y, x, &w, None, m, self.out_features, self.in_features,
+                            1.0, 0.0, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
     }
 }
 
@@ -200,24 +229,13 @@ pub fn layer_forward(
     let mut d_normed:   DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_tmp:      DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let dequant = |ql: &QuantLinearDev| -> anyhow::Result<DeviceBuffer<bf16>> {
-        let mut out: DeviceBuffer<bf16> = DeviceBuffer::new_async(ql.out_features * ql.in_features, stream)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        ql.dequant_to(&mut out, stream)?;
-        Ok(out)
-    };
-
     // Attention block.
     d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let qw = dequant(&lw.q_proj)?;
-        lt.linear_bf16(&mut d_q, &d_normed, &qw, None, t_q, h_heads * d, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.q_proj.forward(lt, &mut d_q, &d_normed, t_q, stream)?;
     {
         let q_tmp = clone_buffer_async(&d_q, stream)?;
         rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), t_q * h_heads, d, eps, Some(stream))
@@ -232,16 +250,8 @@ pub fn layer_forward(
         let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
         let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        {
-            let kw = dequant(kl)?;
-            lt.linear_bf16(&mut d_k, &d_normed, &kw, None, t_q, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        {
-            let vw = dequant(vl)?;
-            lt.linear_bf16(&mut d_v, &d_normed, &vw, None, t_q, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        kl.forward(lt, &mut d_k, &d_normed, t_q, stream)?;
+        vl.forward(lt, &mut d_v, &d_normed, t_q, stream)?;
         {
             let k_tmp = clone_buffer_async(&d_k, stream)?;
             rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), t_q * h_kv, d, eps, Some(stream))
@@ -261,12 +271,7 @@ pub fn layer_forward(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let ow = dequant(&lw.o_proj)?;
-        lt.linear_bf16(&mut d_attn_hidden, &d_attn_out, &ow, None,
-                        t_q, hidden, h_heads * d, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.o_proj.forward(lt, &mut d_attn_hidden, &d_attn_out, t_q, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_attn_hidden, Some(&lw.post_attention_layernorm),
                   t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -283,23 +288,11 @@ pub fn layer_forward(
     let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let gw = dequant(&lw.gate_proj)?;
-        lt.linear_bf16(&mut d_gate_out, &d_normed, &gw, None, t_q, inter, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    {
-        let uw = dequant(&lw.up_proj)?;
-        lt.linear_bf16(&mut d_up_out, &d_normed, &uw, None, t_q, inter, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.gate_proj.forward(lt, &mut d_gate_out, &d_normed, t_q, stream)?;
+    lw.up_proj.forward(lt, &mut d_up_out, &d_normed, t_q, stream)?;
     gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let dw = dequant(&lw.down_proj)?;
-        lt.linear_bf16(&mut d_mlp_out, &d_act, &dw, None, t_q, hidden, inter, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.down_proj.forward(lt, &mut d_mlp_out, &d_act, t_q, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_mlp_out, Some(&lw.post_feedforward_layernorm),
                   t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -311,20 +304,10 @@ pub fn layer_forward(
     let mut d_ple_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_ple_glu:      DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_ple_proj_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let plg = dequant(&lw.per_layer_input_gate)?;
-        lt.linear_bf16(&mut d_ple_gate_out, h, &plg, None,
-                        t_q, per_layer, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.per_layer_input_gate.forward(lt, &mut d_ple_gate_out, h, t_q, stream)?;
     gelu_tanh_glu_bf16(&mut d_ple_glu, &d_ple_gate_out, ple_layer, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let plp = dequant(&lw.per_layer_projection)?;
-        lt.linear_bf16(&mut d_ple_proj_out, &d_ple_glu, &plp, None,
-                        t_q, hidden, per_layer, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.per_layer_projection.forward(lt, &mut d_ple_proj_out, &d_ple_glu, t_q, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_ple_proj_out, Some(&lw.post_per_layer_input_norm),
                   t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -644,24 +627,13 @@ fn layer_forward_batched(
     let mut d_normed:   DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_tmp:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let dequant = |ql: &QuantLinearDev| -> anyhow::Result<DeviceBuffer<bf16>> {
-        let mut out: DeviceBuffer<bf16> = DeviceBuffer::new_async(ql.out_features * ql.in_features, stream)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        ql.dequant_to(&mut out, stream)?;
-        Ok(out)
-    };
-
     // Attention block.
     d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let qw = dequant(&lw.q_proj)?;
-        lt.linear_bf16(&mut d_q, &d_normed, &qw, None, n, h_heads * d, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.q_proj.forward(lt, &mut d_q, &d_normed, n, stream)?;
     {
         let q_tmp = clone_buffer_async(&d_q, stream)?;
         rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), n * h_heads, d, eps, Some(stream))
@@ -676,16 +648,8 @@ fn layer_forward_batched(
         let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
         let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        {
-            let kw = dequant(kl)?;
-            lt.linear_bf16(&mut d_k, &d_normed, &kw, None, n, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        {
-            let vw = dequant(vl)?;
-            lt.linear_bf16(&mut d_v, &d_normed, &vw, None, n, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        kl.forward(lt, &mut d_k, &d_normed, n, stream)?;
+        vl.forward(lt, &mut d_v, &d_normed, n, stream)?;
         {
             let k_tmp = clone_buffer_async(&d_k, stream)?;
             rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), n * h_kv, d, eps, Some(stream))
@@ -732,12 +696,7 @@ fn layer_forward_batched(
     }
 
     let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let ow = dequant(&lw.o_proj)?;
-        lt.linear_bf16(&mut d_attn_hidden, &d_attn_out, &ow, None,
-                        n, hidden, h_heads * d, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lw.o_proj.forward(lt, &mut d_attn_hidden, &d_attn_out, n, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_attn_hidden, Some(&lw.post_attention_layernorm),
                   n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -754,10 +713,10 @@ fn layer_forward_batched(
     let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    { let gw = dequant(&lw.gate_proj)?; lt.linear_bf16(&mut d_gate_out, &d_normed, &gw, None, n, inter, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
-    { let uw = dequant(&lw.up_proj)?;   lt.linear_bf16(&mut d_up_out,   &d_normed, &uw, None, n, inter, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    lw.gate_proj.forward(lt, &mut d_gate_out, &d_normed, n, stream)?;
+    lw.up_proj.forward(lt, &mut d_up_out, &d_normed, n, stream)?;
     gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    { let dw = dequant(&lw.down_proj)?; lt.linear_bf16(&mut d_mlp_out,  &d_act,    &dw, None, n, hidden, inter, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    lw.down_proj.forward(lt, &mut d_mlp_out, &d_act, n, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_mlp_out, Some(&lw.post_feedforward_layernorm), n, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -766,9 +725,9 @@ fn layer_forward_batched(
     let mut d_ple_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_ple_glu:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_ple_proj_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    { let plg = dequant(&lw.per_layer_input_gate)?; lt.linear_bf16(&mut d_ple_gate_out, h, &plg, None, n, per_layer, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    lw.per_layer_input_gate.forward(lt, &mut d_ple_gate_out, h, n, stream)?;
     gelu_tanh_glu_bf16(&mut d_ple_glu, &d_ple_gate_out, ple_layer, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    { let plp = dequant(&lw.per_layer_projection)?; lt.linear_bf16(&mut d_ple_proj_out, &d_ple_glu, &plp, None, n, hidden, per_layer, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+    lw.per_layer_projection.forward(lt, &mut d_ple_proj_out, &d_ple_glu, n, stream)?;
     rmsnorm_bf16(&mut d_tmp, &d_ple_proj_out, Some(&lw.post_per_layer_input_norm), n, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
     add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
 
