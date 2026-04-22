@@ -234,6 +234,27 @@ enum Command {
         #[arg(long, default_value = "2,108,107,1")]
         ids: String,
     },
+    /// Measure prefill + decode throughput. Runs N warmup iterations then M
+    /// measured iterations with a fixed prompt, records per-step timings,
+    /// dumps summary + JSON to results/.
+    Bench {
+        model: PathBuf,
+        #[arg(long, default_value = "Write a haiku about GPUs.")]
+        prompt: String,
+        #[arg(long)]
+        chat: bool,
+        #[arg(long, default_value_t = 32)]
+        max_new: usize,
+        #[arg(long, default_value_t = 4096)]
+        max_len: usize,
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        #[arg(long, default_value_t = 3)]
+        iters: usize,
+        /// Optional label for the results JSON (helps diff runs).
+        #[arg(long, default_value = "baseline")]
+        label: String,
+    },
     /// Generate text from a prompt: tokenize, prefill, then greedy-sample
     /// decode until EOS or `max_new_tokens`. Loads all 42 layers' weights
     /// once (FP4 packed, dequant per step into a transient scratch buffer).
@@ -376,6 +397,8 @@ fn main() -> anyhow::Result<()> {
         Command::TestVsHfFull { model, hf, ids } => cmd_test_vs_hf_full(model, hf, ids),
         Command::Generate { model, prompt, max_new, max_len, chat } =>
             cmd_generate(model, prompt, max_new, max_len, chat),
+        Command::Bench { model, prompt, chat, max_new, max_len, warmup, iters, label } =>
+            cmd_bench(model, prompt, chat, max_new, max_len, warmup, iters, label),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -2355,6 +2378,210 @@ fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usi
              decoded_steps, decode_ms,
              decoded_steps as f64 / (decode_ms / 1000.0));
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench(
+    model_dir: PathBuf,
+    prompt: String,
+    chat: bool,
+    max_new: usize,
+    max_len: usize,
+    warmup: usize,
+    iters: usize,
+    label: String,
+) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&model_dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    let shape = ModelShape {
+        hidden: tc.hidden_size,
+        inter: tc.intermediate_size,
+        vocab: tc.vocab_size,
+        h_heads: tc.num_attention_heads,
+        h_kv: tc.num_key_value_heads,
+        per_layer: tc.hidden_size_per_layer_input.ok_or_else(|| anyhow::anyhow!("missing"))?,
+        n_layers: tc.num_hidden_layers,
+        ple_width: tc.hidden_size_per_layer_input.unwrap_or(0) * tc.num_hidden_layers,
+        eps: tc.rms_norm_eps as f32,
+        softcap: tc.final_logit_softcapping.unwrap_or(30.0) as f32,
+    };
+
+    let tok = Tokenizer::from_dir(&model_dir)?;
+    let mm = MmapWeights::open(&model_dir.join("model.safetensors"))?;
+
+    let text = if chat {
+        format!("<|turn>user\n{}<turn|>\n<|turn>model\n", prompt)
+    } else { prompt.clone() };
+    let prompt_ids_u: Vec<u32> = tok.encode(&text, true)?;
+    let prompt_ids: Vec<i32> = prompt_ids_u.iter().map(|&x| x as i32).collect();
+    anyhow::ensure!(prompt_ids.len() + max_new <= max_len, "exceeds max_len");
+
+    println!("=== xenon-cli bench ===");
+    println!("label               {}", label);
+    println!("prompt_len          {}", prompt_ids.len());
+    println!("max_new             {}", max_new);
+    println!("warmup / iters      {} / {}", warmup, iters);
+
+    let t_load = Instant::now();
+    let mut layers: Vec<LayerWeights> = Vec::with_capacity(shape.n_layers);
+    for l in 0..shape.n_layers {
+        layers.push(load_layer_weights(&mm, &cfg, l, &stream)?);
+    }
+    let top = TopLevelWeights {
+        per_layer_model_projection: QuantLinearDev::load(
+            &mm.load_quant_linear("model.language_model.per_layer_model_projection")?)?,
+        per_layer_projection_norm: {
+            let b = mm.load_bf16("model.language_model.per_layer_projection_norm.weight")?;
+            let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d
+        },
+        norm: {
+            let b = mm.load_bf16("model.language_model.norm.weight")?;
+            let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d
+        },
+    };
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    let (mem_free, mem_total) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("weights loaded      {:.1} s  (vram {:.2}/{:.2} GiB free)",
+             load_ms / 1000.0,
+             mem_free as f64 / 1073741824.0, mem_total as f64 / 1073741824.0);
+
+    let eos: Vec<i32> = vec![1, 106];
+
+    // One run = fresh KvCache + prefill + up-to-max_new decode steps, with
+    // per-step timings captured.
+    let run_once = |layers: &[LayerWeights], top: &TopLevelWeights,
+                    lt: &mut CublasLt, stream: &Stream|
+        -> anyhow::Result<(f64, Vec<f64>, usize)>
+    {
+        let mut kv = build_kv_cache(&mm, &cfg, max_len)?;
+        let t_prefill = Instant::now();
+        let logits0 = forward_step(&mm, &cfg, shape, layers, top, &mut kv,
+                                    &prompt_ids, 0, lt, stream)?;
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
+        let mut next = argmax_bf16(&logits0);
+        let mut decode_mss: Vec<f64> = Vec::with_capacity(max_new);
+        let mut steps = 0usize;
+        for step in 0..max_new {
+            if eos.contains(&next) && step > 0 { break; }
+            let q_pos = kv.len() as i32;
+            let t_step = Instant::now();
+            let logits = forward_step(&mm, &cfg, shape, layers, top, &mut kv,
+                                       &[next], q_pos, lt, stream)?;
+            decode_mss.push(t_step.elapsed().as_secs_f64() * 1e3);
+            next = argmax_bf16(&logits);
+            steps += 1;
+        }
+        let _ = steps;
+        Ok((prefill_ms, decode_mss, steps))
+    };
+
+    // Warmup.
+    for i in 0..warmup {
+        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream)?;
+        println!("warmup {:>2}          prefill {:>6.1} ms   decode {} steps   avg {:>6.1} ms",
+                 i, pfm, steps,
+                 if !dec.is_empty() { dec.iter().sum::<f64>() / dec.len() as f64 } else { 0.0 });
+    }
+
+    // Measured runs.
+    let mut all_prefill_ms: Vec<f64> = Vec::new();
+    let mut all_decode_ms: Vec<f64> = Vec::new();
+    let mut all_steps: Vec<usize> = Vec::new();
+    for i in 0..iters {
+        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream)?;
+        println!("iter   {:>2}          prefill {:>6.1} ms   decode {} steps   avg {:>6.1} ms",
+                 i, pfm, steps,
+                 if !dec.is_empty() { dec.iter().sum::<f64>() / dec.len() as f64 } else { 0.0 });
+        all_prefill_ms.push(pfm);
+        all_decode_ms.extend(dec);
+        all_steps.push(steps);
+    }
+
+    // Summary.
+    let prefill_mean = mean(&all_prefill_ms);
+    let (p50, p95) = percentiles(&all_decode_ms);
+    let decode_mean = mean(&all_decode_ms);
+    let prefill_tps = prompt_ids.len() as f64 / (prefill_mean / 1000.0);
+    let decode_tps = 1.0 / (decode_mean / 1000.0);
+    println!();
+    println!("=== summary ===");
+    println!("prefill             {:>7.1} ms ({:>6.1} tok/s at T={})", prefill_mean, prefill_tps, prompt_ids.len());
+    println!("decode per-step     mean {:.2} ms  p50 {:.2}  p95 {:.2}", decode_mean, p50, p95);
+    println!("decode throughput   {:>7.2} tok/s (mean)", decode_tps);
+
+    // Dump JSON.
+    let ts = chrono_now_iso();
+    let git_hash = current_git_hash().unwrap_or_else(|| "unknown".into());
+    let results_dir = std::path::Path::new("results");
+    std::fs::create_dir_all(results_dir)?;
+    let fname = format!("bench-{}-{}.json", label, ts);
+    let path = results_dir.join(&fname);
+    let j = serde_json::json!({
+        "timestamp": ts,
+        "label": label,
+        "git_hash": git_hash,
+        "model": model_dir.to_string_lossy(),
+        "prompt": prompt,
+        "chat": chat,
+        "prompt_len": prompt_ids.len(),
+        "max_new": max_new,
+        "max_len": max_len,
+        "warmup_iters": warmup,
+        "measured_iters": iters,
+        "weights_load_s": load_ms / 1000.0,
+        "vram_free_gib": mem_free as f64 / 1073741824.0,
+        "vram_total_gib": mem_total as f64 / 1073741824.0,
+        "prefill_ms_per_run": all_prefill_ms,
+        "decode_ms_per_step": all_decode_ms,
+        "decode_steps_per_run": all_steps,
+        "summary": {
+            "prefill_ms_mean": prefill_mean,
+            "prefill_tok_per_s": prefill_tps,
+            "decode_ms_mean": decode_mean,
+            "decode_ms_p50": p50,
+            "decode_ms_p95": p95,
+            "decode_tok_per_s_mean": decode_tps,
+        },
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&j)?)?;
+    println!();
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() { 0.0 } else { xs.iter().sum::<f64>() / xs.len() as f64 }
+}
+fn percentiles(xs: &[f64]) -> (f64, f64) {
+    if xs.is_empty() { return (0.0, 0.0); }
+    let mut s: Vec<f64> = xs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p = |q: f64| {
+        let idx = ((s.len() - 1) as f64 * q).round() as usize;
+        s[idx]
+    };
+    (p(0.50), p(0.95))
+}
+fn current_git_hash() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"]).output().ok()?;
+    if !out.status.success() { return None; }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+fn chrono_now_iso() -> String {
+    // Very simple local-time ISO-ish stamp; avoids pulling chrono in.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let secs = now.as_secs();
+    format!("{}", secs)
 }
 
 fn argmax_bf16(row: &[bf16]) -> i32 {
