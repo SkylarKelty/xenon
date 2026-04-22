@@ -1,0 +1,26 @@
+[project]
+name = "xenon-hf-ref"
+version = "0.0.1"
+description = "HuggingFace Gemma 4 reference harness for xenon correctness diffs."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.5.0",
+    # Gemma 4 lands in transformers main after 4.55. Pin to main for now;
+    # swap to a stable release once one ships with gemma4 support.
+    "transformers @ git+https://github.com/huggingface/transformers.git",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+    "numpy>=1.24",
+    "accelerate>=0.30",
+    # modelopt itself pins transformers<5 so we can't use its HF integration
+    # with the gemma4 we need. Instead, we dequant NVFP4 ourselves in Python
+    # (mirrors the Rust kernel math) and feed a vanilla bf16 Gemma4 model.
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
