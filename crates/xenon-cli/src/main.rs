@@ -11,7 +11,7 @@ use xenon_core::{
 };
 use xenon_kernels::{
     add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
-    cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
+    cuda::{device_synchronize, mem_info, Device, DeviceBuffer, PinnedBuffer, Stream},
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16, rope_bf16_reference,
@@ -2090,11 +2090,15 @@ fn layer_forward(
     Ok(())
 }
 
-/// Weights shared across all decoder layers (embedding is host-only).
+/// Weights shared across all decoder layers. `lm_head_pinned` holds the
+/// 1.25 GiB `embed_tokens` table in page-locked host memory so every
+/// forward step can `cudaMemcpyAsync` it to a transient device buffer
+/// concurrently with decoder compute.
 struct TopLevelWeights {
     per_layer_model_projection: QuantLinearDev,
     per_layer_projection_norm: DeviceBuffer<bf16>,
     norm: DeviceBuffer<bf16>,
+    lm_head_pinned: PinnedBuffer<bf16>,
 }
 
 /// Shape/meta precomputed once for a model.
@@ -2148,6 +2152,10 @@ fn build_kv_cache(mm: &MmapWeights, cfg: &GemmaConfig, max_len: usize)
 /// Appends new K/V to `kv` and advances `cur_len` by `ids.len()`. Returns the
 /// post-softcap logits for the LAST row as a `[vocab]` host vector (argmax
 /// on a small host copy is trivial and removes a device dep).
+///
+/// `stream_lm` is a separate CUDA stream used to upload the 1.25 GiB lm_head
+/// weights asynchronously while the decoder stack runs on `stream`. Pass
+/// the same stream if you don't want overlap.
 #[allow(clippy::too_many_arguments)]
 fn forward_step(
     mm: &MmapWeights,
@@ -2160,11 +2168,20 @@ fn forward_step(
     q_pos_base: i32,
     lt: &mut CublasLt,
     stream: &Stream,
+    stream_lm: &Stream,
 ) -> anyhow::Result<Vec<bf16>> {
     let tc = &cfg.text_config;
     let t_q = ids.len();
     let t_kv = kv.len() + t_q;
     let ModelShape { hidden, inter, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
+
+    // Kick off lm_head H2D on a separate stream BEFORE the decoder stack.
+    // The 1.25 GiB PCIe transfer runs concurrently with decoder compute;
+    // at the tail we stream-sync, then GEMM against the pre-uploaded weights.
+    // Source must be pinned for true async overlap — see TopLevelWeights.
+    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_lm_head.copy_from_host_bytes_async(top.lm_head_pinned.as_bytes(), stream_lm)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // positions for RoPE: absolute indices q_pos_base..q_pos_base+t_q.
     let positions_host: Vec<i32> = (0..t_q as i32).map(|i| q_pos_base + i).collect();
@@ -2239,16 +2256,13 @@ fn forward_step(
     rmsnorm_bf16(&mut d_normed, &d_last_row, Some(&top.norm), 1, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let lm_head_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+    // Wait for the async lm_head H2D (kicked off at the top) to finish
+    // before consuming d_lm_head.
+    stream_lm.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
-    {
-        let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-        d_lm_head.copy_from_host_bytes(lm_head_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-        lt.linear_bf16(&mut d_logits, &d_normed, &d_lm_head, None,
-                        1, vocab, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+    lt.linear_bf16(&mut d_logits, &d_normed, &d_lm_head, None,
+                    1, vocab, hidden, 1.0, 0.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
     softcap_bf16(&mut d_capped, &d_logits, softcap, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2314,6 +2328,12 @@ fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usi
             d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
             d
         },
+        lm_head_pinned: {
+            let b = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+            let mut p: PinnedBuffer<bf16> = PinnedBuffer::new(shape.vocab * shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+            p.as_mut_bytes().copy_from_slice(b);
+            p
+        },
     };
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
@@ -2331,8 +2351,9 @@ fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usi
 
     // ---- Prefill ----
     let t_prefill = Instant::now();
+    let stream_lm = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
     let logits0 = forward_step(&mm, &cfg, shape, &layers, &top, &mut kv,
-                                &prompt_ids, 0, &mut lt, &stream)?;
+                                &prompt_ids, 0, &mut lt, &stream, &stream_lm)?;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
     let mut next: i32 = argmax_bf16(&logits0);
     eprintln!("[xenon] prefill {:.1} ms ({:.1} tok/s)",
@@ -2365,7 +2386,7 @@ fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usi
         }
         let q_pos = kv.len() as i32;
         let logits = forward_step(&mm, &cfg, shape, &layers, &top, &mut kv,
-                                   &[next], q_pos, &mut lt, &stream)?;
+                                   &[next], q_pos, &mut lt, &stream, &stream_lm)?;
         next = argmax_bf16(&logits);
         generated.push(next as u32);
         emit(&generated, &mut prev_decoded, &mut out)?;
@@ -2446,6 +2467,12 @@ fn cmd_bench(
             d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
             d
         },
+        lm_head_pinned: {
+            let b = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+            let mut p: PinnedBuffer<bf16> = PinnedBuffer::new(shape.vocab * shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+            p.as_mut_bytes().copy_from_slice(b);
+            p
+        },
     };
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
@@ -2458,14 +2485,15 @@ fn cmd_bench(
 
     // One run = fresh KvCache + prefill + up-to-max_new decode steps, with
     // per-step timings captured.
+    let stream_lm = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
     let run_once = |layers: &[LayerWeights], top: &TopLevelWeights,
-                    lt: &mut CublasLt, stream: &Stream|
+                    lt: &mut CublasLt, stream: &Stream, stream_lm: &Stream|
         -> anyhow::Result<(f64, Vec<f64>, usize)>
     {
         let mut kv = build_kv_cache(&mm, &cfg, max_len)?;
         let t_prefill = Instant::now();
         let logits0 = forward_step(&mm, &cfg, shape, layers, top, &mut kv,
-                                    &prompt_ids, 0, lt, stream)?;
+                                    &prompt_ids, 0, lt, stream, stream_lm)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
         let mut next = argmax_bf16(&logits0);
         let mut decode_mss: Vec<f64> = Vec::with_capacity(max_new);
@@ -2475,7 +2503,7 @@ fn cmd_bench(
             let q_pos = kv.len() as i32;
             let t_step = Instant::now();
             let logits = forward_step(&mm, &cfg, shape, layers, top, &mut kv,
-                                       &[next], q_pos, lt, stream)?;
+                                       &[next], q_pos, lt, stream, stream_lm)?;
             decode_mss.push(t_step.elapsed().as_secs_f64() * 1e3);
             next = argmax_bf16(&logits);
             steps += 1;
@@ -2486,7 +2514,7 @@ fn cmd_bench(
 
     // Warmup.
     for i in 0..warmup {
-        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream)?;
+        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream, &stream_lm)?;
         println!("warmup {:>2}          prefill {:>6.1} ms   decode {} steps   avg {:>6.1} ms",
                  i, pfm, steps,
                  if !dec.is_empty() { dec.iter().sum::<f64>() / dec.len() as f64 } else { 0.0 });
@@ -2497,13 +2525,31 @@ fn cmd_bench(
     let mut all_decode_ms: Vec<f64> = Vec::new();
     let mut all_steps: Vec<usize> = Vec::new();
     for i in 0..iters {
-        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream)?;
+        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream, &stream_lm)?;
         println!("iter   {:>2}          prefill {:>6.1} ms   decode {} steps   avg {:>6.1} ms",
                  i, pfm, steps,
                  if !dec.is_empty() { dec.iter().sum::<f64>() / dec.len() as f64 } else { 0.0 });
         all_prefill_ms.push(pfm);
         all_decode_ms.extend(dec);
         all_steps.push(steps);
+    }
+
+    // Single profiled decode step: time the major phases with host-side
+    // stream.synchronize() to attribute wall time to each block. Adds
+    // sync overhead, so treat as diagnostic, not throughput.
+    {
+        let mut kv = build_kv_cache(&mm, &cfg, max_len)?;
+        let _ = forward_step(&mm, &cfg, shape, &layers, &top, &mut kv,
+                              &prompt_ids, 0, &mut lt, &stream, &stream_lm)?;
+        let next_tok = 107i32;
+        let q_pos = kv.len() as i32;
+        let phases = forward_step_profiled(&mm, &cfg, shape, &layers, &top, &mut kv,
+                                           &[next_tok], q_pos, &mut lt, &stream, &stream_lm)?;
+        println!();
+        println!("=== profiled decode step (phase times, ms) ===");
+        for (name, ms) in &phases {
+            println!("  {:<28} {:>7.2}", name, ms);
+        }
     }
 
     // Summary.
@@ -2582,6 +2628,133 @@ fn chrono_now_iso() -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
     let secs = now.as_secs();
     format!("{}", secs)
+}
+
+/// Variant of forward_step that synchronizes and times each major phase.
+/// Sync overhead inflates wall time; use only for diagnostic breakdown.
+#[allow(clippy::too_many_arguments)]
+fn forward_step_profiled(
+    mm: &MmapWeights,
+    cfg: &GemmaConfig,
+    shape: ModelShape,
+    layers: &[LayerWeights],
+    top: &TopLevelWeights,
+    kv: &mut KvCache,
+    ids: &[i32],
+    q_pos_base: i32,
+    lt: &mut CublasLt,
+    stream: &Stream,
+    stream_lm: &Stream,
+) -> anyhow::Result<Vec<(&'static str, f64)>> {
+    let tc = &cfg.text_config;
+    let t_q = ids.len();
+    let t_kv = kv.len() + t_q;
+    let ModelShape { hidden, inter: _, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
+
+    let mut phases: Vec<(&'static str, f64)> = Vec::new();
+    let mark = |phases: &mut Vec<(&'static str, f64)>, name: &'static str, t: Instant, stream: &Stream| -> anyhow::Result<()> {
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        phases.push((name, t.elapsed().as_secs_f64() * 1e3));
+        Ok(())
+    };
+
+    let t0 = Instant::now();
+    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_lm_head.copy_from_host_bytes_async(top.lm_head_pinned.as_bytes(), stream_lm).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Don't sync stream_lm yet — measure only the issue cost.
+    phases.push(("lm_head H2D issue", t0.elapsed().as_secs_f64() * 1e3));
+
+    let positions_host: Vec<i32> = (0..t_q as i32).map(|i| q_pos_base + i).collect();
+    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(t_q).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_positions.copy_from_host(&positions_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let t_embed = Instant::now();
+    let ie_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens.weight", ids, hidden)?;
+    let embed_scale = (hidden as f32).sqrt();
+    let ie_scaled: Vec<bf16> = ie_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
+    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host(&ie_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    mark(&mut phases, "embed gather+upload", t_embed, stream)?;
+
+    let t_ple = Instant::now();
+    let raw_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens_per_layer.weight", ids, ple_width)?;
+    let raw_scale = (per_layer as f32).sqrt();
+    let raw_scaled: Vec<bf16> = raw_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
+    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_raw.copy_from_host(&raw_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_plmp_w: DeviceBuffer<bf16> = DeviceBuffer::new(ple_width * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    top.per_layer_model_projection.dequant_to(&mut d_plmp_w, stream)?;
+    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_ctx, &d_h, &d_plmp_w, None,
+                    t_q, ple_width, hidden, (hidden as f32).powf(-0.5), 0.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_ctx_normed, &d_ctx, Some(&top.per_layer_projection_norm),
+                  t_q * n_layers, per_layer, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(&mut d_combined, &d_ctx_normed, &d_raw, (0.5f32).sqrt(), Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(d_plmp_w); drop(d_raw); drop(d_ctx); drop(d_ctx_normed);
+    mark(&mut phases, "ple assembly", t_ple, stream)?;
+
+    let t_stack = Instant::now();
+    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for layer_idx in 0..n_layers {
+        per_layer_slice_bf16(&mut d_ple_layer, &d_combined,
+                              t_q, n_layers, per_layer, layer_idx, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer_idx);
+        let d_layer = cfg.head_dim_for_layer(layer_idx);
+        let window = match tc.layer_types[layer_idx] {
+            LayerKind::SlidingAttention => tc.sliding_window.unwrap_or(0) as i32,
+            LayerKind::FullAttention => 0,
+        };
+        let meta = LayerMeta {
+            layer_idx,
+            t_q, t_kv, q_pos_base,
+            hidden, inter: shape.inter, h_heads, h_kv,
+            head_dim: d_layer, per_layer, eps, window, rope_theta, rotary_dim,
+            owns_kv: mm.layer_owns_kv(layer_idx),
+        };
+        layer_forward(&layers[layer_idx], meta, &mut d_h, &d_ple_layer,
+                       &d_positions, kv, lt, stream)?;
+    }
+    kv.advance(t_q);
+    mark(&mut phases, "decoder stack (42 layers)", t_stack, stream)?;
+
+    let t_tail = Instant::now();
+    let mut d_last_row: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_last_row.copy_region_from_device(0, &d_h, (t_q - 1) * hidden, hidden)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_normed: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_normed, &d_last_row, Some(&top.norm), 1, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    mark(&mut phases, "final RMSNorm", t_tail, stream)?;
+
+    let t_sync = Instant::now();
+    stream_lm.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    phases.push(("wait for lm_head H2D", t_sync.elapsed().as_secs_f64() * 1e3));
+
+    let t_lm = Instant::now();
+    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_logits, &d_normed, &d_lm_head, None,
+                    1, vocab, hidden, 1.0, 0.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    softcap_bf16(&mut d_capped, &d_logits, softcap, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    mark(&mut phases, "lm_head GEMM + softcap", t_lm, stream)?;
+
+    let t_d2h = Instant::now();
+    let _host = d_capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    phases.push(("logits D2H", t_d2h.elapsed().as_secs_f64() * 1e3));
+
+    Ok(phases)
 }
 
 fn argmax_bf16(row: &[bf16]) -> i32 {

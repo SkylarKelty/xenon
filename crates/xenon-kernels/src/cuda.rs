@@ -14,7 +14,10 @@ unsafe extern "C" {
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFree(ptr: *mut c_void) -> i32;
+    fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> i32;
+    fn cudaFreeHost(ptr: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
+    fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
     fn cudaStreamCreate(stream: *mut *mut c_void) -> i32;
     fn cudaStreamDestroy(stream: *mut c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
@@ -206,6 +209,28 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
         })
     }
 
+    /// Async upload raw bytes on a stream. With pageable host memory, CUDA
+    /// copies the host bytes into a pinned staging buffer synchronously on
+    /// the caller, then runs the staging→device DMA asynchronously on the
+    /// stream. For overlap across streams, that's still useful: the DMA
+    /// can run concurrently with kernels on other streams, and the host
+    /// thread isn't blocked for the full transfer.
+    pub fn copy_from_host_bytes_async(&mut self, src: &[u8], stream: &Stream) -> Result<(), CudaError> {
+        assert_eq!(src.len(), self.bytes(), "DeviceBuffer::copy_from_host_bytes_async byte length mismatch");
+        if self.len == 0 {
+            return Ok(());
+        }
+        CudaError::check(unsafe {
+            cudaMemcpyAsync(
+                self.ptr,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                MEMCPY_HOST_TO_DEVICE,
+                stream.as_raw(),
+            )
+        })
+    }
+
     pub fn copy_to_host(&self, dst: &mut [T]) -> Result<(), CudaError> {
         assert_eq!(dst.len(), self.len, "DeviceBuffer::copy_to_host length mismatch");
         if self.len == 0 {
@@ -277,6 +302,57 @@ impl<T: bytemuck::Pod> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             let _ = unsafe { cudaFree(self.ptr) };
+        }
+    }
+}
+
+/// Page-locked (pinned) host buffer. Unlike a regular `Vec<T>`, these bytes
+/// are pinned in physical memory and can be transferred to/from device
+/// memory via `cudaMemcpyAsync` *truly* asynchronously — no CUDA-managed
+/// staging buffer. One-time allocation cost trades for per-call H2D that
+/// can run concurrently with compute on another stream.
+pub struct PinnedBuffer<T: bytemuck::Pod> {
+    ptr: *mut c_void,
+    len: usize,
+    _p: PhantomData<T>,
+}
+
+unsafe impl<T: bytemuck::Pod + Send> Send for PinnedBuffer<T> {}
+unsafe impl<T: bytemuck::Pod + Sync> Sync for PinnedBuffer<T> {}
+
+impl<T: bytemuck::Pod> PinnedBuffer<T> {
+    pub fn new(n: usize) -> Result<Self, CudaError> {
+        if n == 0 {
+            return Ok(Self { ptr: std::ptr::null_mut(), len: 0, _p: PhantomData });
+        }
+        let bytes = n.checked_mul(std::mem::size_of::<T>()).expect("overflow");
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        CudaError::check(unsafe { cudaMallocHost(&mut ptr, bytes) })?;
+        Ok(Self { ptr, len: n, _p: PhantomData })
+    }
+
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn bytes(&self) -> usize { self.len * std::mem::size_of::<T>() }
+
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) }
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.bytes()) }
+    }
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.bytes()) }
+    }
+}
+
+impl<T: bytemuck::Pod> Drop for PinnedBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = unsafe { cudaFreeHost(self.ptr) };
         }
     }
 }
