@@ -175,16 +175,28 @@ during serving; phase 4 CUDA Graph capture subsumes this.
       each decoder layer. Deferred to Phase 3 full-layer forward (no
       existing code path composes the full layer).
 
-### Phase 3 — full forward pass [ ]
-- [ ] 42-layer chain: embed → (norm → attn → norm → mlp + PLE inject) × 42 →
-      norm → lm_head → logits
-- [ ] Host-offloaded `lm_head` with cudaMemcpyAsync overlap (reclaims 1.28 GiB VRAM)
-- [ ] Host-offloaded per-layer embedding tables (reclaims ~5.4 GiB VRAM —
-      confirmed bf16 in the modelopt checkpoint, not FP4)
-- [ ] Final `logit_softcapping = 30.0` kernel
-- [ ] HF reference comparison: Python harness captures per-layer activations
-      to .safetensors; Rust diffs against them. Target: global rel diff ≤
-      5e-2 per layer, ≤ 1e-1 cumulative at final logits.
+### Phase 3 — full forward pass [x]
+- [x] 42-layer chain: embed → (norm → attn → norm → mlp + PLE inject) × 42 →
+      norm → lm_head → logits. Wired in `cmd_test_vs_hf_full` with a
+      `LayerWeights` struct + `layer_forward` helper, dequanting each layer
+      on the fly to stay within VRAM. 610 ms for T=4 on the first call
+      (cuBLASLt algo selection dominates).
+- [x] KV sharing: layers 0..23 own KV; 24..41 share via the last non-shared
+      layer of the same type (22 for sliding, 23 for full). Driven by
+      `MmapWeights::layer_owns_kv` + `KvCache`'s `slot_for_layer` indirection.
+- [x] Final `logit_softcapping = 30.0` — `softcap_bf16` kernel. Bit-exact
+      formula match: `tanh(x/30) * 30`.
+- [x] HF reference harness (`tools/hf-ref/`): Python dequants NVFP4
+      ourselves (sidestepping modelopt/transformers<5 conflict) and feeds
+      a vanilla bf16 Gemma4. Captures embed, per-layer attn/mlp/final,
+      final norm, pre/post softcap logits.
+- [x] HF diff tests: embed (4e-3), PLE assembly (8e-3), per-layer forward
+      (3e-4 to 1e-2 across all own-KV layers), tail (5e-3), full chain
+      (logits global_rel 2.85e-2, top-1/top-5 predictions identical to HF).
+- [ ] Host-offloaded `lm_head` with cudaMemcpyAsync overlap (reclaims
+      1.28 GiB VRAM). Currently uploaded; works but uses ~1.25 GiB.
+- [ ] Host-offloaded per-layer embedding tables — already effectively
+      host-resident; only the gathered rows (~21 KiB/token) touch device.
 
 ### Phase 4 — decode + CUDA Graphs [ ]
 - [ ] Single-token decode path (Q=1 over cached K/V)
