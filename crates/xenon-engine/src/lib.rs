@@ -215,7 +215,9 @@ pub fn load_layer_weights(
 }
 
 pub struct TopLevelWeights {
-    pub per_layer_model_projection: QuantLinearDev,
+    /// Dequanted once at load (was `dequant_to` per forward_step before — 647 μs
+    /// per call × ≥6 calls/run showed up clearly on nsys). 43 MB VRAM cost.
+    pub per_layer_model_projection: DeviceBuffer<bf16>,
     pub per_layer_projection_norm: DeviceBuffer<bf16>,
     pub norm: DeviceBuffer<bf16>,
     /// lm_head (embed_tokens.weight) resident on device. Historically lived
@@ -431,31 +433,29 @@ pub fn forward_step(
     let _ = stream_lm; // kept for signature compatibility; lm_head is resident.
 
     let positions_host: Vec<i32> = (0..t_q as i32).map(|i| q_pos_base + i).collect();
-    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(t_q).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_positions.copy_from_host(&positions_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new_async(t_q, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_positions.copy_from_host_bytes_async(bytemuck::cast_slice(&positions_host), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let ie_host = mm.gather_rows_bf16(
         "model.language_model.embed_tokens.weight", ids, hidden)?;
     let embed_scale = (hidden as f32).sqrt();
     let ie_scaled: Vec<bf16> = ie_host.iter()
         .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
-    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_h.copy_from_host(&ie_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host_bytes_async(bytemuck::cast_slice(&ie_scaled), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let raw_host = mm.gather_rows_bf16(
         "model.language_model.embed_tokens_per_layer.weight", ids, ple_width)?;
     let raw_scale = (per_layer as f32).sqrt();
     let raw_scaled: Vec<bf16> = raw_host.iter()
         .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
-    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_raw.copy_from_host(&raw_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_raw.copy_from_host_bytes_async(bytemuck::cast_slice(&raw_scaled), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_plmp_w: DeviceBuffer<bf16> = DeviceBuffer::new(ple_width * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    top.per_layer_model_projection.dequant_to(&mut d_plmp_w, stream)?;
-    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_ctx, &d_h, &d_plmp_w, None,
+    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_ctx, &d_h, &top.per_layer_model_projection, None,
                     t_q, ple_width, hidden, (hidden as f32).powf(-0.5), 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_ctx_normed, &d_ctx, Some(&top.per_layer_projection_norm),
@@ -463,9 +463,9 @@ pub fn forward_step(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     add_scale_bf16(&mut d_combined, &d_ctx_normed, &d_raw, (0.5f32).sqrt(), Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    drop(d_plmp_w); drop(d_raw); drop(d_ctx); drop(d_ctx_normed);
+    drop(d_raw); drop(d_ctx); drop(d_ctx_normed);
 
-    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     for layer_idx in 0..n_layers {
         per_layer_slice_bf16(&mut d_ple_layer, &d_combined,
                               t_q, n_layers, per_layer, layer_idx, Some(stream))
@@ -488,18 +488,18 @@ pub fn forward_step(
     }
     kv.advance(t_q);
 
-    let mut d_last_row: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_last_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     d_last_row.copy_region_from_device(0, &d_h, (t_q - 1) * hidden, hidden)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_normed: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_normed: DeviceBuffer<bf16> = DeviceBuffer::new_async(hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_normed, &d_last_row, Some(&top.norm), 1, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new_async(vocab, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     lt.linear_bf16(&mut d_logits, &d_normed, &top.lm_head, None,
                     1, vocab, hidden, 1.0, 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new_async(vocab, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     softcap_bf16(&mut d_capped, &d_logits, softcap, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -554,8 +554,8 @@ pub fn forward_step_batched(
     // Positions array: one per request row. rope_bf16 already accepts a
     // positions vector of length `tokens`, one position per row.
     let positions_host: Vec<i32> = slots.iter().map(|s| s.cur_pos).collect();
-    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(n).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_positions.copy_from_host(&positions_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new_async(n, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_positions.copy_from_host_bytes_async(bytemuck::cast_slice(&positions_host), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Input embedding: host-gather N rows of embed_tokens, scale, upload.
     let ie_host = mm.gather_rows_bf16(
@@ -563,8 +563,8 @@ pub fn forward_step_batched(
     let embed_scale = (hidden as f32).sqrt();
     let ie_scaled: Vec<bf16> = ie_host.iter()
         .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
-    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(n * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_h.copy_from_host(&ie_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host_bytes_async(bytemuck::cast_slice(&ie_scaled), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // PLE assembly across the N-row batch.
     let raw_host = mm.gather_rows_bf16(
@@ -572,15 +572,13 @@ pub fn forward_step_batched(
     let raw_scale = (per_layer as f32).sqrt();
     let raw_scaled: Vec<bf16> = raw_host.iter()
         .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
-    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_raw.copy_from_host(&raw_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_raw.copy_from_host_bytes_async(bytemuck::cast_slice(&raw_scaled), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_plmp_w: DeviceBuffer<bf16> = DeviceBuffer::new(ple_width * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    top.per_layer_model_projection.dequant_to(&mut d_plmp_w, stream)?;
-    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new(n * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_ctx, &d_h, &d_plmp_w, None,
+    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_ctx, &d_h, &top.per_layer_model_projection, None,
                     n, ple_width, hidden, (hidden as f32).powf(-0.5), 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_ctx_normed, &d_ctx, Some(&top.per_layer_projection_norm),
@@ -588,9 +586,9 @@ pub fn forward_step_batched(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     add_scale_bf16(&mut d_combined, &d_ctx_normed, &d_raw, (0.5f32).sqrt(), Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    drop(d_plmp_w); drop(d_raw); drop(d_ctx); drop(d_ctx_normed);
+    drop(d_raw); drop(d_ctx); drop(d_ctx_normed);
 
-    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new(n * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     for layer_idx in 0..n_layers {
         per_layer_slice_bf16(&mut d_ple_layer, &d_combined,
                               n, n_layers, per_layer, layer_idx, Some(stream))
@@ -618,14 +616,14 @@ pub fn forward_step_batched(
     }
 
     // Final norm + lm_head + softcap for all N rows.
-    let mut d_normed_all: DeviceBuffer<bf16> = DeviceBuffer::new(n * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_normed_all: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_normed_all, &d_h, Some(&top.norm), n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(n * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * vocab, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     lt.linear_bf16(&mut d_logits, &d_normed_all, &top.lm_head, None,
                     n, vocab, hidden, 1.0, 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(n * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * vocab, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     softcap_bf16(&mut d_capped, &d_logits, softcap, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -877,8 +875,15 @@ impl Engine {
             layers.push(load_layer_weights(&mm, &cfg, l, &stream)?);
         }
         let top = TopLevelWeights {
-            per_layer_model_projection: QuantLinearDev::load(
-                &mm.load_quant_linear("model.language_model.per_layer_model_projection")?)?,
+            per_layer_model_projection: {
+                let q = QuantLinearDev::load(
+                    &mm.load_quant_linear("model.language_model.per_layer_model_projection")?)?;
+                let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(q.out_features * q.in_features)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                q.dequant_to(&mut d, &stream)?;
+                stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+                d
+            },
             per_layer_projection_norm: {
                 let b = mm.load_bf16("model.language_model.per_layer_projection_norm.weight")?;
                 let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
