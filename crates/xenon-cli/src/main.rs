@@ -234,6 +234,24 @@ enum Command {
         #[arg(long, default_value = "2,108,107,1")]
         ids: String,
     },
+    /// Generate text from a prompt: tokenize, prefill, then greedy-sample
+    /// decode until EOS or `max_new_tokens`. Loads all 42 layers' weights
+    /// once (FP4 packed, dequant per step into a transient scratch buffer).
+    Generate {
+        model: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 32)]
+        max_new: usize,
+        /// Max context length — sizes the KV cache. Default leaves headroom
+        /// for the biggest full-attn slot at 4K.
+        #[arg(long, default_value_t = 4096)]
+        max_len: usize,
+        /// Wrap the prompt in Gemma's chat template so the instruction-tuned
+        /// model treats it as a user turn and actually responds.
+        #[arg(long)]
+        chat: bool,
+    },
     /// Run the FlashAttention-2 tiled kernel vs the naive kernel on random
     /// Q/K/V and verify they agree. Exercises the online-softmax path at
     /// T_kv values where the naive kernel would run out of shared memory.
@@ -356,6 +374,8 @@ fn main() -> anyhow::Result<()> {
             cmd_test_vs_hf_layer(model, hf, ids, layer),
         Command::TestVsHfTail { model, hf } => cmd_test_vs_hf_tail(model, hf),
         Command::TestVsHfFull { model, hf, ids } => cmd_test_vs_hf_full(model, hf, ids),
+        Command::Generate { model, prompt, max_new, max_len, chat } =>
+            cmd_generate(model, prompt, max_new, max_len, chat),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -1734,9 +1754,42 @@ fn cmd_test_vs_hf_tail(model_dir: PathBuf, hf_path: PathBuf) -> anyhow::Result<(
     Ok(())
 }
 
-/// All device buffers for one decoder layer's FP4/bf16 weights.
-/// Owner-KV layers populate `k_proj`, `v_proj`, `k_norm`; shared-KV layers
-/// leave them `None` (those GEMMs aren't run — K/V comes from the cache).
+/// NVFP4-quantized linear kept on-device in its packed form. Callers dequant
+/// to a bf16 scratch buffer just before they need the weight for a GEMM; that
+/// way we can keep all 42 layers' weights resident (~2.1 GiB total packed vs
+/// ~7.5 GiB dequanted) and only pay for peak scratch once per layer.
+struct QuantLinearDev {
+    packed: DeviceBuffer<u8>,
+    scales: DeviceBuffer<u8>,
+    global_scale: f32,
+    out_features: usize,
+    in_features: usize,
+}
+
+impl QuantLinearDev {
+    fn load(q: &xenon_core::QuantLinearRef<'_>) -> anyhow::Result<Self> {
+        let mut packed: DeviceBuffer<u8> = DeviceBuffer::new(q.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut scales: DeviceBuffer<u8> = DeviceBuffer::new(q.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        packed.copy_from_host_bytes(q.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+        scales.copy_from_host_bytes(q.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self {
+            packed, scales,
+            global_scale: q.global_scale,
+            out_features: q.out_features,
+            in_features: q.in_features,
+        })
+    }
+
+    fn dequant_to(&self, out: &mut DeviceBuffer<bf16>, stream: &Stream) -> anyhow::Result<()> {
+        fp4_dequant_bf16(out, &self.packed, &self.scales, self.global_scale,
+                          self.out_features, self.in_features, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// Decoder-layer weights resident on device. Quantized linears stay FP4;
+/// norms and `layer_scalar` are bf16/f32. Owner-KV layers populate
+/// `k_proj`/`v_proj`/`k_norm`; shared-KV layers leave them `None`.
 struct LayerWeights {
     input_layernorm: DeviceBuffer<bf16>,
     post_attention_layernorm: DeviceBuffer<bf16>,
@@ -1746,22 +1799,21 @@ struct LayerWeights {
     q_norm: DeviceBuffer<bf16>,
     k_norm: Option<DeviceBuffer<bf16>>,
 
-    q_proj: DeviceBuffer<bf16>,
-    k_proj: Option<DeviceBuffer<bf16>>,
-    v_proj: Option<DeviceBuffer<bf16>>,
-    o_proj: DeviceBuffer<bf16>,
+    q_proj: QuantLinearDev,
+    k_proj: Option<QuantLinearDev>,
+    v_proj: Option<QuantLinearDev>,
+    o_proj: QuantLinearDev,
 
-    gate_proj: DeviceBuffer<bf16>,
-    up_proj: DeviceBuffer<bf16>,
-    down_proj: DeviceBuffer<bf16>,
+    gate_proj: QuantLinearDev,
+    up_proj: QuantLinearDev,
+    down_proj: QuantLinearDev,
 
-    per_layer_input_gate: DeviceBuffer<bf16>,
-    per_layer_projection: DeviceBuffer<bf16>,
+    per_layer_input_gate: QuantLinearDev,
+    per_layer_projection: QuantLinearDev,
 
     layer_scalar: f32,
 }
 
-/// Upload + dequant one decoder layer's weights.
 fn load_layer_weights(
     mm: &MmapWeights,
     cfg: &GemmaConfig,
@@ -1780,16 +1832,6 @@ fn load_layer_weights(
         d.copy_from_host_bytes(bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(d)
     };
-    let dequant = |q: &xenon_core::QuantLinearRef<'_>| -> anyhow::Result<DeviceBuffer<bf16>> {
-        let mut dp: DeviceBuffer<u8> = DeviceBuffer::new(q.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut ds: DeviceBuffer<u8> = DeviceBuffer::new(q.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
-        dp.copy_from_host_bytes(q.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
-        ds.copy_from_host_bytes(q.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut dw: DeviceBuffer<bf16> = DeviceBuffer::new(q.out_features * q.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
-        fp4_dequant_bf16(&mut dw, &dp, &ds, q.global_scale, q.out_features, q.in_features, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(dw)
-    };
 
     let input_layernorm = upload_bf16(mm.load_bf16(&format!("{prefix}.input_layernorm.weight"))?, hidden)?;
     let post_attention_layernorm = upload_bf16(mm.load_bf16(&format!("{prefix}.post_attention_layernorm.weight"))?, hidden)?;
@@ -1801,19 +1843,19 @@ fn load_layer_weights(
         Some(upload_bf16(mm.load_bf16(&format!("{prefix}.self_attn.k_norm.weight"))?, d)?)
     } else { None };
 
-    let q_proj = dequant(&mm.load_quant_linear(&format!("{prefix}.self_attn.q_proj"))?)?;
+    let q_proj = QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.self_attn.q_proj"))?)?;
     let (k_proj, v_proj) = if owns_kv {
-        (Some(dequant(&mm.load_quant_linear(&format!("{prefix}.self_attn.k_proj"))?)?),
-         Some(dequant(&mm.load_quant_linear(&format!("{prefix}.self_attn.v_proj"))?)?))
+        (Some(QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.self_attn.k_proj"))?)?),
+         Some(QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.self_attn.v_proj"))?)?))
     } else { (None, None) };
-    let o_proj = dequant(&mm.load_quant_linear(&format!("{prefix}.self_attn.o_proj"))?)?;
+    let o_proj = QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.self_attn.o_proj"))?)?;
 
-    let gate_proj = dequant(&mm.load_quant_linear(&format!("{prefix}.mlp.gate_proj"))?)?;
-    let up_proj = dequant(&mm.load_quant_linear(&format!("{prefix}.mlp.up_proj"))?)?;
-    let down_proj = dequant(&mm.load_quant_linear(&format!("{prefix}.mlp.down_proj"))?)?;
+    let gate_proj = QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.mlp.gate_proj"))?)?;
+    let up_proj = QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.mlp.up_proj"))?)?;
+    let down_proj = QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.mlp.down_proj"))?)?;
 
-    let per_layer_input_gate = dequant(&mm.load_quant_linear(&format!("{prefix}.per_layer_input_gate"))?)?;
-    let per_layer_projection = dequant(&mm.load_quant_linear(&format!("{prefix}.per_layer_projection"))?)?;
+    let per_layer_input_gate = QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.per_layer_input_gate"))?)?;
+    let per_layer_projection = QuantLinearDev::load(&mm.load_quant_linear(&format!("{prefix}.per_layer_projection"))?)?;
 
     let layer_scalar_bytes = mm.load_bf16(&format!("{prefix}.layer_scalar"))?;
     let layer_scalar = bf16::from_bits(u16::from_le_bytes([layer_scalar_bytes[0], layer_scalar_bytes[1]])).to_f32();
@@ -1831,10 +1873,19 @@ fn load_layer_weights(
 }
 
 /// Per-layer metadata passed to the forward step.
+///
+/// `t_q` is the number of query tokens (1 for decode, prompt-length for
+/// prefill). `t_kv` is the total cached K/V length *after* this call's
+/// append (== `kv.cur_len` + `t_q` for own-KV layers, or the owner's
+/// cached length for shared layers). `q_pos_base` is the absolute position
+/// of the first query token: 0 for prefill, `t_kv - 1` for a single
+/// decode step.
 #[derive(Clone, Copy)]
 struct LayerMeta {
     layer_idx: usize,
-    tokens: usize,
+    t_q: usize,
+    t_kv: usize,
+    q_pos_base: i32,
     hidden: usize,
     inter: usize,
     h_heads: usize,
@@ -1851,6 +1902,10 @@ struct LayerMeta {
 /// Run one decoder layer's forward, updating `h` in place and writing K/V to
 /// the cache for owner layers. Shared layers skip the K/V path and read from
 /// `kv` via `slot_for_layer`.
+///
+/// `h` is `[t_q, hidden]`. For prefill t_q = T; for decode t_q = 1.
+/// `positions` holds the RoPE position for each of the `t_q` query tokens
+/// (prefill: `[0..T)`, decode: `[cur_len]`).
 #[allow(clippy::too_many_arguments)]
 fn layer_forward(
     lw: &LayerWeights,
@@ -1862,65 +1917,87 @@ fn layer_forward(
     lt: &mut CublasLt,
     stream: &Stream,
 ) -> anyhow::Result<()> {
-    let LayerMeta { tokens, hidden, inter, h_heads, h_kv, head_dim: d, per_layer, eps, window, rope_theta, rotary_dim, owns_kv, layer_idx } = meta;
+    let LayerMeta {
+        layer_idx, t_q, t_kv, q_pos_base,
+        hidden, inter, h_heads, h_kv, head_dim: d, per_layer,
+        eps, window, rope_theta, rotary_dim, owns_kv,
+    } = meta;
 
-    // Scratch buffers. Re-alloced per layer; cheap relative to the compute.
-    let mut d_residual: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_normed:   DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_tmp:      DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Scratch buffers. Re-alloced per call; cheap relative to the compute.
+    let mut d_residual: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_normed:   DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_tmp:      DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Helper: dequant an FP4 weight into a fresh bf16 scratch buffer.
+    let dequant = |ql: &QuantLinearDev| -> anyhow::Result<DeviceBuffer<bf16>> {
+        let mut out: DeviceBuffer<bf16> = DeviceBuffer::new(ql.out_features * ql.in_features)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        ql.dequant_to(&mut out, stream)?;
+        Ok(out)
+    };
 
     // ---- Attention block ----
     d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
-    rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), tokens, hidden, eps, Some(stream))
+    rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_heads * d).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_q, &d_normed, &lw.q_proj, None, tokens, h_heads * d, hidden, 1.0, 0.0, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * h_heads * d).map_err(|e| anyhow::anyhow!("{e}"))?;
     {
-        let q_tmp = clone_buffer(&d_q)?;
-        rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), tokens * h_heads, d, eps, Some(stream))
+        let qw = dequant(&lw.q_proj)?;
+        lt.linear_bf16(&mut d_q, &d_normed, &qw, None, t_q, h_heads * d, hidden, 1.0, 0.0, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    rope_bf16(&mut d_q, positions, tokens, h_heads, d, rotary_dim, rope_theta, Some(stream))
+    {
+        let q_tmp = clone_buffer(&d_q)?;
+        rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), t_q * h_heads, d, eps, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    rope_bf16(&mut d_q, positions, t_q, h_heads, d, rotary_dim, rope_theta, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if owns_kv {
-        let kw = lw.k_proj.as_ref().expect("owner layer missing k_proj");
-        let vw = lw.v_proj.as_ref().expect("owner layer missing v_proj");
+        let kl = lw.k_proj.as_ref().expect("owner layer missing k_proj");
+        let vl = lw.v_proj.as_ref().expect("owner layer missing v_proj");
         let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
-        let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
-        lt.linear_bf16(&mut d_k, &d_normed, kw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        lt.linear_bf16(&mut d_v, &d_normed, vw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
         {
-            let k_tmp = clone_buffer(&d_k)?;
-            rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), tokens * h_kv, d, eps, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let v_tmp = clone_buffer(&d_v)?;
-            rmsnorm_bf16(&mut d_v, &v_tmp, None, tokens * h_kv, d, eps, Some(stream))
+            let kw = dequant(kl)?;
+            lt.linear_bf16(&mut d_k, &d_normed, &kw, None, t_q, h_kv * d, hidden, 1.0, 0.0, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        rope_bf16(&mut d_k, positions, tokens, h_kv, d, rotary_dim, rope_theta, Some(stream))
+        {
+            let vw = dequant(vl)?;
+            lt.linear_bf16(&mut d_v, &d_normed, &vw, None, t_q, h_kv * d, hidden, 1.0, 0.0, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        {
+            let k_tmp = clone_buffer(&d_k)?;
+            rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), t_q * h_kv, d, eps, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let v_tmp = clone_buffer(&d_v)?;
+            rmsnorm_bf16(&mut d_v, &v_tmp, None, t_q * h_kv, d, eps, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        rope_bf16(&mut d_k, positions, t_q, h_kv, d, rotary_dim, rope_theta, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Stash into the KV cache at this layer's slot, offset cur_len=0.
-        kv.append(layer_idx, &d_k, &d_v, tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+        kv.append(layer_idx, &d_k, &d_v, t_q).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    // Attention reads from the cache via slot_for_layer (owner or own).
-    let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_heads * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * h_heads * d).map_err(|e| anyhow::anyhow!("{e}"))?;
     attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
-                     tokens, tokens, h_heads, h_kv, d, 1.0, 0, window, Some(stream))
+                     t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_attn_hidden, &d_attn_out, &lw.o_proj, None,
-                    tokens, hidden, h_heads * d, 1.0, 0.0, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let ow = dequant(&lw.o_proj)?;
+        lt.linear_bf16(&mut d_attn_hidden, &d_attn_out, &ow, None,
+                        t_q, hidden, h_heads * d, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     rmsnorm_bf16(&mut d_tmp, &d_attn_hidden, Some(&lw.post_attention_layernorm),
-                  tokens, hidden, eps, Some(stream))
+                  t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1928,42 +2005,57 @@ fn layer_forward(
     // ---- MLP block ----
     d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_normed, h, Some(&lw.pre_feedforward_layernorm),
-                  tokens, hidden, eps, Some(stream))
+                  t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new(tokens * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new(tokens * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_gate_out, &d_normed, &lw.gate_proj, None, tokens, inter, hidden, 1.0, 0.0, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_up_out,   &d_normed, &lw.up_proj,   None, tokens, inter, hidden, 1.0, 0.0, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new(t_q * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new(t_q * inter).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let gw = dequant(&lw.gate_proj)?;
+        lt.linear_bf16(&mut d_gate_out, &d_normed, &gw, None, t_q, inter, hidden, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    {
+        let uw = dequant(&lw.up_proj)?;
+        lt.linear_bf16(&mut d_up_out, &d_normed, &uw, None, t_q, inter, hidden, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_mlp_out, &d_act, &lw.down_proj, None, tokens, hidden, inter, 1.0, 0.0, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let dw = dequant(&lw.down_proj)?;
+        lt.linear_bf16(&mut d_mlp_out, &d_act, &dw, None, t_q, hidden, inter, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     rmsnorm_bf16(&mut d_tmp, &d_mlp_out, Some(&lw.post_feedforward_layernorm),
-                  tokens, hidden, eps, Some(stream))
+                  t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // ---- PLE block ----
     d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ple_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ple_glu:      DeviceBuffer<bf16> = DeviceBuffer::new(tokens * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ple_proj_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_ple_gate_out, h, &lw.per_layer_input_gate, None,
-                    tokens, per_layer, hidden, 1.0, 0.0, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_glu:      DeviceBuffer<bf16> = DeviceBuffer::new(t_q * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ple_proj_out: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let plg = dequant(&lw.per_layer_input_gate)?;
+        lt.linear_bf16(&mut d_ple_gate_out, h, &plg, None,
+                        t_q, per_layer, hidden, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     gelu_tanh_glu_bf16(&mut d_ple_glu, &d_ple_gate_out, ple_layer, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_ple_proj_out, &d_ple_glu, &lw.per_layer_projection, None,
-                    tokens, hidden, per_layer, 1.0, 0.0, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let plp = dequant(&lw.per_layer_projection)?;
+        lt.linear_bf16(&mut d_ple_proj_out, &d_ple_glu, &plp, None,
+                        t_q, hidden, per_layer, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     rmsnorm_bf16(&mut d_tmp, &d_ple_proj_out, Some(&lw.post_per_layer_input_norm),
-                  tokens, hidden, eps, Some(stream))
+                  t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1973,6 +2065,309 @@ fn layer_forward(
     scale_bf16(h, &h_in, lw.layer_scalar, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// Weights shared across all decoder layers (embedding is host-only).
+struct TopLevelWeights {
+    per_layer_model_projection: QuantLinearDev,
+    per_layer_projection_norm: DeviceBuffer<bf16>,
+    norm: DeviceBuffer<bf16>,
+}
+
+/// Shape/meta precomputed once for a model.
+#[derive(Clone, Copy)]
+struct ModelShape {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    h_heads: usize,
+    h_kv: usize,
+    per_layer: usize,
+    n_layers: usize,
+    ple_width: usize,
+    eps: f32,
+    softcap: f32,
+}
+
+/// Build the KV sharing map: layers 0..first_shared own; shared layers
+/// point at the last own-KV layer of the same kind.
+fn build_kv_cache(mm: &MmapWeights, cfg: &GemmaConfig, max_len: usize)
+    -> anyhow::Result<KvCache>
+{
+    let tc = &cfg.text_config;
+    let n_layers = tc.num_hidden_layers;
+    let num_kv_shared = tc.num_kv_shared_layers.unwrap_or(0);
+    let first_shared = n_layers - num_kv_shared;
+    let h_kv = tc.num_key_value_heads;
+
+    let mut slot_specs: Vec<SlotSpec> = Vec::new();
+    let mut slot_idx_of_owner: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut slot_for_layer: Vec<usize> = vec![0; n_layers];
+    for l in 0..n_layers {
+        if mm.layer_owns_kv(l) {
+            let idx = slot_specs.len();
+            slot_specs.push(SlotSpec { h_kv, head_dim: cfg.head_dim_for_layer(l) });
+            slot_idx_of_owner.insert(l, idx);
+            slot_for_layer[l] = idx;
+        }
+    }
+    for l in first_shared..n_layers {
+        let kind = tc.layer_types[l];
+        let owner = (0..first_shared).rev()
+            .find(|&ol| tc.layer_types[ol] == kind)
+            .ok_or_else(|| anyhow::anyhow!("no KV owner for layer {l}"))?;
+        slot_for_layer[l] = *slot_idx_of_owner.get(&owner).unwrap();
+    }
+    Ok(KvCache::new(slot_specs, slot_for_layer, max_len).map_err(|e| anyhow::anyhow!("{e}"))?)
+}
+
+/// Run one forward pass for `ids` (prefill for T>1 or a decode step for T=1).
+/// Appends new K/V to `kv` and advances `cur_len` by `ids.len()`. Returns the
+/// post-softcap logits for the LAST row as a `[vocab]` host vector (argmax
+/// on a small host copy is trivial and removes a device dep).
+#[allow(clippy::too_many_arguments)]
+fn forward_step(
+    mm: &MmapWeights,
+    cfg: &GemmaConfig,
+    shape: ModelShape,
+    layers: &[LayerWeights],
+    top: &TopLevelWeights,
+    kv: &mut KvCache,
+    ids: &[i32],
+    q_pos_base: i32,
+    lt: &mut CublasLt,
+    stream: &Stream,
+) -> anyhow::Result<Vec<bf16>> {
+    let tc = &cfg.text_config;
+    let t_q = ids.len();
+    let t_kv = kv.len() + t_q;
+    let ModelShape { hidden, inter, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
+
+    // positions for RoPE: absolute indices q_pos_base..q_pos_base+t_q.
+    let positions_host: Vec<i32> = (0..t_q as i32).map(|i| q_pos_base + i).collect();
+    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(t_q).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_positions.copy_from_host(&positions_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // ---- Input embedding (host-offloaded) ----
+    let ie_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens.weight", ids, hidden)?;
+    let embed_scale = (hidden as f32).sqrt();
+    let ie_scaled: Vec<bf16> = ie_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
+    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_h.copy_from_host(&ie_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // ---- PLE assembly ----
+    let raw_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens_per_layer.weight", ids, ple_width)?;
+    let raw_scale = (per_layer as f32).sqrt();
+    let raw_scaled: Vec<bf16> = raw_host.iter()
+        .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
+    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_raw.copy_from_host(&raw_scaled).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut d_plmp_w: DeviceBuffer<bf16> = DeviceBuffer::new(ple_width * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    top.per_layer_model_projection.dequant_to(&mut d_plmp_w, stream)?;
+    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * ple_width).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_ctx, &d_h, &d_plmp_w, None,
+                    t_q, ple_width, hidden, (hidden as f32).powf(-0.5), 0.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_ctx_normed, &d_ctx, Some(&top.per_layer_projection_norm),
+                  t_q * n_layers, per_layer, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(&mut d_combined, &d_ctx_normed, &d_raw, (0.5f32).sqrt(), Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(d_plmp_w);
+    drop(d_raw);
+    drop(d_ctx);
+    drop(d_ctx_normed);
+
+    // ---- Decoder stack ----
+    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new(t_q * per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for layer_idx in 0..n_layers {
+        per_layer_slice_bf16(&mut d_ple_layer, &d_combined,
+                              t_q, n_layers, per_layer, layer_idx, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer_idx);
+        let d_layer = cfg.head_dim_for_layer(layer_idx);
+        let window = match tc.layer_types[layer_idx] {
+            LayerKind::SlidingAttention => tc.sliding_window.unwrap_or(0) as i32,
+            LayerKind::FullAttention => 0,
+        };
+        let meta = LayerMeta {
+            layer_idx,
+            t_q, t_kv, q_pos_base,
+            hidden, inter, h_heads, h_kv,
+            head_dim: d_layer, per_layer, eps, window, rope_theta, rotary_dim,
+            owns_kv: mm.layer_owns_kv(layer_idx),
+        };
+        layer_forward(&layers[layer_idx], meta, &mut d_h, &d_ple_layer,
+                       &d_positions, kv, lt, stream)?;
+    }
+    kv.advance(t_q);
+
+    // ---- Tail: final norm + lm_head + softcap on the LAST row only ----
+    let mut d_last_row: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_last_row.copy_region_from_device(0, &d_h, (t_q - 1) * hidden, hidden)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_normed: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut d_normed, &d_last_row, Some(&top.norm), 1, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let lm_head_bytes = mm.load_bf16("model.language_model.embed_tokens.weight")?;
+    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+        d_lm_head.copy_from_host_bytes(lm_head_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+        lt.linear_bf16(&mut d_logits, &d_normed, &d_lm_head, None,
+                        1, vocab, hidden, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
+    softcap_bf16(&mut d_capped, &d_logits, softcap, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(d_capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?)
+}
+
+fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usize, chat: bool) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cfg = GemmaConfig::from_path(&model_dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    let shape = ModelShape {
+        hidden: tc.hidden_size,
+        inter: tc.intermediate_size,
+        vocab: tc.vocab_size,
+        h_heads: tc.num_attention_heads,
+        h_kv: tc.num_key_value_heads,
+        per_layer: tc.hidden_size_per_layer_input.ok_or_else(|| anyhow::anyhow!("hidden_size_per_layer_input missing"))?,
+        n_layers: tc.num_hidden_layers,
+        ple_width: tc.hidden_size_per_layer_input.unwrap_or(0) * tc.num_hidden_layers,
+        eps: tc.rms_norm_eps as f32,
+        softcap: tc.final_logit_softcapping.unwrap_or(30.0) as f32,
+    };
+
+    let tok = Tokenizer::from_dir(&model_dir)?;
+    let mm = MmapWeights::open(&model_dir.join("model.safetensors"))?;
+
+    // Wrap in Gemma 4 chat template if requested. Gemma 4 uses <|turn> (105)
+    // and <turn|> (106) as the turn markers (not <start_of_turn>/<end_of_turn>
+    // like Gemma 2/3). Template: <|turn>user\n{prompt}<turn|>\n<|turn>model\n
+    let text = if chat {
+        format!("<|turn>user\n{}<turn|>\n<|turn>model\n", prompt)
+    } else {
+        prompt.clone()
+    };
+    let prompt_ids_u: Vec<u32> = tok.encode(&text, true)?;
+    let prompt_ids: Vec<i32> = prompt_ids_u.iter().map(|&x| x as i32).collect();
+    anyhow::ensure!(prompt_ids.len() + max_new <= max_len,
+        "prompt ({}) + max_new ({}) exceeds max_len ({})",
+        prompt_ids.len(), max_new, max_len);
+
+    // ---- Load all 42 layers (FP4-resident). ----
+    let t_load = Instant::now();
+    let mut layers: Vec<LayerWeights> = Vec::with_capacity(shape.n_layers);
+    for l in 0..shape.n_layers {
+        layers.push(load_layer_weights(&mm, &cfg, l, &stream)?);
+    }
+    let top = TopLevelWeights {
+        per_layer_model_projection: QuantLinearDev::load(
+            &mm.load_quant_linear("model.language_model.per_layer_model_projection")?)?,
+        per_layer_projection_norm: {
+            let b = mm.load_bf16("model.language_model.per_layer_projection_norm.weight")?;
+            let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.per_layer).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d
+        },
+        norm: {
+            let b = mm.load_bf16("model.language_model.norm.weight")?;
+            let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d
+        },
+    };
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    let (mem_free, mem_total) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!(
+        "[xenon] loaded {} layers in {:.1} s; vram {:.2}/{:.2} GiB free; prompt {} tokens",
+        shape.n_layers, load_ms / 1000.0,
+        mem_free as f64 / 1073741824.0, mem_total as f64 / 1073741824.0,
+        prompt_ids.len()
+    );
+
+    let mut kv = build_kv_cache(&mm, &cfg, max_len)?;
+
+    let eos: Vec<i32> = vec![1, 106]; // Gemma 4 stop tokens
+
+    // ---- Prefill ----
+    let t_prefill = Instant::now();
+    let logits0 = forward_step(&mm, &cfg, shape, &layers, &top, &mut kv,
+                                &prompt_ids, 0, &mut lt, &stream)?;
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
+    let mut next: i32 = argmax_bf16(&logits0);
+    eprintln!("[xenon] prefill {:.1} ms ({:.1} tok/s)",
+             prefill_ms, prompt_ids.len() as f64 / (prefill_ms / 1000.0));
+
+    // Stream tokens as they're generated. For incremental decoding, keep
+    // the accumulated decoded string and print the diff after each token
+    // so subword pieces assemble into proper UTF-8 without partial chars.
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut generated: Vec<u32> = vec![next as u32];
+    let mut prev_decoded = String::new();
+    let emit = |gen: &[u32], prev: &mut String, out: &mut std::io::StdoutLock| -> anyhow::Result<()> {
+        let s = tok.decode(gen, /*skip_special*/ true)?;
+        if s.len() >= prev.len() && s.starts_with(prev.as_str()) {
+            out.write_all(s[prev.len()..].as_bytes())?;
+            out.flush()?;
+        }
+        *prev = s;
+        Ok(())
+    };
+    emit(&generated, &mut prev_decoded, &mut out)?;
+
+    let t_decode_all = Instant::now();
+    let mut decoded_steps = 0usize;
+    for step in 0..max_new {
+        if eos.contains(&next) && step > 0 {
+            break;
+        }
+        let q_pos = kv.len() as i32;
+        let logits = forward_step(&mm, &cfg, shape, &layers, &top, &mut kv,
+                                   &[next], q_pos, &mut lt, &stream)?;
+        next = argmax_bf16(&logits);
+        generated.push(next as u32);
+        emit(&generated, &mut prev_decoded, &mut out)?;
+        decoded_steps += 1;
+    }
+    let decode_ms = t_decode_all.elapsed().as_secs_f64() * 1e3;
+    writeln!(out)?;
+    drop(out);
+    eprintln!("[xenon] decoded {} tokens in {:.1} ms ({:.1} tok/s, prefill excluded)",
+             decoded_steps, decode_ms,
+             decoded_steps as f64 / (decode_ms / 1000.0));
+    Ok(())
+}
+
+fn argmax_bf16(row: &[bf16]) -> i32 {
+    let mut best_i = 0;
+    let mut best_v = row[0].to_f32();
+    for (i, v) in row.iter().enumerate().skip(1) {
+        let f = v.to_f32();
+        if f > best_v {
+            best_v = f;
+            best_i = i;
+        }
+    }
+    best_i as i32
 }
 
 fn cmd_test_vs_hf_full(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) -> anyhow::Result<()> {
@@ -2101,7 +2496,9 @@ fn cmd_test_vs_hf_full(model_dir: PathBuf, hf_path: PathBuf, ids_csv: String) ->
             LayerKind::FullAttention => 0,
         };
         let meta = LayerMeta {
-            layer_idx, tokens, hidden, inter,
+            layer_idx,
+            t_q: tokens, t_kv: tokens, q_pos_base: 0,
+            hidden, inter,
             h_heads, h_kv,
             head_dim: d_layer,
             per_layer, eps, window, rope_theta, rotary_dim,

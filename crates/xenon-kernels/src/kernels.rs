@@ -509,8 +509,10 @@ pub fn attn_naive_bf16(
     stream: Option<&Stream>,
 ) -> Result<(), CudaError> {
     assert_eq!(q.len(), t_q * h * d, "attn: q length");
-    assert_eq!(k.len(), t_kv * h_kv * d, "attn: k length");
-    assert_eq!(v.len(), t_kv * h_kv * d, "attn: v length");
+    // K/V can be KvCache slots sized [max_len, h_kv, d] where max_len >= t_kv;
+    // the kernel only reads the first t_kv rows.
+    assert!(k.len() >= t_kv * h_kv * d, "attn: k length");
+    assert!(v.len() >= t_kv * h_kv * d, "attn: v length");
     assert_eq!(out.len(), t_q * h * d, "attn: out length");
     assert!(h % h_kv == 0, "attn: h must be divisible by h_kv");
     let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
@@ -653,8 +655,9 @@ pub fn attn_flash_bf16(
     stream: Option<&Stream>,
 ) -> Result<(), CudaError> {
     assert_eq!(q.len(), t_q * h * d, "attn_flash: q length");
-    assert_eq!(k.len(), t_kv * h_kv * d, "attn_flash: k length");
-    assert_eq!(v.len(), t_kv * h_kv * d, "attn_flash: v length");
+    // Same "K/V may be a larger KvCache slot" exception as attn_naive.
+    assert!(k.len() >= t_kv * h_kv * d, "attn_flash: k length");
+    assert!(v.len() >= t_kv * h_kv * d, "attn_flash: v length");
     assert_eq!(out.len(), t_q * h * d, "attn_flash: out length");
     assert!(h % h_kv == 0);
     assert!(d % 128 == 0, "attn_flash: d must be a multiple of 128");
