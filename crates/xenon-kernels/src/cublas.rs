@@ -10,6 +10,7 @@
 //! + layouts, ask the heuristic for an algo, run it. Scoped to BF16 operands
 //! + fp32 accumulate; other dtypes can be added when we need them.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use half::bf16;
@@ -185,10 +186,17 @@ impl From<CudaError> for GemmError {
     }
 }
 
-/// Owning handle to cuBLASLt with a pre-allocated workspace.
+/// Cache key for algorithm selection: (m, n, k, opA, opB).
+type AlgoKey = (usize, usize, usize, i32, i32);
+
+/// Owning handle to cuBLASLt with a pre-allocated workspace and an algorithm
+/// cache keyed by (m, n, k, opA, opB). `cublasLtMatmulAlgoGetHeuristic` is
+/// ~50-200 µs per call; with 9 GEMMs × 42 layers per forward pass, skipping
+/// re-selection on repeat shapes is worth ~20-80 ms/step.
 pub struct CublasLt {
     handle: CublasLtHandleRaw,
     workspace: DeviceBuffer<u8>,
+    algo_cache: HashMap<AlgoKey, MatmulAlgo>,
 }
 
 unsafe impl Send for CublasLt {}
@@ -199,8 +207,10 @@ impl CublasLt {
         let mut h: CublasLtHandleRaw = std::ptr::null_mut();
         ck(unsafe { cublasLtCreate(&mut h) })?;
         let workspace = DeviceBuffer::<u8>::new(32 * 1024 * 1024)?;
-        Ok(Self { handle: h, workspace })
+        Ok(Self { handle: h, workspace, algo_cache: HashMap::new() })
     }
+
+    pub fn cached_algo_count(&self) -> usize { self.algo_cache.len() }
 
     /// `D[M,N] = alpha * A[M,K] * B[K,N] + beta * C[M,N]`, all row-major bf16.
     /// Uses fp32 accumulation and fp32 alpha/beta.
@@ -263,41 +273,45 @@ impl CublasLt {
         ck(unsafe { cublasLtMatrixLayoutCreate(&mut d_layout, CUDA_R_16BF, n as u64, m as u64, n as i64) })?;
         let _g_d = LayoutGuard(d_layout);
 
-        let mut pref: MatmulPreferenceRaw = std::ptr::null_mut();
-        ck(unsafe { cublasLtMatmulPreferenceCreate(&mut pref) })?;
-        let _g_pref = PrefGuard(pref);
-        let ws_bytes: u64 = self.workspace.bytes() as u64;
-        ck(unsafe {
-            cublasLtMatmulPreferenceSetAttribute(
-                pref,
-                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                &ws_bytes as *const u64 as *const c_void,
-                std::mem::size_of::<u64>(),
-            )
-        })?;
-
-        let mut heur = MatmulHeuristicResult {
-            algo: MatmulAlgo { data: [0; 8] },
-            workspace_size: 0,
-            state: 0,
-            waves_count: 0.0,
-            _reserved: [0; 4],
+        let key: AlgoKey = (m, n, k, CUBLAS_OP_N, CUBLAS_OP_N);
+        let algo = if let Some(a) = self.algo_cache.get(&key) {
+            *a
+        } else {
+            let mut pref: MatmulPreferenceRaw = std::ptr::null_mut();
+            ck(unsafe { cublasLtMatmulPreferenceCreate(&mut pref) })?;
+            let _g_pref = PrefGuard(pref);
+            let ws_bytes: u64 = self.workspace.bytes() as u64;
+            ck(unsafe {
+                cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &ws_bytes as *const u64 as *const c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            })?;
+            let mut heur = MatmulHeuristicResult {
+                algo: MatmulAlgo { data: [0; 8] },
+                workspace_size: 0,
+                state: 0,
+                waves_count: 0.0,
+                _reserved: [0; 4],
+            };
+            let mut returned: i32 = 0;
+            ck(unsafe {
+                cublasLtMatmulAlgoGetHeuristic(
+                    self.handle,
+                    desc,
+                    a_layout, b_layout, d_layout, d_layout,
+                    pref,
+                    1,
+                    &mut heur,
+                    &mut returned,
+                )
+            })?;
+            if returned == 0 { return Err(GemmError::NoAlgorithm); }
+            self.algo_cache.insert(key, heur.algo);
+            heur.algo
         };
-        let mut returned: i32 = 0;
-        ck(unsafe {
-            cublasLtMatmulAlgoGetHeuristic(
-                self.handle,
-                desc,
-                a_layout, b_layout, d_layout, d_layout,
-                pref,
-                1,
-                &mut heur,
-                &mut returned,
-            )
-        })?;
-        if returned == 0 {
-            return Err(GemmError::NoAlgorithm);
-        }
 
         let c_ptr: *const c_void = match c {
             Some(c) => c.as_device_ptr() as *const c_void,
@@ -315,7 +329,7 @@ impl CublasLt {
                 &beta as *const f32 as *const c_void,
                 c_ptr, d_layout,
                 d.as_device_ptr(), d_layout,
-                &heur.algo as *const MatmulAlgo,
+                &algo as *const MatmulAlgo,
                 self.workspace.as_device_ptr(),
                 self.workspace.bytes(),
                 stream_ptr,
@@ -388,41 +402,45 @@ impl CublasLt {
         ck(unsafe { cublasLtMatrixLayoutCreate(&mut d_layout, CUDA_R_16BF, n as u64, m as u64, n as i64) })?;
         let _g_d = LayoutGuard(d_layout);
 
-        let mut pref: MatmulPreferenceRaw = std::ptr::null_mut();
-        ck(unsafe { cublasLtMatmulPreferenceCreate(&mut pref) })?;
-        let _g_pref = PrefGuard(pref);
-        let ws_bytes: u64 = self.workspace.bytes() as u64;
-        ck(unsafe {
-            cublasLtMatmulPreferenceSetAttribute(
-                pref,
-                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                &ws_bytes as *const u64 as *const c_void,
-                std::mem::size_of::<u64>(),
-            )
-        })?;
-
-        let mut heur = MatmulHeuristicResult {
-            algo: MatmulAlgo { data: [0; 8] },
-            workspace_size: 0,
-            state: 0,
-            waves_count: 0.0,
-            _reserved: [0; 4],
+        let key: AlgoKey = (m, n, k, CUBLAS_OP_T, CUBLAS_OP_N);
+        let algo = if let Some(a) = self.algo_cache.get(&key) {
+            *a
+        } else {
+            let mut pref: MatmulPreferenceRaw = std::ptr::null_mut();
+            ck(unsafe { cublasLtMatmulPreferenceCreate(&mut pref) })?;
+            let _g_pref = PrefGuard(pref);
+            let ws_bytes: u64 = self.workspace.bytes() as u64;
+            ck(unsafe {
+                cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &ws_bytes as *const u64 as *const c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            })?;
+            let mut heur = MatmulHeuristicResult {
+                algo: MatmulAlgo { data: [0; 8] },
+                workspace_size: 0,
+                state: 0,
+                waves_count: 0.0,
+                _reserved: [0; 4],
+            };
+            let mut returned: i32 = 0;
+            ck(unsafe {
+                cublasLtMatmulAlgoGetHeuristic(
+                    self.handle,
+                    desc,
+                    a_layout, b_layout, d_layout, d_layout,
+                    pref,
+                    1,
+                    &mut heur,
+                    &mut returned,
+                )
+            })?;
+            if returned == 0 { return Err(GemmError::NoAlgorithm); }
+            self.algo_cache.insert(key, heur.algo);
+            heur.algo
         };
-        let mut returned: i32 = 0;
-        ck(unsafe {
-            cublasLtMatmulAlgoGetHeuristic(
-                self.handle,
-                desc,
-                a_layout, b_layout, d_layout, d_layout,
-                pref,
-                1,
-                &mut heur,
-                &mut returned,
-            )
-        })?;
-        if returned == 0 {
-            return Err(GemmError::NoAlgorithm);
-        }
 
         let c_ptr: *const c_void = match c {
             Some(c) => c.as_device_ptr() as *const c_void,
@@ -440,7 +458,7 @@ impl CublasLt {
                 &beta as *const f32 as *const c_void,
                 c_ptr, d_layout,
                 y.as_device_ptr(), d_layout,
-                &heur.algo as *const MatmulAlgo,
+                &algo as *const MatmulAlgo,
                 self.workspace.as_device_ptr(),
                 self.workspace.bytes(),
                 stream_ptr,

@@ -14,6 +14,8 @@ unsafe extern "C" {
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFree(ptr: *mut c_void) -> i32;
+    fn cudaMallocAsync(ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
+    fn cudaFreeAsync(ptr: *mut c_void, stream: *mut c_void) -> i32;
     fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFreeHost(ptr: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
@@ -134,9 +136,16 @@ impl Drop for Stream {
 
 /// A typed device allocation. `T` must be POD (bytemuck::Pod) so we can safely
 /// round-trip raw bytes from host slices.
+///
+/// Allocated via either `cudaMalloc` (default) or `cudaMallocAsync` on a
+/// given stream — the latter hits CUDA's default stream-ordered memory
+/// pool, which caches block sizes and is ~10-100x faster for the
+/// alloc/free churn in transient scratch buffers. `free_stream` remembers
+/// which path was used so Drop picks the matching API.
 pub struct DeviceBuffer<T: bytemuck::Pod> {
     ptr: *mut c_void,
     len: usize,
+    free_stream: *mut c_void, // null => cudaFree, non-null => cudaFreeAsync
     _p: PhantomData<T>,
 }
 
@@ -149,6 +158,7 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
             return Ok(Self {
                 ptr: std::ptr::null_mut(),
                 len: 0,
+                free_stream: std::ptr::null_mut(),
                 _p: PhantomData,
             });
         }
@@ -158,6 +168,30 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
         Ok(Self {
             ptr,
             len: n,
+            free_stream: std::ptr::null_mut(),
+            _p: PhantomData,
+        })
+    }
+
+    /// Stream-ordered allocation from CUDA's default memory pool.
+    /// For transient buffers reused each step, this is much faster than
+    /// `cudaMalloc` because the pool caches freed blocks of the same size.
+    pub fn new_async(n: usize, stream: &Stream) -> Result<Self, CudaError> {
+        if n == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+                free_stream: std::ptr::null_mut(),
+                _p: PhantomData,
+            });
+        }
+        let bytes = n.checked_mul(std::mem::size_of::<T>()).expect("overflow");
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        CudaError::check(unsafe { cudaMallocAsync(&mut ptr, bytes, stream.as_raw()) })?;
+        Ok(Self {
+            ptr,
+            len: n,
+            free_stream: stream.as_raw(),
             _p: PhantomData,
         })
     }
@@ -301,7 +335,11 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
 impl<T: bytemuck::Pod> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            let _ = unsafe { cudaFree(self.ptr) };
+            if self.free_stream.is_null() {
+                let _ = unsafe { cudaFree(self.ptr) };
+            } else {
+                let _ = unsafe { cudaFreeAsync(self.ptr, self.free_stream) };
+            }
         }
     }
 }
