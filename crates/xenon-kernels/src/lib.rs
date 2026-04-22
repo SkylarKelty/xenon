@@ -20,6 +20,6 @@ pub use kernels::{
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, hello, nvfp4_quantize_bf16,
     per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16,
-    rope_bf16_reference, scale_bf16, softcap_bf16, softmax_attn_bf16,
-    softmax_attn_bf16_reference, ue4m3_to_f32,
+    rope_bf16_reference, round_up, scale_bf16, softcap_bf16, softmax_attn_bf16,
+    softmax_attn_bf16_reference, swizzle_blockscale_ue4m3, ue4m3_to_f32,
 };

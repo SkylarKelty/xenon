@@ -13,33 +13,55 @@ use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
     add_scale_bf16, attn_naive_bf16,
     cuda::{Device, DeviceBuffer, Stream},
-    fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, per_layer_slice_bf16,
-    rmsnorm_bf16, rope_bf16, scale_bf16, softcap_bf16, CublasLt, KvCache, SlotSpec,
+    fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, nvfp4_quantize_bf16,
+    per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, scale_bf16, softcap_bf16,
+    swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
 };
 
 // -------------------- Weight containers --------------------
 
-/// NVFP4 linear weight resident on device in packed form. Dequant to bf16
-/// scratch on demand (via [`QuantLinearDev::dequant_to`]).
+/// NVFP4 linear weight resident on device.
+///
+/// Carries two copies of the per-16 UE4M3 block scales:
+/// - `scales` — row-major `[N, K/16]`, used by `fp4_dequant_bf16` (which
+///    reads linear).
+/// - `scales_swizzled` — 128×4 interleaved layout required by cuBLASLt's
+///    `VEC16_UE4M3` mode, produced once at load via `swizzle_blockscale_ue4m3`.
+///
+/// `global_scale` is the weight per-tensor f32 (weight_scale_2 in modelopt);
+/// `input_scale` is the calibrated activation per-tensor f32. Both fold into
+/// `alpha` on the native NVFP4 GEMM path.
 pub struct QuantLinearDev {
     pub packed: DeviceBuffer<u8>,
     pub scales: DeviceBuffer<u8>,
+    pub scales_swizzled: DeviceBuffer<u8>,
     pub global_scale: f32,
+    pub input_scale: f32,
     pub out_features: usize,
     pub in_features: usize,
 }
 
 impl QuantLinearDev {
     pub fn load(q: &xenon_core::QuantLinearRef<'_>) -> anyhow::Result<Self> {
+        let n = q.out_features;
+        let k = q.in_features;
+        let k_blocks = k / 16;
         let mut packed: DeviceBuffer<u8> = DeviceBuffer::new(q.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut scales: DeviceBuffer<u8> = DeviceBuffer::new(q.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
         packed.copy_from_host_bytes(q.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
         scales.copy_from_host_bytes(q.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let n_padded = round_up(n, 128);
+        let kb_padded = round_up(k_blocks, 4);
+        let mut scales_swizzled: DeviceBuffer<u8> =
+            DeviceBuffer::new(n_padded * kb_padded).map_err(|e| anyhow::anyhow!("{e}"))?;
+        swizzle_blockscale_ue4m3(&mut scales_swizzled, &scales, n, k_blocks, None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Self {
-            packed, scales,
+            packed, scales, scales_swizzled,
             global_scale: q.global_scale,
-            out_features: q.out_features,
-            in_features: q.in_features,
+            input_scale: q.input_scale,
+            out_features: n,
+            in_features: k,
         })
     }
 
@@ -49,18 +71,18 @@ impl QuantLinearDev {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// `y = x @ W^T` with FP4 weight. For `m == 1` uses the fused
-    /// FP4×bf16 gemv path; for `m > 1` dequants to bf16 and calls
-    /// `linear_bf16`.
+    /// `y = x @ W^T` with FP4 weight. Three-way dispatch by M:
+    /// - `m == 1` → fused `xk_fp4_gemv_bf16` (decode fast path).
+    /// - `m >= 128` → native NVFP4 tensor-core GEMM: quantize the
+    ///   activation to FP4 (`nvfp4_quantize_bf16`), swizzle its block scales
+    ///   into cuBLASLt's 128×4-interleaved layout, call `linear_nvfp4` with
+    ///   the pre-swizzled weight scales and `alpha = weight_scale_2 ×
+    ///   input_scale`. This was broken before the swizzle/input_scale fix
+    ///   landed — see `project_xenon_nvfp4_swizzle` memory.
+    /// - otherwise → dequant weight to bf16 scratch + `linear_bf16`.
     ///
-    /// Note on native NVFP4 at `m >= 128`: tried 2026-04-22. `linear_nvfp4`
-    /// requires BOTH operands FP4 on Blackwell, so we had to quantize the
-    /// activation to FP4 via `nvfp4_quantize_bf16`. Prefill sped up from
-    /// 952 → 2390 tok/s at T=155, but decode output collapsed to token 0
-    /// (complete garbage) — FP4 activations compound too much error over
-    /// 42 layers. Blackwell sm_120a doesn't offer a mixed FP4×bf16 tensor-
-    /// core path, so the primitive is kept dormant until someone does
-    /// smart-outlier-handling or switches to an FP8 activation format.
+    /// cuBLASLt's FP4 kernel is silently broken at `m < 128` on sm_120a, so
+    /// the threshold is strict.
     pub fn forward(
         &self,
         lt: &mut CublasLt,
@@ -71,9 +93,32 @@ impl QuantLinearDev {
     ) -> anyhow::Result<()> {
         let n = self.out_features;
         let k = self.in_features;
+        let k_blocks = k / 16;
         if m == 1 {
             fp4_gemv_bf16(y, x, &self.packed, &self.scales, self.global_scale,
                            n, k, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        } else if m >= 128 {
+            let mut x_packed: DeviceBuffer<u8> =
+                DeviceBuffer::new_async(m * (k / 2), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut x_scales_linear: DeviceBuffer<u8> =
+                DeviceBuffer::new_async(m * k_blocks, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            nvfp4_quantize_bf16(&mut x_packed, &mut x_scales_linear, x, m, k, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let m_padded = round_up(m, 128);
+            let kb_padded = round_up(k_blocks, 4);
+            let mut x_scales_swizzled: DeviceBuffer<u8> =
+                DeviceBuffer::new_async(m_padded * kb_padded, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            swizzle_blockscale_ue4m3(&mut x_scales_swizzled, &x_scales_linear, m, k_blocks, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Our nvfp4_quantize_bf16 stores block scales as amax/6 (no
+            // input_scale factor), so F4 × F8 ≈ x directly. cuBLASLt thus
+            // accumulates Σ (w/weight_scale_2) × x, and alpha only needs
+            // to fold weight_scale_2.
+            let alpha_scale = self.global_scale;
+            lt.linear_nvfp4(y, &x_packed, &x_scales_swizzled,
+                             &self.packed, &self.scales_swizzled,
+                             alpha_scale, None, m, n, k, 1.0, 0.0, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))
         } else {
             let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * k, stream)

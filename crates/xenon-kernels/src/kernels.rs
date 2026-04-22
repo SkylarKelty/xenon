@@ -133,6 +133,15 @@ unsafe extern "C" {
         cols: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_swizzle_blockscale(
+        dst: *mut c_void,
+        src: *const c_void,
+        m: i32,
+        k_blocks: i32,
+        m_padded: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn xk_attn_flash_bf16(
         out: *mut c_void,
         q: *const c_void,
@@ -708,6 +717,45 @@ pub fn nvfp4_quantize_bf16(
             input.as_device_ptr(),
             rows as i32,
             cols as i32,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Smallest multiple of `align` that is >= `n`.
+#[inline]
+pub fn round_up(n: usize, align: usize) -> usize {
+    ((n + align - 1) / align) * align
+}
+
+/// Swizzle UE4M3 per-16 block scales from row-major `[m, k_blocks]` into
+/// cuBLASLt's 128×4-interleaved layout (the one `VEC16_UE4M3` mode expects).
+/// `dst` must have `round_up(m, 128) * round_up(k_blocks, 4)` bytes.
+///
+/// Used for both weight scales (swizzled once at load) and activation
+/// scales (swizzled each time `nvfp4_quantize_bf16` runs, which is per
+/// prefill step in the M≥128 dispatch).
+pub fn swizzle_blockscale_ue4m3(
+    dst: &mut DeviceBuffer<u8>,
+    src: &DeviceBuffer<u8>,
+    m: usize,
+    k_blocks: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    let m_padded = round_up(m, 128);
+    let k_padded = round_up(k_blocks, 4);
+    assert!(src.len() >= m * k_blocks, "swizzle: src length");
+    assert!(dst.len() >= m_padded * k_padded, "swizzle: dst length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_swizzle_blockscale(
+            dst.as_device_ptr(),
+            src.as_device_ptr(),
+            m as i32,
+            k_blocks as i32,
+            m_padded as i32,
+            k_padded as i32,
             stream_ptr,
         )
     };

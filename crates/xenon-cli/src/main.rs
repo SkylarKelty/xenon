@@ -15,8 +15,8 @@ use xenon_kernels::{
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16,
-    rope_bf16_reference, scale_bf16, softcap_bf16, softmax_attn_bf16,
-    softmax_attn_bf16_reference, CublasLt, KvCache, SlotSpec,
+    rope_bf16_reference, round_up, scale_bf16, softcap_bf16, softmax_attn_bf16,
+    softmax_attn_bf16_reference, swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
 };
 
 /// Parse a little-endian bf16 byte slice into a `Vec<bf16>`. Avoids
@@ -121,6 +121,18 @@ enum Command {
         iters: usize,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+    },
+    /// Validate xk_swizzle_blockscale against a reference byte file produced
+    /// by vLLM's Python swizzle. Both src and expected are raw u8[M, Kb].
+    TestSwizzle {
+        #[arg(long)]
+        src: PathBuf,
+        #[arg(long)]
+        expected: PathBuf,
+        #[arg(long)]
+        m: usize,
+        #[arg(long)]
+        k_blocks: usize,
     },
     /// Run a bf16 Linear (y = x @ W^T) via cuBLASLt and compare to a CPU reference.
     TestLinear {
@@ -420,6 +432,7 @@ fn main() -> anyhow::Result<()> {
         Command::TestLinear { m, n, k, seed } => cmd_test_linear(m, n, k, seed),
         Command::TestNvfp4Linear { model, module, m, seed } => cmd_test_nvfp4_linear(model, module, m, seed),
         Command::TestFp4Gemv { model, module, iters, seed } => cmd_test_fp4_gemv(model, module, iters, seed),
+        Command::TestSwizzle { src, expected, m, k_blocks } => cmd_test_swizzle(src, expected, m, k_blocks),
         Command::TestNvfp4Roundtrip { rows, cols, seed } => cmd_test_nvfp4_roundtrip(rows, cols, seed),
         Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
         Command::TestMlp { model, layer, batch, seed } => cmd_test_mlp(model, layer, batch, seed),
@@ -1178,6 +1191,47 @@ fn cmd_test_fp4_gemv(dir: PathBuf, module: String, iters: usize, seed: u64) -> a
     anyhow::ensure!(global_rel <= tol, "fused vs dequant: rel {global_rel} > {tol}");
     println!("OK: fused fp4 gemv matches dequant+bf16 linear within {:.3}% rel.",
              global_rel * 100.0);
+    Ok(())
+}
+
+fn cmd_test_swizzle(src_path: PathBuf, exp_path: PathBuf, m: usize, kb: usize) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let src = std::fs::read(&src_path)?;
+    let expected = std::fs::read(&exp_path)?;
+    let m_padded = round_up(m, 128);
+    let kb_padded = round_up(kb, 4);
+    anyhow::ensure!(src.len() == m * kb, "src len {} != m*kb {}", src.len(), m * kb);
+    anyhow::ensure!(expected.len() == m_padded * kb_padded,
+        "expected len {} != m_padded*kb_padded {}", expected.len(), m_padded * kb_padded);
+
+    let mut d_src: DeviceBuffer<u8> = DeviceBuffer::new(m * kb).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_src.copy_from_host_bytes(&src).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_dst: DeviceBuffer<u8> = DeviceBuffer::new(m_padded * kb_padded).map_err(|e| anyhow::anyhow!("{e}"))?;
+    swizzle_blockscale_ue4m3(&mut d_dst, &d_src, m, kb, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got = d_dst.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut diffs = 0usize;
+    let mut first = None;
+    for i in 0..got.len() {
+        if got[i] != expected[i] {
+            diffs += 1;
+            if first.is_none() { first = Some(i); }
+        }
+    }
+    if diffs == 0 {
+        println!("OK: swizzle kernel matches reference byte-for-byte ({} bytes)", got.len());
+    } else {
+        let i = first.unwrap();
+        let s = i.saturating_sub(8);
+        let e = (i + 8).min(got.len());
+        println!("FAIL: {diffs}/{} bytes differ. First diff at byte {i}:", got.len());
+        println!("  got[{s}..{e}]:      {:?}", &got[s..e]);
+        println!("  expected[{s}..{e}]: {:?}", &expected[s..e]);
+        anyhow::bail!("swizzle kernel diverged from reference");
+    }
     Ok(())
 }
 
@@ -2048,22 +2102,34 @@ fn cmd_test_vs_hf_tail(model_dir: PathBuf, hf_path: PathBuf) -> anyhow::Result<(
 struct QuantLinearDev {
     packed: DeviceBuffer<u8>,
     scales: DeviceBuffer<u8>,
+    scales_swizzled: DeviceBuffer<u8>,
     global_scale: f32,
+    input_scale: f32,
     out_features: usize,
     in_features: usize,
 }
 
 impl QuantLinearDev {
     fn load(q: &xenon_core::QuantLinearRef<'_>) -> anyhow::Result<Self> {
+        let n = q.out_features;
+        let k = q.in_features;
+        let k_blocks = k / 16;
         let mut packed: DeviceBuffer<u8> = DeviceBuffer::new(q.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut scales: DeviceBuffer<u8> = DeviceBuffer::new(q.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
         packed.copy_from_host_bytes(q.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
         scales.copy_from_host_bytes(q.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let n_padded = round_up(n, 128);
+        let kb_padded = round_up(k_blocks, 4);
+        let mut scales_swizzled: DeviceBuffer<u8> =
+            DeviceBuffer::new(n_padded * kb_padded).map_err(|e| anyhow::anyhow!("{e}"))?;
+        swizzle_blockscale_ue4m3(&mut scales_swizzled, &scales, n, k_blocks, None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Self {
-            packed, scales,
+            packed, scales, scales_swizzled,
             global_scale: q.global_scale,
-            out_features: q.out_features,
-            in_features: q.in_features,
+            input_scale: q.input_scale,
+            out_features: n,
+            in_features: k,
         })
     }
 
@@ -2073,11 +2139,8 @@ impl QuantLinearDev {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// `y = x @ W^T`. Dispatches to the fused FP4×bf16 gemv for M=1 decode,
-    /// and to dequant+bf16 linear for M>1 (dequant amortizes across M).
-    /// Native NVFP4 was tried for M≥128 and reverted — it requires FP4
-    /// activations, which produce garbage output after 42 layers. See
-    /// the engine's QuantLinearDev::forward for details.
+    /// Three-way dispatch by M — see xenon-engine's QuantLinearDev::forward
+    /// doc for the full rationale.
     fn forward(
         &self,
         lt: &mut CublasLt,
@@ -2088,9 +2151,28 @@ impl QuantLinearDev {
     ) -> anyhow::Result<()> {
         let n = self.out_features;
         let k = self.in_features;
+        let k_blocks = k / 16;
         if m == 1 {
             fp4_gemv_bf16(y, x, &self.packed, &self.scales, self.global_scale,
                            n, k, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        } else if m >= 128 {
+            let mut x_packed: DeviceBuffer<u8> =
+                DeviceBuffer::new_async(m * (k / 2), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut x_scales_linear: DeviceBuffer<u8> =
+                DeviceBuffer::new_async(m * k_blocks, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            nvfp4_quantize_bf16(&mut x_packed, &mut x_scales_linear, x, m, k, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let m_padded = round_up(m, 128);
+            let kb_padded = round_up(k_blocks, 4);
+            let mut x_scales_swizzled: DeviceBuffer<u8> =
+                DeviceBuffer::new_async(m_padded * kb_padded, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+            swizzle_blockscale_ue4m3(&mut x_scales_swizzled, &x_scales_linear, m, k_blocks, Some(stream))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let alpha_scale = self.global_scale;
+            lt.linear_nvfp4(y, &x_packed, &x_scales_swizzled,
+                             &self.packed, &self.scales_swizzled,
+                             alpha_scale, None, m, n, k, 1.0, 0.0, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))
         } else {
             let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * k, stream)

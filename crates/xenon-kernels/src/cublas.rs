@@ -509,10 +509,23 @@ impl CublasLt {
     ) -> Result<(), GemmError> {
         assert!(k % 16 == 0, "NVFP4 requires K divisible by 16");
         assert_eq!(x_packed.len(), m * (k / 2), "nvfp4: x_packed length");
-        assert_eq!(x_scales.len(), m * (k / 16), "nvfp4: x_scales length");
         assert_eq!(y.len(), m * n, "nvfp4: y length");
         assert_eq!(w_packed.len(), n * (k / 2), "nvfp4: w_packed length");
-        assert_eq!(w_scales.len(), n * (k / 16), "nvfp4: w_scales length");
+        // Scales are in the 128×4-tile swizzled layout cuBLASLt expects;
+        // their buffer is padded: `round_up(rows, 128) * round_up(k/16, 4)`.
+        // We accept `>=` to let callers pass persistent scratch.
+        let scales_x_expected = ((m + 127) / 128 * 128) * (((k / 16) + 3) / 4 * 4);
+        let scales_w_expected = ((n + 127) / 128 * 128) * (((k / 16) + 3) / 4 * 4);
+        assert!(
+            x_scales.len() >= scales_x_expected,
+            "nvfp4: x_scales length {} < swizzled expected {}",
+            x_scales.len(), scales_x_expected
+        );
+        assert!(
+            w_scales.len() >= scales_w_expected,
+            "nvfp4: w_scales length {} < swizzled expected {}",
+            w_scales.len(), scales_w_expected
+        );
         if let Some(c) = c { assert_eq!(c.len(), m * n); }
 
         let alpha_effective = alpha * global_scale;

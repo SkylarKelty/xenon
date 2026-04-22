@@ -367,10 +367,12 @@ impl MmapWeights {
         let w_name  = format!("{prefix}.weight");
         let s_name  = format!("{prefix}.weight_scale");
         let s2_name = format!("{prefix}.weight_scale_2");
+        let is_name = format!("{prefix}.input_scale");
 
         let w_info  = self.info(&w_name).ok_or_else(|| Error::Config(format!("missing '{w_name}'")))?;
         let s_info  = self.info(&s_name).ok_or_else(|| Error::Config(format!("missing '{s_name}'")))?;
         let s2_info = self.info(&s2_name).ok_or_else(|| Error::Config(format!("missing '{s2_name}'")))?;
+        let is_info = self.info(&is_name).ok_or_else(|| Error::Config(format!("missing '{is_name}'")))?;
 
         if w_info.dtype != "U8" {
             return Err(Error::Config(format!("'{w_name}' dtype {} (want U8)", w_info.dtype)));
@@ -407,10 +409,20 @@ impl MmapWeights {
                 s2_info.shape
             )));
         }
+        if is_info.dtype != "F32" {
+            return Err(Error::Config(format!("'{is_name}' dtype {} (want F32)", is_info.dtype)));
+        }
+        if !is_info.shape.is_empty() && is_info.shape != vec![1] {
+            return Err(Error::Config(format!(
+                "'{is_name}' shape {:?} is not scalar",
+                is_info.shape
+            )));
+        }
 
         let packed = self.tensor_bytes(&w_name)?;
         let scales = self.tensor_bytes(&s_name)?;
         let s2_bytes = self.tensor_bytes(&s2_name)?;
+        let is_bytes = self.tensor_bytes(&is_name)?;
         if packed.len() != out * in_packed {
             return Err(Error::Config(format!(
                 "'{w_name}' byte length {} != expected {}",
@@ -431,7 +443,14 @@ impl MmapWeights {
                 s2_bytes.len()
             )));
         }
+        if is_bytes.len() != 4 {
+            return Err(Error::Config(format!(
+                "'{is_name}' has {} bytes (want 4 for f32)",
+                is_bytes.len()
+            )));
+        }
         let global_scale = f32::from_le_bytes([s2_bytes[0], s2_bytes[1], s2_bytes[2], s2_bytes[3]]);
+        let input_scale = f32::from_le_bytes([is_bytes[0], is_bytes[1], is_bytes[2], is_bytes[3]]);
 
         Ok(QuantLinearRef {
             module: prefix.to_string(),
@@ -440,6 +459,7 @@ impl MmapWeights {
             packed,
             scales,
             global_scale,
+            input_scale,
         })
     }
 }
@@ -451,6 +471,7 @@ pub struct QuantLinearRef<'a> {
     pub out_features: usize,
     pub in_features: usize,
     pub packed: &'a [u8],    // [out, in/2]
-    pub scales: &'a [u8],    // [out, in/16] UE4M3
-    pub global_scale: f32,   // per-tensor fp32 multiplier
+    pub scales: &'a [u8],    // [out, in/16] UE4M3 (row-major in the checkpoint)
+    pub global_scale: f32,   // weight per-tensor fp32 multiplier (weight_scale_2)
+    pub input_scale: f32,    // activation per-tensor fp32 multiplier (calibrated)
 }
