@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::{Error, Result};
 
+#[derive(Clone)]
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
 }

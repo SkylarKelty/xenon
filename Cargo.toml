@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/xenon-core",
     "crates/xenon-kernels",
+    "crates/xenon-engine",
     "crates/xenon-server",
     "crates/xenon-cli",
 ]
