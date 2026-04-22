@@ -79,6 +79,17 @@ __global__ void xk_fp4_gemv_bf16_kernel(
     const size_t row_packed = (size_t)n * (K >> 1);   // K/2 bytes per row
     const size_t row_scales = (size_t)n * (K >> 4);   // K/16 bytes per row
 
+    // Stage the 16-entry FP4 LUT into shared memory at block entry. In the
+    // inner loop each thread indexes with its own 4-bit `code`, so reading
+    // from __constant__ would serialize through the MIO pipe (broadcast only
+    // fires when all warp lanes share the same address). Shmem has 32 banks,
+    // so 16 distinct codes across a warp land in 16 distinct banks and are
+    // served in parallel. Confirmed via ncu: pre-shmem kernel spent ~68% of
+    // stall cycles on MIO throttle.
+    __shared__ float s_lut[16];
+    if (tid < 16) s_lut[tid] = XK_FP4_GEMV_LUT[tid];
+    __syncthreads();
+
     float acc = 0.0f;
 
     // Each thread strides through K/16-sized blocks. Within a warp, threads
@@ -103,7 +114,7 @@ __global__ void xk_fp4_gemv_bf16_kernel(
             const int byte_idx = i >> 1;
             const uint8_t byte = (uint8_t)(w_pack >> (byte_idx * 8));
             const uint8_t code = (i & 1) ? (byte >> 4) : (byte & 0xF);
-            const float   w_val = XK_FP4_GEMV_LUT[code] * bs;
+            const float   w_val = s_lut[code] * bs;
             const float   x_val = (i < 8)
                 ? __bfloat162float(xa0p[i])
                 : __bfloat162float(xa1p[i - 8]);
