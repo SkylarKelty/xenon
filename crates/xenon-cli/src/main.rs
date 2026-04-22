@@ -11,7 +11,7 @@ use xenon_core::{
 };
 use xenon_kernels::{
     add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
-    cuda::{device_synchronize, mem_info, Device, DeviceBuffer, PinnedBuffer, Stream},
+    cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16,
@@ -2342,15 +2342,15 @@ fn clone_buffer_async(src: &DeviceBuffer<bf16>, stream: &Stream) -> anyhow::Resu
     Ok(dst)
 }
 
-/// Weights shared across all decoder layers. `lm_head_pinned` holds the
-/// 1.25 GiB `embed_tokens` table in page-locked host memory so every
-/// forward step can `cudaMemcpyAsync` it to a transient device buffer
-/// concurrently with decoder compute.
+/// Weights shared across all decoder layers. `lm_head` is the 1.34 GiB
+/// `embed_tokens` table kept device-resident — with the decoder stack at
+/// ~11 ms post fused-FP4-gemv + shmem LUT, the PCIe transfer it used to
+/// do per-step no longer hides and became the dominant host-side stall.
 struct TopLevelWeights {
     per_layer_model_projection: QuantLinearDev,
     per_layer_projection_norm: DeviceBuffer<bf16>,
     norm: DeviceBuffer<bf16>,
-    lm_head_pinned: PinnedBuffer<bf16>,
+    lm_head: DeviceBuffer<bf16>,
 }
 
 /// Shape/meta precomputed once for a model.
@@ -2426,14 +2426,7 @@ fn forward_step(
     let t_q = ids.len();
     let t_kv = kv.len() + t_q;
     let ModelShape { hidden, inter, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
-
-    // Kick off lm_head H2D on a separate stream BEFORE the decoder stack.
-    // The 1.25 GiB PCIe transfer runs concurrently with decoder compute;
-    // at the tail we stream-sync, then GEMM against the pre-uploaded weights.
-    // Source must be pinned for true async overlap — see TopLevelWeights.
-    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_lm_head.copy_from_host_bytes_async(top.lm_head_pinned.as_bytes(), stream_lm)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _ = stream_lm; // retained for signature compatibility; lm_head is resident.
 
     // positions for RoPE: absolute indices q_pos_base..q_pos_base+t_q.
     let positions_host: Vec<i32> = (0..t_q as i32).map(|i| q_pos_base + i).collect();
@@ -2508,11 +2501,8 @@ fn forward_step(
     rmsnorm_bf16(&mut d_normed, &d_last_row, Some(&top.norm), 1, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Wait for the async lm_head H2D (kicked off at the top) to finish
-    // before consuming d_lm_head.
-    stream_lm.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_logits, &d_normed, &d_lm_head, None,
+    lt.linear_bf16(&mut d_logits, &d_normed, &top.lm_head, None,
                     1, vocab, hidden, 1.0, 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2696,11 +2686,11 @@ fn cmd_bench(
             d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
             d
         },
-        lm_head_pinned: {
+        lm_head: {
             let b = mm.load_bf16("model.language_model.embed_tokens.weight")?;
-            let mut p: PinnedBuffer<bf16> = PinnedBuffer::new(shape.vocab * shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-            p.as_mut_bytes().copy_from_slice(b);
-            p
+            let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.vocab * shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
+            d
         },
     };
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2886,11 +2876,10 @@ fn forward_step_profiled(
         Ok(())
     };
 
-    let t0 = Instant::now();
-    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_lm_head.copy_from_host_bytes_async(top.lm_head_pinned.as_bytes(), stream_lm).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // Don't sync stream_lm yet — measure only the issue cost.
-    phases.push(("lm_head H2D issue", t0.elapsed().as_secs_f64() * 1e3));
+    let _ = stream_lm; // retained for signature compatibility; lm_head is resident.
+    // lm_head is device-resident as of the lm_head-resident change; nothing
+    // to upload per-step. Kept phase name so the output columns stay stable.
+    phases.push(("lm_head H2D issue", 0.0));
 
     let positions_host: Vec<i32> = (0..t_q as i32).map(|i| q_pos_base + i).collect();
     let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(t_q).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2964,13 +2953,12 @@ fn forward_step_profiled(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     mark(&mut phases, "final RMSNorm", t_tail, stream)?;
 
-    let t_sync = Instant::now();
-    stream_lm.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
-    phases.push(("wait for lm_head H2D", t_sync.elapsed().as_secs_f64() * 1e3));
+    // lm_head is resident — no H2D to wait for. Kept row for phase stability.
+    phases.push(("wait for lm_head H2D", 0.0));
 
     let t_lm = Instant::now();
     let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_logits, &d_normed, &d_lm_head, None,
+    lt.linear_bf16(&mut d_logits, &d_normed, &top.lm_head, None,
                     1, vocab, hidden, 1.0, 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;

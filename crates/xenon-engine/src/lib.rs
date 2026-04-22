@@ -12,7 +12,7 @@ use half::bf16;
 use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
     add_scale_bf16, attn_naive_bf16,
-    cuda::{Device, DeviceBuffer, PinnedBuffer, Stream},
+    cuda::{Device, DeviceBuffer, Stream},
     fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, per_layer_slice_bf16,
     rmsnorm_bf16, rope_bf16, scale_bf16, softcap_bf16, CublasLt, KvCache, SlotSpec,
 };
@@ -165,7 +165,12 @@ pub struct TopLevelWeights {
     pub per_layer_model_projection: QuantLinearDev,
     pub per_layer_projection_norm: DeviceBuffer<bf16>,
     pub norm: DeviceBuffer<bf16>,
-    pub lm_head_pinned: PinnedBuffer<bf16>,
+    /// lm_head (embed_tokens.weight) resident on device. Historically lived
+    /// in pinned host memory and was copied per-step; now that the decoder
+    /// stack is ~11 ms the 1.34 GB PCIe transfer can't hide behind it and
+    /// becomes the dominant per-step cost. Resident costs 1.34 GB VRAM,
+    /// worth it at the current budget.
+    pub lm_head: DeviceBuffer<bf16>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -370,10 +375,7 @@ pub fn forward_step(
     let t_q = ids.len();
     let t_kv = kv.len() + t_q;
     let ModelShape { hidden, inter, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
-
-    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_lm_head.copy_from_host_bytes_async(top.lm_head_pinned.as_bytes(), stream_lm)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _ = stream_lm; // kept for signature compatibility; lm_head is resident.
 
     let positions_host: Vec<i32> = (0..t_q as i32).map(|i| q_pos_base + i).collect();
     let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(t_q).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -440,9 +442,8 @@ pub fn forward_step(
     rmsnorm_bf16(&mut d_normed, &d_last_row, Some(&top.norm), 1, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    stream_lm.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_logits, &d_normed, &d_lm_head, None,
+    lt.linear_bf16(&mut d_logits, &d_normed, &top.lm_head, None,
                     1, vocab, hidden, 1.0, 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -495,11 +496,7 @@ pub fn forward_step_batched(
     assert_eq!(new_tokens.len(), n, "new_tokens length must match slots");
     let tc = &cfg.text_config;
     let ModelShape { hidden, inter, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
-
-    // Kick off async lm_head H2D.
-    let mut d_lm_head: DeviceBuffer<bf16> = DeviceBuffer::new(vocab * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_lm_head.copy_from_host_bytes_async(top.lm_head_pinned.as_bytes(), stream_lm)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _ = stream_lm; // kept for signature compatibility; lm_head is resident.
 
     // Positions array: one per request row. rope_bf16 already accepts a
     // positions vector of length `tokens`, one position per row.
@@ -571,9 +568,8 @@ pub fn forward_step_batched(
     let mut d_normed_all: DeviceBuffer<bf16> = DeviceBuffer::new(n * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut d_normed_all, &d_h, Some(&top.norm), n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    stream_lm.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(n * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_logits, &d_normed_all, &d_lm_head, None,
+    lt.linear_bf16(&mut d_logits, &d_normed_all, &top.lm_head, None,
                     n, vocab, hidden, 1.0, 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new(n * vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -842,11 +838,11 @@ impl Engine {
                 d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
                 d
             },
-            lm_head_pinned: {
+            lm_head: {
                 let b = mm.load_bf16("model.language_model.embed_tokens.weight")?;
-                let mut p: PinnedBuffer<bf16> = PinnedBuffer::new(shape.vocab * shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
-                p.as_mut_bytes().copy_from_slice(b);
-                p
+                let mut d: DeviceBuffer<bf16> = DeviceBuffer::new(shape.vocab * shape.hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+                d.copy_from_host_bytes(b).map_err(|e| anyhow::anyhow!("{e}"))?;
+                d
             },
         };
         stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
