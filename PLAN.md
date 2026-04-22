@@ -132,17 +132,24 @@ during serving; phase 4 CUDA Graph capture subsumes this.
       baseline. Shared-memory scores; bounded at T_kv ≤ ~11K fp32 entries.
 - [x] Softmax kernel (causal + optional sliding-window mask) — exact match
       vs ref, row-sum within ~1e-3 of 1.0
-- [ ] KV cache allocator with GQA layout (2 KV heads × head_dim per layer)
+- [x] KV cache allocator with GQA layout (2 KV heads × head_dim per layer).
+      `KvCache` holds per-slot `[max_len, h_kv, head_dim]` K/V buffers with
+      a `slot_for_layer` indirection for sharing. `append` writes at
+      `cur_len`; `advance` marks N tokens consumed.
 - [x] Sliding-window mask (window 512) + full attention variants — same
       kernel, window=0 for full attention
-- [ ] KV sharing: 18 of 42 layers reuse KV from earlier layers — map indices
-      (hint: layers missing `k_proj.input_scale`/`v_proj.input_scale` are
-      the ones that reuse KV)
+- [x] KV sharing: 18 of 42 layers reuse KV from earlier layers. Detected
+      via `MmapWeights::layer_owns_kv`: layers missing `k_proj.input_scale`
+      are the shared ones. Map: layers 0..23 own their KV, layers 24..41
+      share (strongly suggestive mapping: layer `n` shares with `n-24`,
+      same-kind — to confirm vs HF in phase 3).
 - [ ] FlashAttention-style tile kernel (fp32 accumulate, bf16 I/O), one
       version per head_dim variant — needed for T_kv > ~11K
-- [x] CLI: `test-rope`, `test-softmax`, `test-embed`, `test-attn-layer`.
-      End-to-end: real weights, layer 0/4/5/11/17/24/35/41 all pass with
-      global rel ≤ 5.6e-3 at T=4.
+- [x] CLI: `test-rope`, `test-softmax`, `test-embed`, `test-attn-layer`,
+      `test-attn-decode`, `test-kv-cache`, `kv-map`. End-to-end: real
+      weights, ~8 layers across both kinds pass with global rel ≤ 5.6e-3
+      at T=4. Decode-shape and cache-append paths match prefill's last
+      row bit-for-bit.
 
 ### Phase 3 — full forward pass [ ]
 - [ ] 42-layer chain: embed → (norm → attn → norm → mlp + PLE inject) × 42 →

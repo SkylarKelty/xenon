@@ -281,6 +281,18 @@ impl MmapWeights {
         self.header.tensors.get(name)
     }
 
+    /// Does this layer compute its own K/V at inference time? We detect this
+    /// by the presence of the `k_proj.input_scale` activation-scale tensor:
+    /// layers that share KV under `num_kv_shared_layers` don't actually run
+    /// their (still-present) k_proj/v_proj weights, so modelopt never writes
+    /// an input_scale for them.
+    pub fn layer_owns_kv(&self, layer: usize) -> bool {
+        let name = format!(
+            "model.language_model.layers.{layer}.self_attn.k_proj.input_scale"
+        );
+        self.header.tensors.contains_key(&name)
+    }
+
     /// Raw bytes of a plain bf16 tensor, with dtype + length validation.
     pub fn load_bf16(&self, name: &str) -> Result<&[u8]> {
         let info = self

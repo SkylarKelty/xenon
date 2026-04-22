@@ -237,6 +237,40 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
             cudaMemcpy(self.ptr, src.ptr, self.bytes(), MEMCPY_DEVICE_TO_DEVICE)
         })
     }
+
+    /// D2D copy of `src` into this buffer starting at `dst_offset` elements.
+    /// `dst_offset + src.len()` must not exceed `self.len()`.
+    pub fn copy_slice_from_device(
+        &mut self,
+        dst_offset: usize,
+        src: &DeviceBuffer<T>,
+    ) -> Result<(), CudaError> {
+        self.copy_region_from_device(dst_offset, src, 0, src.len)
+    }
+
+    /// General D2D region copy: copy `len` elements from `src[src_offset..]`
+    /// into `self[dst_offset..]`.
+    pub fn copy_region_from_device(
+        &mut self,
+        dst_offset: usize,
+        src: &DeviceBuffer<T>,
+        src_offset: usize,
+        len: usize,
+    ) -> Result<(), CudaError> {
+        let dst_end = dst_offset.checked_add(len).expect("overflow");
+        let src_end = src_offset.checked_add(len).expect("overflow");
+        assert!(dst_end <= self.len, "copy_region: dst slice out of range");
+        assert!(src_end <= src.len, "copy_region: src slice out of range");
+        if len == 0 {
+            return Ok(());
+        }
+        let esz = std::mem::size_of::<T>();
+        let dst_ptr = unsafe { (self.ptr as *mut u8).add(dst_offset * esz) as *mut c_void };
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset * esz) as *const c_void };
+        CudaError::check(unsafe {
+            cudaMemcpy(dst_ptr, src_ptr, len * esz, MEMCPY_DEVICE_TO_DEVICE)
+        })
+    }
 }
 
 impl<T: bytemuck::Pod> Drop for DeviceBuffer<T> {

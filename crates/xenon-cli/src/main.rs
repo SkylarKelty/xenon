@@ -15,7 +15,7 @@ use xenon_kernels::{
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16, rope_bf16_reference, softmax_attn_bf16,
-    softmax_attn_bf16_reference, CublasLt,
+    softmax_attn_bf16_reference, CublasLt, KvCache, SlotSpec,
 };
 
 /// Parse a little-endian bf16 byte slice into a `Vec<bf16>`. Avoids
@@ -131,6 +131,35 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Self-consistency decode test: run prefill for T tokens, extract the
+    /// last-row attention output, then re-run attention with (T_q=1,
+    /// T_kv=T, q_pos_base=T-1) using the same Q/K/V. The two outputs must
+    /// match bit-closely — proves the decode-shape code path computes the
+    /// same math as the "last row of prefill".
+    TestAttnDecode {
+        model: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+        #[arg(long, default_value_t = 4)]
+        tokens: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Exercise KvCache: prefill (T-1) tokens via append-to-cache, then one
+    /// decode step, and verify the final attention output matches a
+    /// reference run that processes all T tokens at once.
+    TestKvCache {
+        model: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+        #[arg(long, default_value_t = 4)]
+        tokens: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Print the KV-sharing map derived from the safetensors header (which
+    /// layers own their KV vs reuse from elsewhere).
+    KvMap { model: PathBuf },
     /// Apply RoPE on random input and compare to a CPU reference.
     TestRope {
         #[arg(long, default_value_t = 4)]
@@ -214,6 +243,11 @@ fn main() -> anyhow::Result<()> {
         Command::TestEmbed { model, ids } => cmd_test_embed(model, ids),
         Command::TestAttnLayer { model, layer, tokens, q_pos_base, seed } =>
             cmd_test_attn_layer(model, layer, tokens, q_pos_base, seed),
+        Command::TestAttnDecode { model, layer, tokens, seed } =>
+            cmd_test_attn_decode(model, layer, tokens, seed),
+        Command::TestKvCache { model, layer, tokens, seed } =>
+            cmd_test_kv_cache(model, layer, tokens, seed),
+        Command::KvMap { model } => cmd_kv_map(model),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
     }
 }
@@ -1159,6 +1193,290 @@ fn clone_buffer(src: &DeviceBuffer<bf16>) -> anyhow::Result<DeviceBuffer<bf16>> 
     let mut dst = DeviceBuffer::<bf16>::new(src.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
     dst.copy_from_device(src).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(dst)
+}
+
+/// Run the attention block up to (and including) the naive-attention kernel,
+/// returning the attn output [T, H, D] and the roped Q, K, V used to produce
+/// it. Shared helper for test-attn-layer and test-attn-decode.
+#[allow(clippy::too_many_arguments)]
+fn run_prefill_attn(
+    dir: &PathBuf,
+    layer: usize,
+    tokens: usize,
+    q_pos_base: i32,
+    seed: u64,
+    stream: &Stream,
+    lt: &mut CublasLt,
+) -> anyhow::Result<PrefillAttn> {
+    let cfg = GemmaConfig::from_path(&dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    anyhow::ensure!(layer < tc.num_hidden_layers, "layer out of range");
+    let hidden = tc.hidden_size;
+    let h = tc.num_attention_heads;
+    let h_kv = tc.num_key_value_heads;
+    let d = cfg.head_dim_for_layer(layer);
+    let kind = tc.layer_types[layer];
+    let window: i32 = if matches!(kind, LayerKind::SlidingAttention) {
+        tc.sliding_window.unwrap_or(0) as i32
+    } else { 0 };
+    let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer);
+    let eps = tc.rms_norm_eps as f32;
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    let prefix = format!("model.language_model.layers.{layer}");
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+    let in_norm_bytes = mm.load_bf16(&format!("{prefix}.input_layernorm.weight"))?;
+    let q_norm_bytes  = mm.load_bf16(&format!("{prefix}.self_attn.q_norm.weight"))?;
+    let k_norm_bytes  = mm.load_bf16(&format!("{prefix}.self_attn.k_norm.weight"))?;
+    let q_proj = mm.load_quant_linear(&format!("{prefix}.self_attn.q_proj"))?;
+    let k_proj = mm.load_quant_linear(&format!("{prefix}.self_attn.k_proj"))?;
+    let v_proj = mm.load_quant_linear(&format!("{prefix}.self_attn.v_proj"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..tokens * hidden)
+        .map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)))
+        .collect();
+    let pos_host: Vec<i32> = (0..tokens).map(|i| q_pos_base + i as i32).collect();
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_in_norm_w: DeviceBuffer<bf16> = DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_q_norm_w:  DeviceBuffer<bf16> = DeviceBuffer::new(d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_k_norm_w:  DeviceBuffer<bf16> = DeviceBuffer::new(d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new(tokens).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_qw: DeviceBuffer<bf16> = DeviceBuffer::new(q_proj.out_features * q_proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_kw: DeviceBuffer<bf16> = DeviceBuffer::new(k_proj.out_features * k_proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_vw: DeviceBuffer<bf16> = DeviceBuffer::new(v_proj.out_features * v_proj.in_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let (mut d_qp, mut d_qs) = (
+        DeviceBuffer::<u8>::new(q_proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(q_proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    let (mut d_kp, mut d_ks) = (
+        DeviceBuffer::<u8>::new(k_proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(k_proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    let (mut d_vp, mut d_vs) = (
+        DeviceBuffer::<u8>::new(v_proj.packed.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        DeviceBuffer::<u8>::new(v_proj.scales.len()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+
+    let mut d_x_normed: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h_kv * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new(tokens * h * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_positions.copy_from_host(&pos_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_in_norm_w.copy_from_host_bytes(in_norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_q_norm_w.copy_from_host_bytes(q_norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_k_norm_w.copy_from_host_bytes(k_norm_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_qp.copy_from_host_bytes(q_proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_qs.copy_from_host_bytes(q_proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_kp.copy_from_host_bytes(k_proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_ks.copy_from_host_bytes(k_proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_vp.copy_from_host_bytes(v_proj.packed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_vs.copy_from_host_bytes(v_proj.scales).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    fp4_dequant_bf16(&mut d_qw, &d_qp, &d_qs, q_proj.global_scale, q_proj.out_features, q_proj.in_features, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_kw, &d_kp, &d_ks, k_proj.global_scale, k_proj.out_features, k_proj.in_features, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fp4_dequant_bf16(&mut d_vw, &d_vp, &d_vs, v_proj.global_scale, v_proj.out_features, v_proj.in_features, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    rmsnorm_bf16(&mut d_x_normed, &d_x, &d_in_norm_w, tokens, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_q, &d_x_normed, &d_qw, None, tokens, h * d, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_k, &d_x_normed, &d_kw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lt.linear_bf16(&mut d_v, &d_x_normed, &d_vw, None, tokens, h_kv * d, hidden, 1.0, 0.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let q_copy = clone_buffer(&d_q)?;
+        rmsnorm_bf16(&mut d_q, &q_copy, &d_q_norm_w, tokens * h, d, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let k_copy = clone_buffer(&d_k)?;
+        rmsnorm_bf16(&mut d_k, &k_copy, &d_k_norm_w, tokens * h_kv, d, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    rope_bf16(&mut d_q, &d_positions, tokens, h,    d, rotary_dim, rope_theta, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rope_bf16(&mut d_k, &d_positions, tokens, h_kv, d, rotary_dim, rope_theta, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    attn_naive_bf16(&mut d_attn_out, &d_q, &d_k, &d_v, tokens, tokens, h, h_kv, d, scale, q_pos_base, window, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok(PrefillAttn {
+        q: d_q, k: d_k, v: d_v, attn_out: d_attn_out,
+        tokens, hidden, h, h_kv, d,
+        scale, window, kind,
+    })
+}
+
+struct PrefillAttn {
+    q: DeviceBuffer<bf16>,
+    k: DeviceBuffer<bf16>,
+    v: DeviceBuffer<bf16>,
+    attn_out: DeviceBuffer<bf16>,
+    tokens: usize,
+    #[allow(dead_code)]
+    hidden: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    scale: f32,
+    window: i32,
+    kind: LayerKind,
+}
+
+fn cmd_kv_map(dir: PathBuf) -> anyhow::Result<()> {
+    let cfg = GemmaConfig::from_path(&dir.join("config.json"))?;
+    let tc = &cfg.text_config;
+    let mm = MmapWeights::open(&dir.join("model.safetensors"))?;
+    let mut owned = Vec::new();
+    let mut shared = Vec::new();
+    for l in 0..tc.num_hidden_layers {
+        if mm.layer_owns_kv(l) {
+            owned.push(l);
+        } else {
+            shared.push(l);
+        }
+    }
+    println!("=== xenon-cli kv-map ===");
+    println!("layers          {}", tc.num_hidden_layers);
+    println!("num_kv_shared   {:?}", tc.num_kv_shared_layers);
+    println!("owns KV         {} layers: {:?}", owned.len(), owned);
+    println!("shares KV       {} layers: {:?}", shared.len(), shared);
+    println!();
+    println!("per-layer kind (S=sliding, F=full) and ownership (O=own, S=shared):");
+    for l in 0..tc.num_hidden_layers {
+        let kind = match tc.layer_types[l] {
+            LayerKind::SlidingAttention => 'S',
+            LayerKind::FullAttention    => 'F',
+        };
+        let own = if mm.layer_owns_kv(l) { 'O' } else { 's' };
+        print!("{l:02}:{kind}{own}  ");
+        if (l + 1) % 6 == 0 { println!(); }
+    }
+    if tc.num_hidden_layers % 6 != 0 { println!(); }
+    Ok(())
+}
+
+fn cmd_test_kv_cache(dir: PathBuf, layer: usize, tokens: usize, seed: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(tokens >= 2, "need at least 2 tokens");
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("=== xenon-cli test-kv-cache ===");
+    // Reference run: full prefill on T tokens.
+    let p = run_prefill_attn(&dir, layer, tokens, 0, seed, &stream, &mut lt)?;
+    let t = p.tokens;
+    let row_k = p.h_kv * p.d;
+    let row_q = p.h * p.d;
+
+    println!("layer {layer}  kind {:?}  T={t}", p.kind);
+    println!("  hidden/H/Hkv/D         {} / {} / {} / {}", p.hidden, p.h, p.h_kv, p.d);
+
+    // Build a KvCache for just this layer (one slot).
+    let spec = SlotSpec { h_kv: p.h_kv, head_dim: p.d };
+    let mut cache = KvCache::new(vec![spec], vec![0], t).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Prefill phase: copy the first T-1 K/V rows from p.k / p.v into a scratch
+    // buffer sized [T-1, Hkv, D] then append to cache.
+    let mut prefill_k: DeviceBuffer<bf16> = DeviceBuffer::new((t - 1) * row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut prefill_v: DeviceBuffer<bf16> = DeviceBuffer::new((t - 1) * row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    prefill_k.copy_region_from_device(0, &p.k, 0, (t - 1) * row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    prefill_v.copy_region_from_device(0, &p.v, 0, (t - 1) * row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    cache.append(0, &prefill_k, &prefill_v, t - 1).map_err(|e| anyhow::anyhow!("{e}"))?;
+    cache.advance(t - 1);
+    println!("prefill done; cache.len = {}", cache.len());
+
+    // Decode phase: append the last token's K/V, then attend.
+    let mut new_k: DeviceBuffer<bf16> = DeviceBuffer::new(row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut new_v: DeviceBuffer<bf16> = DeviceBuffer::new(row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    new_k.copy_region_from_device(0, &p.k, (t - 1) * row_k, row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    new_v.copy_region_from_device(0, &p.v, (t - 1) * row_k, row_k).map_err(|e| anyhow::anyhow!("{e}"))?;
+    cache.append(0, &new_k, &new_v, 1).map_err(|e| anyhow::anyhow!("{e}"))?;
+    cache.advance(1);
+    println!("decode step appended; cache.len = {}", cache.len());
+    assert_eq!(cache.len(), t);
+
+    // Extract the last Q row for the decode query.
+    let mut q_last: DeviceBuffer<bf16> = DeviceBuffer::new(row_q).map_err(|e| anyhow::anyhow!("{e}"))?;
+    q_last.copy_region_from_device(0, &p.q, (t - 1) * row_q, row_q).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Run attention using the cache's K/V buffers.
+    let mut out_cache: DeviceBuffer<bf16> = DeviceBuffer::new(row_q).map_err(|e| anyhow::anyhow!("{e}"))?;
+    attn_naive_bf16(
+        &mut out_cache, &q_last, cache.k_buf(0), cache.v_buf(0),
+        1, cache.len(), p.h, p.h_kv, p.d,
+        p.scale, (t as i32) - 1, p.window, Some(&stream),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let got = out_cache.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prefill_host = p.attn_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = &prefill_host[(t - 1) * row_q..t * row_q];
+    let (max_abs, _per, global_rel) = compare_bf16(&got, want);
+    let mut mismatches = 0usize;
+    for (a, b) in got.iter().zip(want.iter()) {
+        if a.to_bits() != b.to_bits() { mismatches += 1; }
+    }
+
+    println!();
+    println!("mismatched bf16 elements  {} / {}", mismatches, row_q);
+    println!("max abs diff              {:.3e}", max_abs);
+    println!("global rel diff           {:.3e}", global_rel);
+    anyhow::ensure!(mismatches == 0,
+        "cached decode diverges from prefill last row by {mismatches} elements");
+    println!("OK: cached decode matches full-prefill last row bit-for-bit.");
+    Ok(())
+}
+
+fn cmd_test_attn_decode(dir: PathBuf, layer: usize, tokens: usize, seed: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(tokens >= 2, "need at least 2 tokens for a meaningful decode test");
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut lt = CublasLt::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("=== xenon-cli test-attn-decode ===");
+    let p = run_prefill_attn(&dir, layer, tokens, 0, seed, &stream, &mut lt)?;
+
+    let t = p.tokens;
+    let row = p.h * p.d;
+    println!("layer {layer}  kind {:?}  T={t}", p.kind);
+    println!("  hidden/H/Hkv/D         {} / {} / {} / {}", p.hidden, p.h, p.h_kv, p.d);
+    println!("  window / scale         {} / {:.6}", p.window, p.scale);
+
+    // Extract Q[T-1:T] as a [1, H, D] buffer.
+    let mut q_last: DeviceBuffer<bf16> = DeviceBuffer::new(row).map_err(|e| anyhow::anyhow!("{e}"))?;
+    q_last.copy_region_from_device(0, &p.q, (t - 1) * row, row)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Run decode-shape attention: T_q=1, T_kv=T, q_pos_base=T-1.
+    // Full K and V from the prefill are the "cache".
+    let mut out_decode: DeviceBuffer<bf16> = DeviceBuffer::new(row).map_err(|e| anyhow::anyhow!("{e}"))?;
+    attn_naive_bf16(
+        &mut out_decode, &q_last, &p.k, &p.v,
+        1, t, p.h, p.h_kv, p.d,
+        p.scale, (t as i32) - 1, p.window, Some(&stream),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Compare against prefill's last row.
+    let got = out_decode.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prefill_host = p.attn_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want: &[bf16] = &prefill_host[(t - 1) * row..t * row];
+
+    let (max_abs, _per, global_rel) = compare_bf16(&got, want);
+    let mut mismatches = 0usize;
+    for (a, b) in got.iter().zip(want.iter()) {
+        if a.to_bits() != b.to_bits() { mismatches += 1; }
+    }
+
+    println!();
+    println!("mismatched bf16 elements  {} / {}", mismatches, row);
+    println!("max abs diff              {:.3e}", max_abs);
+    println!("global rel diff           {:.3e}", global_rel);
+    // Same math on same inputs — we expect bit-for-bit match (reduction order
+    // is identical per (q_tok, q_head) and here q_tok is fixed).
+    anyhow::ensure!(mismatches == 0,
+        "decode output diverges from prefill last row by {mismatches} elements");
+    println!("OK: decode-shape attention matches last-row of prefill bit-for-bit.");
+    Ok(())
 }
 
 fn cmd_test_mlp(dir: PathBuf, layer: usize, batch: usize, seed: u64) -> anyhow::Result<()> {
