@@ -11,12 +11,20 @@ use std::path::Path;
 use half::bf16;
 use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
-    add_scale_bf16, attn_naive_bf16,
+    add_scale_bf16, attn_naive_bf16, attn_split_kv_auto_chunk_size, attn_split_kv_bf16,
     cuda::{Device, DeviceBuffer, Stream},
     fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, nvfp4_quantize_bf16,
     per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, scale_bf16, softcap_bf16,
     swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
 };
+
+/// RTX PRO 2000 Blackwell Laptop SM count. Used by the attn dispatch to pick
+/// between naive (T_q·H already saturates) and split-KV (doesn't).
+const DEVICE_SM_COUNT: usize = 26;
+/// Grid size at which the naive kernel's (T_q * H) blocks already fill the
+/// GPU, so split-KV's merge-kernel overhead is pure loss. Empirically ~2×
+/// SM count from `test-attn-split-kv` sweep.
+const ATTN_SATURATION_BLOCKS: usize = DEVICE_SM_COUNT * 2;
 
 // -------------------- Weight containers --------------------
 
@@ -326,9 +334,24 @@ pub fn layer_forward(
     }
 
     let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
-                     t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if t_q * h_heads < ATTN_SATURATION_BLOCKS {
+        // Decode-shaped: split T_kv across a third grid dim so more SMs stay busy.
+        let chunk_size = attn_split_kv_auto_chunk_size(t_q, t_kv, h_heads, DEVICE_SM_COUNT);
+        let n_chunks = t_kv.div_ceil(chunk_size);
+        let partials_len = t_q * h_heads * n_chunks;
+        let mut d_pmax: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_psum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_pnum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        attn_split_kv_bf16(&mut d_attn_out, &mut d_pmax, &mut d_psum, &mut d_pnum,
+                           &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
+                           t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window,
+                           chunk_size, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else {
+        attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
+                         t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     lw.o_proj.forward(lt, &mut d_attn_hidden, &d_attn_out, t_q, stream)?;
@@ -733,10 +756,19 @@ fn layer_forward_batched(
         let mut d_q_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_q, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut d_out_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_q, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
         d_q_row.copy_region_from_device(0, &d_q, i * row_q, row_q).map_err(|e| anyhow::anyhow!("{e}"))?;
-        attn_naive_bf16(&mut d_out_row, &d_q_row,
-                         slots[i].kv_cache.k_buf(layer_idx),
-                         slots[i].kv_cache.v_buf(layer_idx),
-                         1, t_kv_i, h_heads, h_kv, d, 1.0, q_pos_i, window, Some(stream))
+        // Per-slot t_q=1; always split-KV territory (h_heads × 1 < ATTN_SATURATION_BLOCKS).
+        let chunk_size = attn_split_kv_auto_chunk_size(1, t_kv_i, h_heads, DEVICE_SM_COUNT);
+        let n_chunks = t_kv_i.div_ceil(chunk_size);
+        let partials_len = h_heads * n_chunks;
+        let mut d_pmax: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_psum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_pnum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        attn_split_kv_bf16(&mut d_out_row, &mut d_pmax, &mut d_psum, &mut d_pnum,
+                           &d_q_row,
+                           slots[i].kv_cache.k_buf(layer_idx),
+                           slots[i].kv_cache.v_buf(layer_idx),
+                           1, t_kv_i, h_heads, h_kv, d, 1.0, q_pos_i, window,
+                           chunk_size, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         // Scatter result back into d_attn_out[i].
         d_attn_out.copy_slice_from_device(i * row_q, &d_out_row).map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -299,43 +299,44 @@ that — deferred to the open-questions / future-phase bucket.
       Same change mirrored to `forward_step_batched` for the server path.
       `forward_step_profiled` left sync (its job is per-phase timing via
       host syncs).
-- [ ] **Attention kernel rewrite — split-KV.** [Investigated 2026-04-23, see
-      below.] Current `xk_attn_naive_bf16_kernel` is 30% of decode GPU time.
-      One block per (q_tok, q_head) gives only 8 blocks for decode on a
-      ~26-SM GPU — grid-underparallel. Existing `xk_attn_flash_bf16_kernel`
-      is architecturally wrong for our shapes (optimizes shmem for long
-      context we don't have). Path: a "naive-style" (threads partition
-      T_kv, no intra-block reduction) kernel with split-KV parallelism —
-      multiple blocks per head, each owns a T_kv chunk, tree-reduce
-      across blocks. Expected 2-3× decode attention speedup.
+- [x] **Attention kernel rewrite — split-KV** (2026-04-23, commit TBD).
+      New `xk_attn_split_kv_*_bf16_kernel` pair: partial kernel grids over
+      `(q_tok × q_head × kv_chunk)` with naive's work pattern per chunk
+      (threads partition T_kv slice, each does a full D-dot, no intra-block
+      reduction); merge kernel combines the n_chunks partials via online
+      softmax. Dispatched in `layer_forward` only when `T_q × H <
+      2 × SM_count` (decode shapes). Prefill still uses naive — adding
+      split-KV there is pure merge-kernel overhead (see loss row below).
 
-**Attention kernel findings (2026-04-23).**
+**Attention kernel findings (2026-04-23, updated with split-KV results).**
 
-Per-launch on our shapes (D=256 sliding / D=512 full, T_kv ≤ 512 sliding
-or ≤ 155 for our bench), measured via `test-attn-flash`:
+Per-launch measured via `test-attn-flash` and `test-attn-split-kv`:
 
-| Shape | naive | flash (rewritten) | flash/naive |
-| --- | --- | --- | --- |
-| T_q=1, T_kv=255, D=256 | 48 μs | 119 μs | 2.48× |
-| T_q=1, T_kv=255, D=512 | 94 μs | 253 μs | 2.69× |
-| T_q=155, T_kv=155, D=256 | 442 μs | 1010 μs | 2.28× |
-| T_q=155, T_kv=155, D=512 | 858 μs | 3383 μs | 3.94× |
+| Shape | naive | flash (rewritten) | split-KV (auto cs) | split-KV speedup |
+| --- | --- | --- | --- | --- |
+| T_q=1, T_kv=255, D=256 | 48 μs | 119 μs | 20 μs (cs=32) | **2.43×** |
+| T_q=1, T_kv=255, D=512 | 94 μs | 253 μs | 32 μs (cs=16) | **2.97×** |
+| T_q=1, T_kv=512, D=256 | 94 μs | — | 32 μs (cs=64) | **3.00×** |
+| T_q=155, T_kv=155, D=256 | 442 μs | 1010 μs | 482 μs (cs=64) | 0.86× |
+| T_q=155, T_kv=155, D=512 | 858 μs | 3383 μs | 975 μs (cs=32) | 0.89× |
 
-Naive wins because threads partition the T_kv dimension and each thread
-does a full D-wide dot product independently — no intra-block reduction.
-Flash partitions D and cooperates per K row, requiring BR=16 block-wide
-reductions per tile; the reduction overhead only amortizes for T_kv in
-the 10K+ regime where naive's O(T_kv) shmem blows the 48 KiB budget.
-Flash kernel rewrite (batched reduction via warp-shuffle + shared memory)
-is ~1.5× faster than the original flash but still ~2× slower than naive.
-Kept wired to `attn_naive_bf16` in production; the improved flash remains
-the long-context fallback (naive shmem budget hard-caps around T_kv≈12K).
+Naive wins vs. flash because threads partition T_kv and each does a full
+D-dot independently — no intra-block reduction. Flash partitions D and
+cooperates per K row, needing BR=16 block-wide reductions per tile; that
+only amortizes for T_kv ≥ ~10K where naive's O(T_kv) shmem blows the 48
+KiB budget. Improved flash kept as long-context fallback (naive caps
+around T_kv≈12K).
 
-*The real win for decode attention is grid parallelism, not kernel
-internals.* Decode has 1 query row × 8 heads = 8 blocks, so only 8 of
-~26 SMs active (~31% SM occupancy regardless of kernel design). Split-KV
-(blocks = q_tok × q_head × kv_chunk) is the fix — sketched in the TODO
-above, not attempted this session.
+Split-KV wins on decode because grid size is the bottleneck, not kernel
+internals. Decode's 1×8=8 blocks only uses 31% of ~26 SMs; split-KV at
+cs=32–74 grows that to 40–64 blocks per launch (~90%+ occupancy).
+For prefill, T_q×H=1240 already oversubscribes the SMs, so split-KV's
+merge-kernel overhead is pure loss — hence the conditional dispatch.
+
+**Full-bench impact (commit TBD, T_prompt=155, max_new=50):**
+- decode 54.05 → 61.48 tok/s (+13.7%); decoder stack 13.96 → 12.22 ms
+- prefill 2441 → 2522 tok/s (+3.3%, within noise)
+- 2.58× ollama's 23.8 tok/s decode (was 2.17×)
 
 ### Phase 7 - emotion vectors [ ]
 - [ ] Investigate https://transformer-circuits.pub/2026/emotions/index.html#toc-15 - add in support for measuring/mapping emotion vectors
@@ -367,12 +368,11 @@ above, not attempted this session.
   KV, but the paper/config doesn't directly specify the mapping. Must be
   derived from the tensor presence pattern (layers without their own K/V
   proj weights reuse earlier ones). Resolve in phase 2.
-- **Attention kernel — split-KV rewrite.** Naive is fastest for our shapes
-  (see Phase 6 findings); the remaining 30% of decode GPU time comes from
-  low SM occupancy (8 blocks for decode on ~26 SMs). Split-KV parallelism
-  across a third grid dimension + tree-reduce is the expected 2-3× path.
-  Tensor-core (wgmma/mma.m16n8k16 bf16) attention is a further 3-5× on top
-  but significantly more code.
+- **Attention kernel — tensor-core path.** Split-KV (2026-04-23) recovered
+  the grid-parallelism deficit and gave +14% decode tok/s wall. Next
+  attention-side lever is switching the QK dot and the PV projection onto
+  wgmma/mma.m16n8k16 bf16 — further 3-5× expected, but a much bigger
+  kernel project than split-KV was.
 - **Native FP4 GEMM migration.** Post-phase-3 we swap dequant+bf16 GEMM for
   cuBLASLt NVFP4 operand mode. Expected win: ~2-3× MLP throughput when
   compute-bound, nothing when bandwidth-bound (which is most of decode).

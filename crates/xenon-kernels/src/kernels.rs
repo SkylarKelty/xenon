@@ -157,6 +157,25 @@ unsafe extern "C" {
         window: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_attn_split_kv_bf16(
+        out: *mut c_void,
+        partial_max: *mut c_void,
+        partial_sum: *mut c_void,
+        partial_num: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        t_q: i32,
+        t_kv: i32,
+        h: i32,
+        h_kv: i32,
+        d: i32,
+        scale: f32,
+        q_pos_base: i32,
+        window: i32,
+        chunk_size: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Runs the hello kernel. Proves the Rust -> nvcc -> CUDA runtime link works.
@@ -822,6 +841,92 @@ pub fn attn_flash_bf16(
             t_q as i32, t_kv as i32,
             h as i32, h_kv as i32, d as i32,
             scale, q_pos_base, window, stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Pick a chunk_size for split-KV attention that aims to fill the GPU with
+/// blocks. For decode shapes (T_q * H small) this returns a smaller chunk_size
+/// so more blocks launch; for prefill (T_q * H already saturates), returns
+/// T_kv so n_chunks collapses to 1 and the merge-kernel cost is negligible.
+///
+/// `sm_count` is the device SM count (e.g. 26 on RTX PRO 2000 Blackwell).
+/// The min chunk size (32) avoids per-block overhead swamping useful work.
+pub fn attn_split_kv_auto_chunk_size(
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    sm_count: usize,
+) -> usize {
+    const MIN_CHUNK: usize = 32;
+    let target_blocks = (sm_count * 2).max(1);
+    let heads = (t_q * h).max(1);
+    if heads >= target_blocks {
+        // Already saturated without splitting.
+        return t_kv.max(MIN_CHUNK);
+    }
+    let n_chunks_want = target_blocks.div_ceil(heads);
+    let cs_from_target = t_kv.div_ceil(n_chunks_want);
+    cs_from_target.max(MIN_CHUNK)
+}
+
+/// Split-KV attention: two-kernel decomposition that parallelises the T_kv
+/// dimension across a third grid axis. Same math (and same answer within
+/// fp32 round-off) as `attn_naive_bf16`, but at decode shapes (T_q=1, H=8)
+/// it launches ~n_chunks× more blocks, saturating SMs that would otherwise
+/// idle.
+///
+/// Caller supplies scratch for the per-chunk `(max, sum, numerator)` arrays;
+/// sizes are `[T_q * H * n_chunks]` floats for max/sum and
+/// `[T_q * H * n_chunks * D]` floats for numerator, where
+/// `n_chunks = ceil(T_kv / chunk_size)`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_split_kv_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    partial_max: &mut DeviceBuffer<f32>,
+    partial_sum: &mut DeviceBuffer<f32>,
+    partial_num: &mut DeviceBuffer<f32>,
+    q: &DeviceBuffer<bf16>,
+    k: &DeviceBuffer<bf16>,
+    v: &DeviceBuffer<bf16>,
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+    chunk_size: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert!(q.len() >= t_q * h * d, "attn_split_kv: q length");
+    assert!(k.len() >= t_kv * h_kv * d, "attn_split_kv: k length");
+    assert!(v.len() >= t_kv * h_kv * d, "attn_split_kv: v length");
+    assert!(out.len() >= t_q * h * d, "attn_split_kv: out length");
+    assert!(h % h_kv == 0, "attn_split_kv: h divisible by h_kv");
+    assert!(chunk_size > 0, "attn_split_kv: chunk_size > 0");
+    let n_chunks = t_kv.div_ceil(chunk_size);
+    let partials_needed = t_q * h * n_chunks;
+    assert!(partial_max.len() >= partials_needed, "attn_split_kv: partial_max length");
+    assert!(partial_sum.len() >= partials_needed, "attn_split_kv: partial_sum length");
+    assert!(partial_num.len() >= partials_needed * d, "attn_split_kv: partial_num length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_attn_split_kv_bf16(
+            out.as_device_ptr(),
+            partial_max.as_device_ptr(),
+            partial_sum.as_device_ptr(),
+            partial_num.as_device_ptr(),
+            q.as_device_ptr(),
+            k.as_device_ptr(),
+            v.as_device_ptr(),
+            t_q as i32, t_kv as i32,
+            h as i32, h_kv as i32, d as i32,
+            scale, q_pos_base, window,
+            chunk_size as i32,
+            stream_ptr,
         )
     };
     if code == 0 { Ok(()) } else { Err(CudaError(-code)) }

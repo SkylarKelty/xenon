@@ -11,6 +11,7 @@ use xenon_core::{
 };
 use xenon_kernels::{
     add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
+    attn_split_kv_auto_chunk_size, attn_split_kv_bf16,
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
@@ -356,6 +357,34 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Run the split-KV attention kernel vs the naive kernel on random Q/K/V,
+    /// verify correctness, and time both. Split-KV parallelises T_kv across a
+    /// third grid axis so decode (T_q=1) can saturate more SMs.
+    TestAttnSplitKv {
+        #[arg(long, default_value_t = 1)]
+        t_q: usize,
+        #[arg(long, default_value_t = 512)]
+        t_kv: usize,
+        #[arg(long, default_value_t = 8)]
+        h: usize,
+        #[arg(long, default_value_t = 2)]
+        h_kv: usize,
+        #[arg(long, default_value_t = 256)]
+        head_dim: usize,
+        /// 0 = no sliding window (full causal).
+        #[arg(long, default_value_t = 0)]
+        window: i32,
+        /// q_pos_base (decode shape: T_kv-T_q for cached).
+        #[arg(long)]
+        q_pos_base: Option<i32>,
+        /// Split-KV chunk size. Comma-separated sweep (e.g. `32,64,128`). Empty
+        /// = auto-pick via attn_split_kv_auto_chunk_size (sm_count=26 for RTX
+        /// PRO 2000 Blackwell).
+        #[arg(long, default_value = "")]
+        chunk_sizes: String,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     /// Apply RoPE on random input and compare to a CPU reference.
     TestRope {
         #[arg(long, default_value_t = 4)]
@@ -453,6 +482,8 @@ fn main() -> anyhow::Result<()> {
             cmd_test_tokenizer(model, text, add_specials),
         Command::TestAttnFlash { t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed } =>
             cmd_test_attn_flash(t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed),
+        Command::TestAttnSplitKv { t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, chunk_sizes, seed } =>
+            cmd_test_attn_split_kv(t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, chunk_sizes, seed),
         Command::TestVsHfEmbed { model, hf, ids } => cmd_test_vs_hf_embed(model, hf, ids),
         Command::TestVsHfPle { model, hf, ids } => cmd_test_vs_hf_ple(model, hf, ids),
         Command::TestVsHfLayer { model, hf, ids, layer } =>
@@ -2279,6 +2310,14 @@ fn load_layer_weights(
 /// cached length for shared layers). `q_pos_base` is the absolute position
 /// of the first query token: 0 for prefill, `t_kv - 1` for a single
 /// decode step.
+/// RTX PRO 2000 Blackwell Laptop SM count. Used by the attn dispatch to pick
+/// between naive (T_q·H already saturates) and split-KV (doesn't).
+const DEVICE_SM_COUNT: usize = 26;
+/// Grid size at which the naive kernel's (T_q * H) blocks already fill the
+/// GPU, so split-KV's merge-kernel overhead is pure loss. Empirically ~2×
+/// SM count from `test-attn-split-kv` sweep.
+const ATTN_SATURATION_BLOCKS: usize = DEVICE_SM_COUNT * 2;
+
 #[derive(Clone, Copy)]
 struct LayerMeta {
     layer_idx: usize,
@@ -2366,9 +2405,24 @@ fn layer_forward(
     }
 
     let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
-                     t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if t_q * h_heads < ATTN_SATURATION_BLOCKS {
+        // Decode-shaped: split T_kv across a third grid dim so more SMs stay busy.
+        let chunk_size = attn_split_kv_auto_chunk_size(t_q, t_kv, h_heads, DEVICE_SM_COUNT);
+        let n_chunks = t_kv.div_ceil(chunk_size);
+        let partials_len = t_q * h_heads * n_chunks;
+        let mut d_pmax: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_psum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_pnum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        attn_split_kv_bf16(&mut d_attn_out, &mut d_pmax, &mut d_psum, &mut d_pnum,
+                           &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
+                           t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window,
+                           chunk_size, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else {
+        attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
+                         t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     lw.o_proj.forward(lt, &mut d_attn_hidden, &d_attn_out, t_q, stream)?;
@@ -3732,6 +3786,129 @@ fn cmd_test_attn_flash(
     let tol_rel: f32 = 5e-2;
     anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
     println!("OK: flash kernel matches reference within {tol_rel:.1e}.");
+    Ok(())
+}
+
+fn cmd_test_attn_split_kv(
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    window: i32,
+    q_pos_base: Option<i32>,
+    chunk_sizes: String,
+    seed: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(h % h_kv == 0, "h must be divisible by h_kv");
+    anyhow::ensure!(t_kv >= t_q, "T_kv must be >= T_q for a cached-decode-like shape");
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let q_pos_base = q_pos_base.unwrap_or((t_kv as i32) - (t_q as i32));
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let q_host: Vec<bf16> = (0..t_q * h * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let k_host: Vec<bf16> = (0..t_kv * h_kv * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let v_host: Vec<bf16> = (0..t_kv * h_kv * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new(k_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(v_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_naive: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_q.copy_from_host(&q_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_k.copy_from_host(&k_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_v.copy_from_host(&v_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Ground truth: GPU naive (it fits: naive tops out around T_kv ≈ 11K
+    // for fp32 score shmem, we stay well under).
+    let naive_shmem_bytes = (t_kv * 4) + (128 * 4);
+    anyhow::ensure!(naive_shmem_bytes < 47 * 1024,
+        "T_kv={t_kv} too large for naive kernel reference");
+    attn_naive_bf16(
+        &mut d_naive, &d_q, &d_k, &d_v,
+        t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want: Vec<bf16> = d_naive.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Time naive as the comparison baseline.
+    let iters = 30;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        attn_naive_bf16(
+            &mut d_naive, &d_q, &d_k, &d_v,
+            t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let per_naive_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    // Parse chunk sweep list, or pick one via the auto heuristic.
+    let sweep: Vec<usize> = if chunk_sizes.trim().is_empty() {
+        // sm_count=26 for RTX PRO 2000 Blackwell; harmless to hardcode here.
+        vec![attn_split_kv_auto_chunk_size(t_q, t_kv, h, 26)]
+    } else {
+        chunk_sizes.split(',')
+            .map(|s| s.trim().parse::<usize>().map_err(|e| anyhow::anyhow!("{e}")))
+            .collect::<anyhow::Result<_>>()?
+    };
+
+    println!("=== xenon-cli test-attn-split-kv ===");
+    println!("shape                    T_q={t_q}, T_kv={t_kv}, H={h}, Hkv={h_kv}, D={d}");
+    println!("scale / q_pos_base       {:.6} / {}", scale, q_pos_base);
+    println!("window                   {window}");
+    println!("naive per-launch         {:>7.2} us (baseline)", per_naive_us);
+    println!();
+    println!("{:>10}  {:>8}  {:>11}  {:>10}  {:>10}  {:>11}",
+             "chunk_size", "n_chunks", "total blocks", "split us", "naive/split", "global_rel");
+
+    let mut d_split: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tol_rel: f32 = 5e-3;
+    let mut worst_rel: f32 = 0.0;
+    for chunk_size in sweep {
+        let n_chunks = t_kv.div_ceil(chunk_size);
+        let total_blocks = t_q * h * n_chunks;
+        let partials_len = t_q * h * n_chunks;
+        let mut d_pmax: DeviceBuffer<f32> = DeviceBuffer::new(partials_len).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_psum: DeviceBuffer<f32> = DeviceBuffer::new(partials_len).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut d_pnum: DeviceBuffer<f32> = DeviceBuffer::new(partials_len * d).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Correctness.
+        attn_split_kv_bf16(
+            &mut d_split, &mut d_pmax, &mut d_psum, &mut d_pnum,
+            &d_q, &d_k, &d_v,
+            t_q, t_kv, h, h_kv, d, scale, q_pos_base, window,
+            chunk_size, Some(&stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let got = d_split.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (_, _, global_rel) = compare_bf16(&got, &want);
+        worst_rel = worst_rel.max(global_rel);
+
+        // Timing.
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            attn_split_kv_bf16(
+                &mut d_split, &mut d_pmax, &mut d_psum, &mut d_pnum,
+                &d_q, &d_k, &d_v,
+                t_q, t_kv, h, h_kv, d, scale, q_pos_base, window,
+                chunk_size, Some(&stream),
+            ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let per_split_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        println!("{:>10}  {:>8}  {:>11}  {:>10.2}  {:>10.2}x  {:>11.3e}",
+                 chunk_size, n_chunks, total_blocks, per_split_us,
+                 per_naive_us / per_split_us, global_rel);
+    }
+
+    anyhow::ensure!(worst_rel <= tol_rel,
+        "worst global_rel {worst_rel} exceeds {tol_rel}");
+    println!();
+    println!("OK: split-KV matches naive within {tol_rel:.1e} across all chunk sizes.");
     Ok(())
 }
 
