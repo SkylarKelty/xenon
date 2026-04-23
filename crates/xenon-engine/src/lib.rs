@@ -14,7 +14,7 @@ use rand::rngs::StdRng;
 use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
     add_scale_bf16, attn_flash_tc_bf16, attn_naive_bf16, attn_split_kv_auto_chunk_size,
-    attn_split_kv_bf16,
+    attn_split_kv_bf16, attn_split_kv_bf16_device,
     cuda::{Device, DeviceBuffer, Stream},
     fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, nvfp4_quantize_bf16,
     per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, sample_topk_bf16, scale_bf16,
@@ -368,8 +368,11 @@ pub struct DecodeScratch {
 
 impl DecodeScratch {
     /// MIN_CHUNK in split-KV attention — keep in sync with
-    /// `attn_split_kv_auto_chunk_size` in xenon-kernels.
-    const ATTN_MIN_CHUNK: usize = 32;
+    /// `attn_split_kv_auto_chunk_size` in xenon-kernels. Also the fixed
+    /// chunk_size used by the device-resident attention path (so the grid
+    /// is static at `max_len / ATTN_MIN_CHUNK` chunks and CUDA graphs can
+    /// capture it).
+    pub const ATTN_MIN_CHUNK: usize = 32;
 
     pub fn new(shape: ModelShape, max_batch: usize, max_len: usize, stream: &Stream)
         -> anyhow::Result<Self>
@@ -857,12 +860,15 @@ pub fn forward_step_batched(
         }, scratch, slots, lt, stream)?;
     }
 
-    // Bump cur_pos AND advance each slot's KV cache. Missing the advance
-    // would leave cur_len at 0 and every subsequent append() would rewrite
-    // the same physical slot, which silently corrupts generation.
+    // Bump cur_pos AND advance each slot's KV cache. `advance_device` bumps
+    // both the host-side `cur_len` and the device-resident `cur_len_dev`
+    // via a kernel, so the captured graph picks up the new offset on each
+    // replay. Missing the advance would leave cur_len at 0 and every
+    // subsequent append would rewrite the same physical slot.
     for s in slots.iter_mut() {
         s.cur_pos += 1;
-        s.kv_cache.advance(1);
+        s.kv_cache.advance_device(1, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Final norm + lm_head + softcap for all N rows.
@@ -949,42 +955,40 @@ fn layer_forward_batched(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         rope_bf16(&mut scratch.k, &scratch.positions, n, h_kv, d, rotary_dim, rope_theta, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Append each slot's row into its own KV cache, reading directly
-        // from the batched k/v buffers via the new append_from_offset path
-        // (no per-slot scratch alloc needed).
+        // Device-resident append: the destination offset (cur_len * row_elts)
+        // is computed by the kernel reading `kv_cache.cur_len_dev`, so the
+        // captured graph picks up the live counter at replay time.
         let row_kv = h_kv * d;
         for i in 0..n {
-            slots[i].kv_cache.append_from_offset(
+            slots[i].kv_cache.append_device(
                 layer_idx,
                 &scratch.k, i * row_kv,
                 &scratch.v, i * row_kv,
-                1,
+                1, stream,
             ).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
     }
 
-    // Per-request attention (kv_len varies per slot, so we loop). The q_row,
-    // out_row, and split-KV partials buffers are all in scratch and reused
-    // for each slot i.
+    // Per-request attention (kv_len varies per slot, so we loop). The
+    // per-layer partial buffers (pmax/psum/pnum) live in scratch and are
+    // sized for the worst-case `n_chunks_fixed = max_len / 32`. The kernel
+    // reads `cur_pos` from the slot's device-resident counter at launch
+    // time and computes T_kv = cur_pos + 1 internally.
     let row_q = h_heads * d;
+    let chunk_size = DecodeScratch::ATTN_MIN_CHUNK;
+    let n_chunks_fixed = scratch.max_len.div_ceil(chunk_size);
     for i in 0..n {
-        // At this point we've appended 1 token but not advanced cur_len yet.
-        // The newly-written token lives at offset cur_len (which is
-        // slots[i].cur_pos). Attention should see kv_len = cur_pos + 1 so
-        // the new token is included.
-        let t_kv_i = slots[i].cur_pos as usize + 1;
-        let q_pos_i = slots[i].cur_pos;
         scratch.q_row.copy_region_from_device(0, &scratch.q, i * row_q, row_q)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Per-slot t_q=1; always split-KV territory (h_heads × 1 < ATTN_SATURATION_BLOCKS).
-        let chunk_size = attn_split_kv_auto_chunk_size(1, t_kv_i, h_heads, DEVICE_SM_COUNT);
-        attn_split_kv_bf16(
+        attn_split_kv_bf16_device(
             &mut scratch.out_row, &mut scratch.pmax, &mut scratch.psum, &mut scratch.pnum,
             &scratch.q_row,
             slots[i].kv_cache.k_buf(layer_idx),
             slots[i].kv_cache.v_buf(layer_idx),
-            1, t_kv_i, h_heads, h_kv, d, 1.0, q_pos_i, window,
-            chunk_size, Some(stream),
+            1,
+            &slots[i].kv_cache.cur_len_dev,
+            h_heads, h_kv, d, 1.0, window,
+            chunk_size, n_chunks_fixed, Some(stream),
         ).map_err(|e| anyhow::anyhow!("{e}"))?;
         scratch.attn_out.copy_slice_from_device(i * row_q, &scratch.out_row)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1321,9 +1325,10 @@ impl Engine {
     }
 
     /// Reset KV cache + position tracking for a new request.
-    pub fn reset(&mut self) {
-        self.kv.reset();
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        self.kv.reset().map_err(|e| anyhow::anyhow!("{e}"))?;
         self.cur_pos = 0;
+        Ok(())
     }
 
     pub fn tokenize(&self, text: &str, add_specials: bool) -> anyhow::Result<Vec<u32>> {
@@ -1356,7 +1361,7 @@ impl Engine {
             "prompt ({}) + max_new ({}) exceeds max_len ({})",
             prompt_ids.len(), max_new, self.max_len);
 
-        self.reset();
+        self.reset()?;
 
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&x| x as i32).collect();
         let t_prefill = Instant::now();
@@ -1447,6 +1452,12 @@ impl Engine {
                                        &mut self.lt, &self.stream, &self.stream_lm)?;
             results[i].prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
             slots[i].cur_pos += requests[i].prompt_ids.len() as i32;
+            // Prefill ran through the host-only kv.advance path. Sync the
+            // device counter up to cur_len before the batched decode starts
+            // using kv_cache.cur_len_dev as the offset source for appends
+            // and the cur_pos source for device-resident attention.
+            slots[i].kv_cache.sync_device_counter()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let next = self.sampler.sample_host(
                 &logits, &requests[i].sampler, 0, &self.stream)?;
             results[i].generated.push(next);

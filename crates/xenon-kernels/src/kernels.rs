@@ -208,6 +208,39 @@ unsafe extern "C" {
         greedy: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_kv_append_bf16(
+        kv_buf: *mut c_void,
+        src: *const c_void,
+        src_offset: i32,
+        cur_len_ptr: *const c_void,
+        row_elts: i32,
+        n_tokens: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn xk_inc_i32(
+        counter_ptr: *mut c_void,
+        delta: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn xk_attn_split_kv_bf16_device(
+        out: *mut c_void,
+        partial_max: *mut c_void,
+        partial_sum: *mut c_void,
+        partial_num: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        t_q: i32,
+        cur_pos_ptr: *const c_void,
+        h: i32,
+        h_kv: i32,
+        d: i32,
+        scale: f32,
+        window: i32,
+        chunk_size: i32,
+        n_chunks_fixed: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Runs the hello kernel. Proves the Rust -> nvcc -> CUDA runtime link works.
@@ -1025,6 +1058,120 @@ pub fn test_mma_bf16(
             d.as_device_ptr(),
             a.as_device_ptr(),
             b.as_device_ptr(),
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Copy `n_tokens * row_elts` bf16 elements from `src[src_offset..]` into
+/// `kv_buf[cur_len * row_elts..]`, where `cur_len` is read from the device-
+/// resident `cur_len_ptr` at kernel execution time (not at launch time).
+///
+/// This is the graph-capturable counterpart to `KvCache::append_from_offset`:
+/// the captured graph node launches with fixed args, and the actual write
+/// offset is fetched fresh at replay time via the device pointer. Combined
+/// with `inc_i32_device` for advancing the counter, this lets the entire
+/// decode loop run under a single captured graph.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_append_bf16(
+    kv_buf: &mut DeviceBuffer<bf16>,
+    src: &DeviceBuffer<bf16>,
+    src_offset: usize,
+    cur_len_ptr: &DeviceBuffer<i32>,
+    row_elts: usize,
+    n_tokens: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert!(cur_len_ptr.len() >= 1, "kv_append: cur_len_ptr length");
+    assert!(src.len() >= src_offset + n_tokens * row_elts, "kv_append: src too short");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_kv_append_bf16(
+            kv_buf.as_device_ptr(),
+            src.as_device_ptr(),
+            src_offset as i32,
+            cur_len_ptr.as_device_ptr(),
+            row_elts as i32,
+            n_tokens as i32,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// In-place `*counter += delta` on a device-resident i32. Runs as a 1×1
+/// kernel so the operation is graph-captureable. Used to advance
+/// `KvCache::cur_len_dev` between decode steps.
+pub fn inc_i32_device(
+    counter: &mut DeviceBuffer<i32>,
+    delta: i32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert!(counter.len() >= 1);
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe { xk_inc_i32(counter.as_device_ptr(), delta, stream_ptr) };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Split-KV attention variant where `cur_pos` is read from a device-resident
+/// `[1] i32` buffer and the grid size is fixed at capture time via
+/// `n_chunks_fixed`. Internally the kernel sets `q_pos_base = cur_pos` and
+/// `T_kv = cur_pos + T_q` (post-append total valid K/V length). Chunks
+/// whose start lies past the live T_kv write all scores as -FLT_MAX and
+/// drop out of the merge via the existing `chunk_sum == 0` check.
+///
+/// Caller must:
+/// - Size the partial buffers for `T_q * H * n_chunks_fixed` (max/sum) and
+///   `T_q * H * n_chunks_fixed * D` (num).
+/// - Use a `chunk_size` that divides the graph's implied max T_kv.
+///   Typical: `chunk_size = 32`, `n_chunks_fixed = max_len / 32`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_split_kv_bf16_device(
+    out: &mut DeviceBuffer<bf16>,
+    partial_max: &mut DeviceBuffer<f32>,
+    partial_sum: &mut DeviceBuffer<f32>,
+    partial_num: &mut DeviceBuffer<f32>,
+    q: &DeviceBuffer<bf16>,
+    k: &DeviceBuffer<bf16>,
+    v: &DeviceBuffer<bf16>,
+    t_q: usize,
+    cur_pos_ptr: &DeviceBuffer<i32>,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    scale: f32,
+    window: i32,
+    chunk_size: usize,
+    n_chunks_fixed: usize,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert!(q.len() >= t_q * h * d, "attn_split_kv_device: q length");
+    assert!(out.len() >= t_q * h * d, "attn_split_kv_device: out length");
+    assert!(h % h_kv == 0, "attn_split_kv_device: h divisible by h_kv");
+    assert!(chunk_size > 0 && n_chunks_fixed > 0);
+    assert!(cur_pos_ptr.len() >= 1);
+    let partials = t_q * h * n_chunks_fixed;
+    assert!(partial_max.len() >= partials, "attn_split_kv_device: partial_max length");
+    assert!(partial_sum.len() >= partials, "attn_split_kv_device: partial_sum length");
+    assert!(partial_num.len() >= partials * d, "attn_split_kv_device: partial_num length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_attn_split_kv_bf16_device(
+            out.as_device_ptr(),
+            partial_max.as_device_ptr(),
+            partial_sum.as_device_ptr(),
+            partial_num.as_device_ptr(),
+            q.as_device_ptr(),
+            k.as_device_ptr(),
+            v.as_device_ptr(),
+            t_q as i32,
+            cur_pos_ptr.as_device_ptr(),
+            h as i32, h_kv as i32, d as i32,
+            scale,
+            window,
+            chunk_size as i32,
+            n_chunks_fixed as i32,
             stream_ptr,
         )
     };

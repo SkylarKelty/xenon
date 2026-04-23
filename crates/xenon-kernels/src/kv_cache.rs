@@ -11,7 +11,8 @@
 
 use half::bf16;
 
-use crate::cuda::{CudaError, DeviceBuffer};
+use crate::cuda::{CudaError, DeviceBuffer, Stream};
+use crate::kernels::{inc_i32_device, kv_append_bf16};
 
 /// Dimensions of one physical KV slot.
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +37,11 @@ pub struct KvCache {
     pub slot_specs: Vec<SlotSpec>,
     pub max_len: usize,
     pub cur_len: usize,
+    /// Device-resident mirror of `cur_len`. Kernels that write the KV cache
+    /// or read the cache length (split-KV attention device variant) read
+    /// their offset from this pointer so CUDA-graph replays pick up the
+    /// live value instead of the capture-time baked-in one.
+    pub cur_len_dev: DeviceBuffer<i32>,
 }
 
 impl KvCache {
@@ -55,7 +61,9 @@ impl KvCache {
             k.push(DeviceBuffer::<bf16>::new(spec.elements(max_len))?);
             v.push(DeviceBuffer::<bf16>::new(spec.elements(max_len))?);
         }
-        Ok(Self { k, v, slot_for_layer, slot_specs, max_len, cur_len: 0 })
+        let mut cur_len_dev = DeviceBuffer::<i32>::new(1)?;
+        cur_len_dev.copy_from_host(&[0i32])?;
+        Ok(Self { k, v, slot_for_layer, slot_specs, max_len, cur_len: 0, cur_len_dev })
     }
 
     pub fn num_layers(&self) -> usize {
@@ -143,13 +151,77 @@ impl KvCache {
 
     /// Mark that `n_tokens` positions have been consumed across all layers.
     /// Caller invokes this exactly once after processing a batch of tokens.
+    ///
+    /// This variant only updates the host counter. Use `advance_device` for
+    /// graph-captured paths — that one issues a kernel that bumps the
+    /// device-resident counter inside the graph, so replays advance
+    /// automatically. If the same cache will later be used via the device-
+    /// resident path (e.g. prefill-then-decode flow), call
+    /// `sync_device_counter` to copy the host cur_len into `cur_len_dev`
+    /// before the first device-path call.
     pub fn advance(&mut self, n_tokens: usize) {
         assert!(self.cur_len + n_tokens <= self.max_len);
         self.cur_len += n_tokens;
     }
 
-    pub fn reset(&mut self) {
+    /// Copy the host `cur_len` into the device-resident `cur_len_dev`.
+    /// Required once between any host-only `advance()` calls (e.g. serial
+    /// prefill via `forward_step`) and the first device-resident append /
+    /// attention call (batched decode via `forward_step_batched`).
+    pub fn sync_device_counter(&mut self) -> Result<(), CudaError> {
+        self.cur_len_dev.copy_from_host(&[self.cur_len as i32])
+    }
+
+    /// Kernel-based append: reads the destination offset from the device-
+    /// resident `cur_len_dev` counter, so the captured graph picks up the
+    /// live value at replay time. Used by the decode path that feeds
+    /// `xk_attn_split_kv_bf16_device`.
+    ///
+    /// Does NOT advance the counter — call `advance_device` after all layers
+    /// have appended (or after the whole decode step) to bump both host and
+    /// device counters.
+    pub fn append_device(
+        &mut self,
+        layer: usize,
+        new_k: &DeviceBuffer<bf16>,
+        k_src_offset: usize,
+        new_v: &DeviceBuffer<bf16>,
+        v_src_offset: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<(), CudaError> {
+        let spec = self.slot_spec(layer);
+        let row_elts = spec.h_kv * spec.head_dim;
+        let n_elts = n_tokens * row_elts;
+        assert!(new_k.len() >= k_src_offset + n_elts, "append_device: new_k too short");
+        assert!(new_v.len() >= v_src_offset + n_elts, "append_device: new_v too short");
+        let slot = self.slot_for(layer);
+        kv_append_bf16(
+            &mut self.k[slot], new_k, k_src_offset,
+            &self.cur_len_dev, row_elts, n_tokens, Some(stream),
+        )?;
+        kv_append_bf16(
+            &mut self.v[slot], new_v, v_src_offset,
+            &self.cur_len_dev, row_elts, n_tokens, Some(stream),
+        )?;
+        Ok(())
+    }
+
+    /// Device-resident counter bump. Issues a 1×1 kernel that increments
+    /// `cur_len_dev` by `n_tokens` and also bumps the host mirror so
+    /// non-captured callers (slot length queries, kv_len lookups) stay in
+    /// sync.
+    pub fn advance_device(&mut self, n_tokens: usize, stream: &Stream) -> Result<(), CudaError> {
+        assert!(self.cur_len + n_tokens <= self.max_len);
+        inc_i32_device(&mut self.cur_len_dev, n_tokens as i32, Some(stream))?;
+        self.cur_len += n_tokens;
+        Ok(())
+    }
+
+    /// Reset both host and device counters to zero (new request).
+    pub fn reset(&mut self) -> Result<(), CudaError> {
         self.cur_len = 0;
+        self.cur_len_dev.copy_from_host(&[0i32])
     }
 
     /// Number of valid positions currently held in the cache.
