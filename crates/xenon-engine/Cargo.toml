@@ -12,5 +12,6 @@ thiserror.workspace = true
 tracing.workspace = true
 half.workspace = true
 bytemuck.workspace = true
+rand.workspace = true
 xenon-core = { path = "../xenon-core" }
 xenon-kernels = { path = "../xenon-kernels" }

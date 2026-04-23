@@ -189,9 +189,10 @@ during serving; phase 4 CUDA Graph capture subsumes this.
       Apply `sqrt(hidden_size) ≈ 50.6` for `embed_tokens` and
       `sqrt(hidden_size_per_layer_input) = 16` for `embed_tokens_per_layer`
       (matches `Gemma3TextScaledWordEmbedding`).
-- [ ] `layer_scalar`: per-layer `[1]`-bf16 multiplier at the very end of
-      each decoder layer. Deferred to Phase 3 full-layer forward (no
-      existing code path composes the full layer).
+- [x] `layer_scalar`: per-layer `[1]`-bf16 multiplier at the very end of
+      each decoder layer. `scale_bf16` tail multiply wired into both
+      `xenon-engine::layer_forward` (prefill + batched) and the
+      `xenon-cli` mirror.
 
 ### Phase 3 — full forward pass [x]
 - [x] 42-layer chain: embed → (norm → attn → norm → mlp + PLE inject) × 42 →
@@ -240,8 +241,19 @@ during serving; phase 4 CUDA Graph capture subsumes this.
 - [x] `DeviceBuffer::new_async` via `cudaMallocAsync` on the default
       stream-ordered pool. Transient scratch hits a cached block after
       warmup. Biggest single decode win (~60%).
-- [ ] Sampling: top-K, top-P, temperature (one kernel). Greedy is host-
-      side argmax today. Add when we care about non-greedy.
+- [x] Sampling: top-K, top-P, temperature. Device-side top-K kernel
+      (`xk_sample_topk_bf16` in `crates/xenon-kernels/src/cu/sample.cu`)
+      does temperature-scaled softmax + iterative top-K extraction in a
+      single block; host applies top-P cutoff + inverse-CDF sampling via
+      a seeded ChaCha PRNG on the compact K-sized slice. Greedy is a
+      kernel fast path and stays on host argmax by default (no
+      per-step D2H+alloc overhead in the common case). Wired through
+      `Engine::generate` / `generate_batch` and the server. CLI: `bench`
+      and `generate` gained `--temperature / --top-p / --top-k / --seed`;
+      defaults preserve the greedy baseline so historical bench numbers
+      remain comparable. `test-sample` validates vs a host reference.
+      Measured: sampler overhead indistinguishable from noise at T=0.7
+      top_p=0.9 top_k=40 (58.4 vs 58.5 tok/s decode, same prompt).
 
 **Perf progression (T_prompt=15, max_new=15, haiku prompt):**
 
@@ -301,10 +313,11 @@ that — deferred to the open-questions / future-phase bucket.
       scratch wiring to keep the code lean. Kernel wrappers now accept
       `buf.len() >= required` (was `==`) so the infrastructure is
       still compatible if we revisit.
-- [ ] **Dispatch NVFP4 GEMM for large-M paths.** With concurrent-request
-      batching (prefill M ≥ 128), the NVFP4 primitive (phase 4.1) becomes
-      viable for MLP GEMMs. Keep the bf16 fallback for small-M. (Server
-      exists; this is the follow-up perf path.)
+- [x] **Dispatch NVFP4 GEMM for large-M paths.** `QuantLinearDev::forward`
+      picks `m==1` → fused FP4 gemv, `m>=128` → native NVFP4 (cuBLASLt
+      VEC16_UE4M3), otherwise → dequant + bf16 linear. The shared-activation
+      path (`prepare_fp4_activation` + `forward_fp4_prepacked`) reuses the
+      quantized activation across co-sourced projections for +8.9% prefill.
 
 ### Phase 6 — polish + bench [~]
 - [ ] Nsight Compute profile passes, fix obvious tuning wins

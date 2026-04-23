@@ -9,14 +9,16 @@
 use std::path::Path;
 
 use half::bf16;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
     add_scale_bf16, attn_flash_tc_bf16, attn_naive_bf16, attn_split_kv_auto_chunk_size,
     attn_split_kv_bf16,
     cuda::{Device, DeviceBuffer, Stream},
     fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, nvfp4_quantize_bf16,
-    per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, scale_bf16, softcap_bf16,
-    swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
+    per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, sample_topk_bf16, scale_bf16,
+    softcap_bf16, swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
 };
 
 /// RTX PRO 2000 Blackwell Laptop SM count. Used by the attn dispatch to pick
@@ -911,6 +913,156 @@ pub fn argmax_bf16(row: &[bf16]) -> i32 {
     best_i as i32
 }
 
+// -------------------- Sampling --------------------
+
+/// Per-request sampler configuration. `temperature <= 0` is greedy (argmax).
+///
+/// `top_k = 0` means "disabled"; internally we cap at `TOP_K_LIMIT` because
+/// the kernel uses a single-block iterative pass — 1024 tokens captures
+/// >99.9% of a real softmax distribution's mass, so tail-truncation past
+/// that has no observable effect on sampling quality.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerParams {
+    pub temperature: f32,
+    pub top_k: u32,
+    pub top_p: f32,
+    pub seed: u64,
+}
+
+/// Hard cap on K for the sampling kernel (see `xk_sample_topk_bf16` in
+/// `sample.cu`). The kernel is single-block iterative; per-iteration cost
+/// is small but K passes add up, so keep this modest.
+pub const TOP_K_LIMIT: usize = 1024;
+
+impl SamplerParams {
+    pub const fn greedy() -> Self {
+        Self { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+    }
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+    /// Effective top-K after applying defaults + the kernel cap. Returns at
+    /// least 1. When only top-P is set (no explicit top-K), we pick
+    /// `TOP_K_LIMIT` so top-P has a candidate pool to filter.
+    fn effective_top_k(&self, vocab: usize) -> usize {
+        let raw = if self.top_k == 0 {
+            if self.top_p < 1.0 { TOP_K_LIMIT } else { 1 }
+        } else {
+            self.top_k as usize
+        };
+        raw.clamp(1, TOP_K_LIMIT.min(vocab))
+    }
+}
+
+impl Default for SamplerParams {
+    fn default() -> Self { Self::greedy() }
+}
+
+/// Device-side top-K sampler. Owns the reusable scratch buffers so each
+/// decode step's sample call is a single kernel launch + K×8-byte D2H.
+/// Non-greedy paths only; callers route greedy through `argmax_bf16` on the
+/// host Vec<bf16> they already have.
+pub struct Sampler {
+    vocab: usize,
+    top_k_cap: usize,
+    d_logits: DeviceBuffer<bf16>,
+    d_probs: DeviceBuffer<f32>,
+    d_ids: DeviceBuffer<u32>,
+    d_scratch: DeviceBuffer<f32>,
+    host_probs: Vec<f32>,
+    host_ids: Vec<u32>,
+}
+
+impl Sampler {
+    pub fn new(vocab: usize, stream: &Stream) -> anyhow::Result<Self> {
+        let top_k_cap = TOP_K_LIMIT.min(vocab);
+        let d_logits = DeviceBuffer::<bf16>::new_async(vocab, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let d_probs = DeviceBuffer::<f32>::new_async(top_k_cap, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let d_ids = DeviceBuffer::<u32>::new_async(top_k_cap, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let d_scratch = DeviceBuffer::<f32>::new_async(vocab, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self {
+            vocab, top_k_cap, d_logits, d_probs, d_ids, d_scratch,
+            host_probs: vec![0.0; top_k_cap],
+            host_ids: vec![0; top_k_cap],
+        })
+    }
+
+    /// Sample from a host row of `[vocab]` bf16 logits. Uploads to the
+    /// sampler's scratch device buffer, runs the kernel, copies back the
+    /// compact K-sized top-K, applies top-P + inverse-CDF on host.
+    pub fn sample_host(
+        &mut self,
+        logits: &[bf16],
+        params: &SamplerParams,
+        step: u64,
+        stream: &Stream,
+    ) -> anyhow::Result<u32> {
+        assert_eq!(logits.len(), self.vocab, "sample: logits len != vocab");
+        if params.is_greedy() {
+            return Ok(argmax_bf16(logits) as u32);
+        }
+        let k = params.effective_top_k(self.vocab).min(self.top_k_cap);
+        self.d_logits
+            .copy_from_host_bytes_async(bytemuck::cast_slice(logits), stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sample_topk_bf16(
+            &mut self.d_probs, &mut self.d_ids, &self.d_logits,
+            Some(&mut self.d_scratch), self.vocab,
+            params.temperature, k, /*greedy=*/ false, Some(stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Full D2H of the capped top-K buffer (8 KiB for K_cap=1024). Slice
+        // to the active K for the host sampler.
+        self.d_probs.copy_to_host(&mut self.host_probs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.d_ids.copy_to_host(&mut self.host_ids)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(sample_from_topk(
+            &self.host_probs[..k], &self.host_ids[..k], params.top_p,
+            params.seed, step,
+        ))
+    }
+}
+
+/// Host-side top-P filter + inverse-CDF sample over the compact top-K list
+/// returned by the kernel. `probs` must be in descending order (kernel
+/// guarantees this). Returns the chosen token id.
+pub fn sample_from_topk(
+    probs: &[f32], ids: &[u32], top_p: f32, seed: u64, step: u64,
+) -> u32 {
+    assert_eq!(probs.len(), ids.len());
+    assert!(!probs.is_empty());
+    // Top-P cutoff over the (already-descending) K list. HF convention:
+    // include the first token whose running cumulative sum crosses top_p.
+    // At least 1 token survives.
+    let mut keep = probs.len();
+    if top_p < 1.0 {
+        let mut cum = 0.0f32;
+        for (i, &p) in probs.iter().enumerate() {
+            cum += p;
+            if cum >= top_p { keep = i + 1; break; }
+        }
+        keep = keep.max(1);
+    }
+    // Renormalize the survivors.
+    let sum: f32 = probs[..keep].iter().sum();
+    if sum <= 0.0 { return ids[0]; }
+    // Deterministic PRNG per (seed, step) so identical requests replay.
+    let mix = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(step);
+    let mut rng = StdRng::seed_from_u64(mix);
+    let u: f32 = rng.gen::<f32>() * sum;
+    let mut cum = 0.0f32;
+    for i in 0..keep {
+        cum += probs[i];
+        if u < cum { return ids[i]; }
+    }
+    ids[keep - 1]
+}
+
 // -------------------- Engine (high-level API) --------------------
 
 pub struct Engine {
@@ -924,6 +1076,8 @@ pub struct Engine {
     pub lt: CublasLt,
     pub stream: Stream,
     pub stream_lm: Stream,
+    /// Reusable device-side top-K sampler (non-greedy path only).
+    pub sampler: Sampler,
     /// Absolute position of the next token to be fed. Advances as KV is filled.
     pub cur_pos: i32,
     pub max_len: usize,
@@ -948,6 +1102,7 @@ pub struct GenerateStats {
 pub struct BatchRequest {
     pub prompt_ids: Vec<u32>,
     pub max_new: usize,
+    pub sampler: SamplerParams,
 }
 
 #[derive(Default, Clone)]
@@ -1020,8 +1175,9 @@ impl Engine {
         stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let kv = build_kv_cache(&mm, &cfg, max_len)?;
+        let sampler = Sampler::new(shape.vocab, &stream)?;
 
-        Ok(Self { cfg, shape, mm, tokenizer, layers, top, kv, lt, stream, stream_lm, cur_pos: 0, max_len })
+        Ok(Self { cfg, shape, mm, tokenizer, layers, top, kv, lt, stream, stream_lm, sampler, cur_pos: 0, max_len })
     }
 
     /// Reset KV cache + position tracking for a new request.
@@ -1042,11 +1198,16 @@ impl Engine {
     /// returns `true` to continue, `false` to stop early (e.g., client
     /// disconnected). Stops automatically on any token in `stop_tokens`
     /// (after at least one step) or after `max_new`.
+    ///
+    /// `params` controls sampling: greedy (`temperature <= 0`) stays on the
+    /// host argmax fast path; otherwise the device top-K kernel runs and
+    /// top-P / CDF are applied on host.
     pub fn generate(
         &mut self,
         prompt_ids: &[u32],
         max_new: usize,
         stop_tokens: &[u32],
+        params: &SamplerParams,
         mut on_token: impl FnMut(u32) -> bool,
     ) -> anyhow::Result<GenerateStats> {
         use std::time::Instant;
@@ -1065,7 +1226,7 @@ impl Engine {
                                     &self.stream, &self.stream_lm)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
         self.cur_pos += prompt_ids.len() as i32;
-        let mut next: u32 = argmax_bf16(&logits) as u32;
+        let mut next: u32 = self.sampler.sample_host(&logits, params, 0, &self.stream)?;
 
         if !on_token(next) { return Ok(GenerateStats { prompt_len: prompt_ids.len(), generated: 1, prefill_ms, decode_ms: Vec::new() }); }
 
@@ -1078,9 +1239,9 @@ impl Engine {
                                        &self.layers, &self.top, &mut self.kv,
                                        &[next as i32], self.cur_pos, &mut self.lt,
                                        &self.stream, &self.stream_lm)?;
-            decode_ms.push(t_step.elapsed().as_secs_f64() * 1e3);
             self.cur_pos += 1;
-            next = argmax_bf16(&logits) as u32;
+            next = self.sampler.sample_host(&logits, params, 1 + step as u64, &self.stream)?;
+            decode_ms.push(t_step.elapsed().as_secs_f64() * 1e3);
             generated += 1;
             if !on_token(next) { break; }
         }
@@ -1134,7 +1295,8 @@ impl Engine {
                                        &mut self.lt, &self.stream, &self.stream_lm)?;
             results[i].prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
             slots[i].cur_pos += requests[i].prompt_ids.len() as i32;
-            let next = argmax_bf16(&logits) as u32;
+            let next = self.sampler.sample_host(
+                &logits, &requests[i].sampler, 0, &self.stream)?;
             results[i].generated.push(next);
             last_tokens[i] = next as i32;
             if !on_token(i, next) { done[i] = true; }
@@ -1170,7 +1332,9 @@ impl Engine {
 
             for i in 0..n {
                 if done[i] { continue; }
-                let next = argmax_bf16(&logits_per_req[i]) as u32;
+                let next = self.sampler.sample_host(
+                    &logits_per_req[i], &requests[i].sampler,
+                    1 + step as u64, &self.stream)?;
                 results[i].decode_ms.push(ms);
                 results[i].generated.push(next);
                 last_tokens[i] = next as i32;

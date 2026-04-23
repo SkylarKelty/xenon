@@ -16,8 +16,9 @@ use xenon_kernels::{
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16,
-    rope_bf16_reference, round_up, scale_bf16, softcap_bf16, softmax_attn_bf16,
-    softmax_attn_bf16_reference, swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
+    rope_bf16_reference, round_up, sample_topk_bf16, sample_topk_bf16_reference, scale_bf16,
+    softcap_bf16, softmax_attn_bf16, softmax_attn_bf16_reference, swizzle_blockscale_ue4m3,
+    CublasLt, KvCache, SlotSpec,
 };
 
 /// Parse a little-endian bf16 byte slice into a `Vec<bf16>`. Avoids
@@ -162,6 +163,19 @@ enum Command {
     TestGelu {
         #[arg(long, default_value_t = 4096)]
         n: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run the top-K sampling kernel against a host reference. Greedy path
+    /// is bit-exact argmax; non-greedy path matches reference top-K indices
+    /// and softmax probs within a few ULPs.
+    TestSample {
+        #[arg(long, default_value_t = 262144)]
+        vocab: usize,
+        #[arg(long, default_value_t = 50)]
+        top_k: usize,
+        #[arg(long, default_value_t = 0.8)]
+        temperature: f32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -315,10 +329,24 @@ enum Command {
         /// Optional label for the results JSON (helps diff runs).
         #[arg(long, default_value = "baseline")]
         label: String,
+        /// Sampling temperature. 0.0 (default) = greedy argmax on host,
+        /// matching the historical bench path so published numbers stay
+        /// comparable. Pass > 0 to measure sampler overhead.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Nucleus-sampling cutoff. 1.0 (default) = disabled.
+        #[arg(long, default_value_t = 1.0)]
+        top_p: f32,
+        /// Top-K cutoff. 0 (default) = disabled (or 1024 if top-p < 1).
+        #[arg(long, default_value_t = 0)]
+        top_k: u32,
+        /// PRNG seed for reproducibility of non-greedy runs.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
-    /// Generate text from a prompt: tokenize, prefill, then greedy-sample
-    /// decode until EOS or `max_new_tokens`. Loads all 42 layers' weights
-    /// once (FP4 packed, dequant per step into a transient scratch buffer).
+    /// Generate text from a prompt: tokenize, prefill, then sample decode
+    /// until EOS or `max_new_tokens`. Default is greedy (`--temperature 0`);
+    /// pass `--temperature > 0` to engage the top-K sampling kernel.
     Generate {
         model: PathBuf,
         #[arg(long)]
@@ -333,6 +361,18 @@ enum Command {
         /// model treats it as a user turn and actually responds.
         #[arg(long)]
         chat: bool,
+        /// Sampling temperature. 0.0 (default) = greedy argmax.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Nucleus-sampling cutoff. 1.0 (default) = disabled.
+        #[arg(long, default_value_t = 1.0)]
+        top_p: f32,
+        /// Top-K cutoff. 0 (default) = disabled (or 1024 if top-p < 1).
+        #[arg(long, default_value_t = 0)]
+        top_k: u32,
+        /// PRNG seed for reproducibility in non-greedy runs.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
     /// Run the FlashAttention-2 tiled kernel vs the naive kernel on random
     /// Q/K/V and verify they agree. Exercises the online-softmax path at
@@ -495,6 +535,8 @@ fn main() -> anyhow::Result<()> {
         Command::TestSwizzle { src, expected, m, k_blocks } => cmd_test_swizzle(src, expected, m, k_blocks),
         Command::TestNvfp4Roundtrip { rows, cols, seed } => cmd_test_nvfp4_roundtrip(rows, cols, seed),
         Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
+        Command::TestSample { vocab, top_k, temperature, seed } =>
+            cmd_test_sample(vocab, top_k, temperature, seed),
         Command::TestMlp { model, layer, batch, seed } => cmd_test_mlp(model, layer, batch, seed),
         Command::TestRope { tokens, heads, head_dim, rotary_dim, theta, seed } =>
             cmd_test_rope(tokens, heads, head_dim, rotary_dim.unwrap_or(head_dim), theta, seed),
@@ -524,10 +566,13 @@ fn main() -> anyhow::Result<()> {
             cmd_test_vs_hf_layer(model, hf, ids, layer),
         Command::TestVsHfTail { model, hf } => cmd_test_vs_hf_tail(model, hf),
         Command::TestVsHfFull { model, hf, ids } => cmd_test_vs_hf_full(model, hf, ids),
-        Command::Generate { model, prompt, max_new, max_len, chat } =>
-            cmd_generate(model, prompt, max_new, max_len, chat),
-        Command::Bench { model, prompt, chat, max_new, max_len, warmup, iters, label } =>
-            cmd_bench(model, prompt, chat, max_new, max_len, warmup, iters, label),
+        Command::Generate { model, prompt, max_new, max_len, chat, temperature, top_p, top_k, seed } =>
+            cmd_generate(model, prompt, max_new, max_len, chat,
+                         xenon_engine::SamplerParams { temperature, top_p, top_k, seed }),
+        Command::Bench { model, prompt, chat, max_new, max_len, warmup, iters, label,
+                         temperature, top_p, top_k, seed } =>
+            cmd_bench(model, prompt, chat, max_new, max_len, warmup, iters, label,
+                      xenon_engine::SamplerParams { temperature, top_p, top_k, seed }),
         Command::BenchBatch { model, prompt, chat, batch, max_new, max_len } =>
             cmd_bench_batch(model, prompt, chat, batch, max_new, max_len),
         Command::Upload { model, prefix, limit_bytes, verify } => cmd_upload(model, prefix, limit_bytes, verify),
@@ -976,6 +1021,81 @@ fn cmd_test_gelu(n: usize, seed: u64) -> anyhow::Result<()> {
     let tol_rel: f32 = 1e-2;
     anyhow::ensure!(global_rel <= tol_rel, "global rel diff {global_rel} exceeds tolerance {tol_rel}");
     println!("OK: within bf16 tolerance (global rel {tol_rel:.1e}).");
+    Ok(())
+}
+
+fn cmd_test_sample(vocab: usize, top_k: usize, temperature: f32, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Build a random logit row with mild magnitudes so the softmax math
+    // doesn't saturate or underflow anywhere interesting.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let logits_host: Vec<bf16> = (0..vocab)
+        .map(|_| bf16::from_f32(rng.gen_range(-4.0..4.0))).collect();
+
+    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new(vocab)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_logits.copy_from_host(&logits_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_probs: DeviceBuffer<f32> = DeviceBuffer::new(top_k)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ids: DeviceBuffer<u32> = DeviceBuffer::new(top_k)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_scratch: DeviceBuffer<f32> = DeviceBuffer::new(vocab)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("=== xenon-cli test-sample ===");
+    println!("vocab                   {vocab}");
+    println!("top_k                   {top_k}");
+    println!("temperature             {temperature}");
+
+    // --- Greedy path: kernel returns argmax, bit-identical to host. ---
+    let mut d_probs_g: DeviceBuffer<f32> = DeviceBuffer::new(1)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_ids_g: DeviceBuffer<u32> = DeviceBuffer::new(1)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    sample_topk_bf16(&mut d_probs_g, &mut d_ids_g, &d_logits, None,
+                      vocab, 1.0, 1, true, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got_g = d_ids_g.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (_ref_p_g, ref_id_g) = sample_topk_bf16_reference(&logits_host, 1.0, 1, true);
+    anyhow::ensure!(got_g[0] == ref_id_g[0],
+        "greedy argmax mismatch: got {}, want {}", got_g[0], ref_id_g[0]);
+    println!("greedy argmax           {} (matches host)", got_g[0]);
+
+    // --- Full path: top-K with temperature. Verify indices and probs match. ---
+    sample_topk_bf16(&mut d_probs, &mut d_ids, &d_logits, Some(&mut d_scratch),
+                      vocab, temperature, top_k, false, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got_p = d_probs.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got_i = d_ids.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (ref_p, ref_i) = sample_topk_bf16_reference(&logits_host, temperature, top_k, false);
+
+    let mut mismatches = 0usize;
+    let mut max_prob_abs_diff = 0.0f32;
+    for k in 0..top_k {
+        if got_i[k] != ref_i[k] { mismatches += 1; }
+        let diff = (got_p[k] - ref_p[k]).abs();
+        if diff > max_prob_abs_diff { max_prob_abs_diff = diff; }
+    }
+    let top5_g: Vec<_> = got_i.iter().take(5).collect();
+    let top5_r: Vec<_> = ref_i.iter().take(5).collect();
+    println!("top-5 ids (kernel)      {:?}", top5_g);
+    println!("top-5 ids (reference)   {:?}", top5_r);
+    println!("top-5 probs (kernel)    {:?}", &got_p[..5.min(top_k)]);
+    println!("id mismatches (of K)    {} / {}", mismatches, top_k);
+    println!("max prob |abs diff|     {:.3e}", max_prob_abs_diff);
+    let mass: f32 = got_p.iter().sum();
+    println!("sum of top-K probs      {:.4} (of 1.0; tail is beyond K)", mass);
+
+    anyhow::ensure!(mismatches == 0,
+        "kernel top-K ids differ from host reference in {} slots", mismatches);
+    // bf16 logits have ~3 bits of tail noise per prob; 1e-3 is comfortable.
+    anyhow::ensure!(max_prob_abs_diff < 1e-3,
+        "kernel top-K probs diverge by {:.3e}, > 1e-3", max_prob_abs_diff);
+    println!("OK: kernel top-K matches host reference.");
     Ok(())
 }
 
@@ -2775,6 +2895,7 @@ fn cmd_bench_batch(
         .map(|_| xenon_engine::BatchRequest {
             prompt_ids: prompt_ids.clone(),
             max_new,
+            sampler: xenon_engine::SamplerParams::greedy(),
         }).collect();
 
     let t0 = Instant::now();
@@ -2810,7 +2931,10 @@ fn cmd_bench_batch(
     Ok(())
 }
 
-fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usize, chat: bool) -> anyhow::Result<()> {
+fn cmd_generate(
+    model_dir: PathBuf, prompt: String, max_new: usize, max_len: usize, chat: bool,
+    sampler: xenon_engine::SamplerParams,
+) -> anyhow::Result<()> {
     use std::io::Write;
     let t_load = Instant::now();
     let mut engine = xenon_engine::Engine::load(&model_dir, max_len)?;
@@ -2825,6 +2949,12 @@ fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usi
         mem_free as f64 / 1073741824.0, mem_total as f64 / 1073741824.0,
         prompt_ids.len()
     );
+    if sampler.is_greedy() {
+        eprintln!("[xenon] sampler             greedy");
+    } else {
+        eprintln!("[xenon] sampler             T={} top_p={} top_k={} seed={}",
+                  sampler.temperature, sampler.top_p, sampler.top_k, sampler.seed);
+    }
 
     // Stream tokens as they're generated. Decode the accumulated ids after
     // each step and emit the diff so subword pieces assemble into proper UTF-8.
@@ -2834,7 +2964,7 @@ fn cmd_generate(model_dir: PathBuf, prompt: String, max_new: usize, max_len: usi
     let mut prev_decoded = String::new();
     let tok = engine.tokenizer.clone();
 
-    let stats = engine.generate(&prompt_ids, max_new, xenon_engine::GEMMA4_EOS, |id| {
+    let stats = engine.generate(&prompt_ids, max_new, xenon_engine::GEMMA4_EOS, &sampler, |id| {
         if xenon_engine::GEMMA4_EOS.contains(&id) && !generated.is_empty() { return true; }
         generated.push(id);
         if let Ok(s) = tok.decode(&generated, /*skip_special*/ true) {
@@ -2869,6 +2999,7 @@ fn cmd_bench(
     warmup: usize,
     iters: usize,
     label: String,
+    sampler: xenon_engine::SamplerParams,
 ) -> anyhow::Result<()> {
     Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
     let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2904,6 +3035,12 @@ fn cmd_bench(
     println!("prompt_len          {}", prompt_ids.len());
     println!("max_new             {}", max_new);
     println!("warmup / iters      {} / {}", warmup, iters);
+    if sampler.is_greedy() {
+        println!("sampler             greedy");
+    } else {
+        println!("sampler             T={} top_p={} top_k={} seed={}",
+                 sampler.temperature, sampler.top_p, sampler.top_k, sampler.seed);
+    }
 
     let t_load = Instant::now();
     let mut layers: Vec<LayerWeights> = Vec::with_capacity(shape.n_layers);
@@ -2949,10 +3086,18 @@ fn cmd_bench(
     let eos: Vec<i32> = vec![1, 106];
 
     // One run = fresh KvCache + prefill + up-to-max_new decode steps, with
-    // per-step timings captured.
+    // per-step timings captured. For non-greedy runs we allocate a Sampler
+    // that owns reusable device-side scratch; greedy stays on the host
+    // argmax path (no regression vs historical bench numbers).
     let stream_lm = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut sampler_rt: Option<xenon_engine::Sampler> = if sampler.is_greedy() {
+        None
+    } else {
+        Some(xenon_engine::Sampler::new(shape.vocab, &stream)?)
+    };
     let run_once = |layers: &[LayerWeights], top: &TopLevelWeights,
-                    lt: &mut CublasLt, stream: &Stream, stream_lm: &Stream|
+                    lt: &mut CublasLt, stream: &Stream, stream_lm: &Stream,
+                    sampler_rt: &mut Option<xenon_engine::Sampler>|
         -> anyhow::Result<(f64, Vec<f64>, usize)>
     {
         let mut kv = build_kv_cache(&mm, &cfg, max_len)?;
@@ -2960,7 +3105,10 @@ fn cmd_bench(
         let logits0 = forward_step(&mm, &cfg, shape, layers, top, &mut kv,
                                     &prompt_ids, 0, lt, stream, stream_lm)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
-        let mut next = argmax_bf16(&logits0);
+        let mut next = match sampler_rt.as_mut() {
+            Some(s) => s.sample_host(&logits0, &sampler, 0, stream)? as i32,
+            None => argmax_bf16(&logits0),
+        };
         let mut decode_mss: Vec<f64> = Vec::with_capacity(max_new);
         let mut steps = 0usize;
         for step in 0..max_new {
@@ -2969,8 +3117,11 @@ fn cmd_bench(
             let t_step = Instant::now();
             let logits = forward_step(&mm, &cfg, shape, layers, top, &mut kv,
                                        &[next], q_pos, lt, stream, stream_lm)?;
+            next = match sampler_rt.as_mut() {
+                Some(s) => s.sample_host(&logits, &sampler, 1 + step as u64, stream)? as i32,
+                None => argmax_bf16(&logits),
+            };
             decode_mss.push(t_step.elapsed().as_secs_f64() * 1e3);
-            next = argmax_bf16(&logits);
             steps += 1;
         }
         Ok((prefill_ms, decode_mss, steps))
@@ -2978,7 +3129,7 @@ fn cmd_bench(
 
     // Warmup.
     for i in 0..warmup {
-        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream, &stream_lm)?;
+        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream, &stream_lm, &mut sampler_rt)?;
         println!("warmup {:>2}          prefill {:>6.1} ms   decode {} steps   avg {:>6.1} ms",
                  i, pfm, steps,
                  if !dec.is_empty() { dec.iter().sum::<f64>() / dec.len() as f64 } else { 0.0 });
@@ -2989,7 +3140,7 @@ fn cmd_bench(
     let mut all_decode_ms: Vec<f64> = Vec::new();
     let mut all_steps: Vec<usize> = Vec::new();
     for i in 0..iters {
-        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream, &stream_lm)?;
+        let (pfm, dec, steps) = run_once(&layers, &top, &mut lt, &stream, &stream_lm, &mut sampler_rt)?;
         println!("iter   {:>2}          prefill {:>6.1} ms   decode {} steps   avg {:>6.1} ms",
                  i, pfm, steps,
                  if !dec.is_empty() { dec.iter().sum::<f64>() / dec.len() as f64 } else { 0.0 });

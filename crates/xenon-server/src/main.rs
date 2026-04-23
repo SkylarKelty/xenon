@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use xenon_core::Tokenizer;
-use xenon_engine::{BatchRequest, Engine, GEMMA4_EOS};
+use xenon_engine::{BatchRequest, Engine, SamplerParams, GEMMA4_EOS};
 
 #[derive(Parser, Debug)]
 #[command(name = "xenon-server", about = "OpenAI-compatible inference server for xenon")]
@@ -64,6 +64,7 @@ enum ResponseChunk {
 struct PendingRequest {
     prompt_ids: Vec<u32>,
     max_new: usize,
+    sampler: SamplerParams,
     /// Batcher-side sender. Closing (drop) signals the batcher the client
     /// went away.
     tx: mpsc::Sender<ResponseChunk>,
@@ -115,7 +116,11 @@ fn run_batch(engine: &mut Engine, batch: Vec<PendingRequest>) {
     let n = batch.len();
     let (requests, txs): (Vec<BatchRequest>, Vec<mpsc::Sender<ResponseChunk>>) = batch
         .into_iter()
-        .map(|p| (BatchRequest { prompt_ids: p.prompt_ids, max_new: p.max_new }, p.tx))
+        .map(|p| (BatchRequest {
+            prompt_ids: p.prompt_ids,
+            max_new: p.max_new,
+            sampler: p.sampler,
+        }, p.tx))
         .unzip();
     tracing::debug!(batch_size = n, "dispatching batch");
 
@@ -195,6 +200,11 @@ struct ChatRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// OpenAI doesn't expose top_k; accepted as an extension.
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -252,6 +262,25 @@ fn render_messages(messages: &[ChatMessage]) -> String {
     out
 }
 
+/// Build `SamplerParams` from optional OpenAI-compatible sampling fields.
+/// `temperature=0` (or unset) keeps the server on the host-argmax fast path.
+/// `seed` defaults to wall-clock nanos so unseeded requests aren't
+/// degenerately identical; set explicitly for reproducibility.
+fn sampler_from_fields(
+    temperature: Option<f32>, top_p: Option<f32>, top_k: Option<u32>,
+    seed: Option<u64>,
+) -> SamplerParams {
+    SamplerParams {
+        temperature: temperature.unwrap_or(0.0),
+        top_p: top_p.unwrap_or(1.0),
+        top_k: top_k.unwrap_or(0),
+        seed: seed.unwrap_or_else(|| {
+            SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64).unwrap_or(0)
+        }),
+    }
+}
+
 /// Common plumbing: enqueue + collect responses.
 ///
 /// Returns the handler-side `mpsc::Receiver<ResponseChunk>` which yields
@@ -260,6 +289,7 @@ async fn enqueue(
     st: &AppState,
     prompt_ids: Vec<u32>,
     max_new: usize,
+    sampler: SamplerParams,
 ) -> Result<mpsc::Receiver<ResponseChunk>, (StatusCode, String)> {
     if prompt_ids.len() + max_new > st.max_len {
         return Err((StatusCode::BAD_REQUEST,
@@ -267,7 +297,7 @@ async fn enqueue(
                     prompt_ids.len(), max_new, st.max_len)));
     }
     let (tx, rx) = mpsc::channel::<ResponseChunk>(128);
-    st.tx.send(PendingRequest { prompt_ids, max_new, tx }).await
+    st.tx.send(PendingRequest { prompt_ids, max_new, sampler, tx }).await
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "batcher channel closed".into()))?;
     Ok(rx)
 }
@@ -279,7 +309,7 @@ async fn post_chat_completions(
     if req.messages.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "messages is required".into()));
     }
-    let _ = (req.temperature, req.top_p);
+    let sampler = sampler_from_fields(req.temperature, req.top_p, req.top_k, req.seed);
     let prompt = render_messages(&req.messages);
     let prompt_ids = st.tokenizer.encode(&prompt, /*add_specials*/ true)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokenize: {e}")))?;
@@ -287,7 +317,7 @@ async fn post_chat_completions(
     let max_new = req.max_tokens.unwrap_or(256);
     let want_stream = req.stream.unwrap_or(false);
 
-    let rx = enqueue(&st, prompt_ids, max_new).await?;
+    let rx = enqueue(&st, prompt_ids, max_new, sampler).await?;
     if want_stream {
         Ok(chat_stream_from_rx(st.model_id, rx).into_response())
     } else {
@@ -406,6 +436,10 @@ struct CompletionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -433,14 +467,14 @@ async fn post_completions(
     State(st): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let _ = (req.temperature, req.top_p);
+    let sampler = sampler_from_fields(req.temperature, req.top_p, req.top_k, req.seed);
     let max_new = req.max_tokens.unwrap_or(128);
     let want_stream = req.stream.unwrap_or(false);
 
     let prompt_ids = st.tokenizer.encode(&req.prompt, true)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokenize: {e}")))?;
     let prompt_len = prompt_ids.len();
-    let rx = enqueue(&st, prompt_ids, max_new).await?;
+    let rx = enqueue(&st, prompt_ids, max_new, sampler).await?;
     if want_stream {
         Ok(completion_stream_from_rx(st.model_id, rx).into_response())
     } else {

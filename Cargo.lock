@@ -1361,6 +1361,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "half",
+ "rand",
  "thiserror",
  "tracing",
  "xenon-core",

@@ -197,6 +197,17 @@ unsafe extern "C" {
         window: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_sample_topk_bf16(
+        out_probs: *mut c_void,
+        out_ids: *mut c_void,
+        logits: *const c_void,
+        scratch: *mut c_void,
+        vocab: i32,
+        temperature: f32,
+        top_k: i32,
+        greedy: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Runs the hello kernel. Proves the Rust -> nvcc -> CUDA runtime link works.
@@ -1018,6 +1029,100 @@ pub fn test_mma_bf16(
         )
     };
     if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Temperature-scaled softmax + top-K extraction over a bf16 logit row.
+///
+/// Writes the K highest-probability `(prob, token_id)` pairs in descending-
+/// prob order into `out_probs` (f32) and `out_ids` (u32). `out_probs[k]` is
+/// the softmax probability of `out_ids[k]` normalized over the full vocab —
+/// so the caller can apply top-P and renormalize on the compact K slice.
+///
+/// `greedy=true` is a dedicated fast path: argmax over bf16 logits, writes
+/// just `out_probs[0] = 1.0` + `out_ids[0] = argmax`. No scratch needed;
+/// equivalent to (and bit-identical with) the host `argmax_bf16`. Use this
+/// when temperature <= 0 / default sampling.
+///
+/// Non-greedy requires `temperature > 0` and a `[vocab]` f32 scratch buffer
+/// that the kernel mutates (scaled logits + iterative masking).
+#[allow(clippy::too_many_arguments)]
+pub fn sample_topk_bf16(
+    out_probs: &mut DeviceBuffer<f32>,
+    out_ids: &mut DeviceBuffer<u32>,
+    logits: &DeviceBuffer<bf16>,
+    scratch: Option<&mut DeviceBuffer<f32>>,
+    vocab: usize,
+    temperature: f32,
+    top_k: usize,
+    greedy: bool,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert!(top_k >= 1, "sample_topk: top_k must be >= 1");
+    assert!(out_probs.len() >= top_k, "sample_topk: out_probs length");
+    assert!(out_ids.len() >= top_k, "sample_topk: out_ids length");
+    assert!(logits.len() >= vocab, "sample_topk: logits length");
+    if !greedy {
+        assert!(temperature > 0.0, "sample_topk: temperature must be > 0 (non-greedy)");
+        let s = scratch.as_ref().expect("sample_topk: scratch required when !greedy");
+        assert!(s.len() >= vocab, "sample_topk: scratch length");
+    }
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let scratch_ptr = scratch
+        .map(|s| s.as_device_ptr())
+        .unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_sample_topk_bf16(
+            out_probs.as_device_ptr(),
+            out_ids.as_device_ptr(),
+            logits.as_device_ptr(),
+            scratch_ptr,
+            vocab as i32,
+            temperature,
+            top_k as i32,
+            if greedy { 1 } else { 0 },
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Host reference for `sample_topk_bf16`'s output: returns the top-K
+/// `(prob, token_id)` pairs in descending-prob order, with probs being the
+/// full-vocab softmax values. Used for kernel validation.
+pub fn sample_topk_bf16_reference(
+    logits: &[bf16],
+    temperature: f32,
+    top_k: usize,
+    greedy: bool,
+) -> (Vec<f32>, Vec<u32>) {
+    if greedy {
+        let mut best_i = 0usize;
+        let mut best_v = logits[0].to_f32();
+        for (i, v) in logits.iter().enumerate().skip(1) {
+            let f = v.to_f32();
+            if f > best_v { best_v = f; best_i = i; }
+        }
+        return (vec![1.0], vec![best_i as u32]);
+    }
+    let inv_t = 1.0 / temperature;
+    let scaled: Vec<f32> = logits.iter().map(|v| v.to_f32() * inv_t).collect();
+    let mut maxv = f32::NEG_INFINITY;
+    for &s in &scaled { if s > maxv { maxv = s; } }
+    let mut probs: Vec<f32> = scaled.iter().map(|s| (s - maxv).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    let inv_sum = 1.0 / sum;
+    for p in probs.iter_mut() { *p *= inv_sum; }
+    let mut idx: Vec<usize> = (0..probs.len()).collect();
+    // Sort desc by prob, tie-break by index asc (matches kernel).
+    idx.sort_by(|&a, &b| {
+        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let top: Vec<(f32, u32)> = idx.into_iter().take(top_k)
+        .map(|i| (probs[i], i as u32)).collect();
+    let out_probs = top.iter().map(|&(p, _)| p).collect();
+    let out_ids = top.iter().map(|&(_, i)| i).collect();
+    (out_probs, out_ids)
 }
 
 /// Host reference for naive attention. Same math as the kernel.
