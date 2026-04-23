@@ -36,6 +36,35 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+// ---- cp.async helpers (sm_80+) -----------------------------------------
+// Async global → shared copy; lets the next tile's K/V start streaming
+// while this tile is still being compute-worked. cg = cache-global
+// (skip L1) which is what we want for our read-once K/V streaming loads.
+// src_size_bytes < 16 triggers the zero-fill behavior of cp.async, so an
+// OOB kv_row can pass src_size=0 to zero-pad that chunk cleanly.
+__device__ __forceinline__ void cp_async_16(
+    void* smem_dst, const void* gmem_src, uint32_t src_size_bytes)
+{
+    uint32_t smem_int_ptr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+        :: "r"(smem_int_ptr), "l"(gmem_src), "r"(src_size_bytes));
+}
+
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Wait until at most N cp.async groups are still pending for this thread.
+// Template so nvcc can emit the immediate operand; wait_group requires one.
+template<int N>
+__device__ __forceinline__ void cp_async_wait_group()
+{
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+
 // Raw mma.m16n8k16 bf16 → fp32 wrapper. Inputs are register-packed; caller
 // does the fragment gather. Kept simple — no fancy layout-aware wrapper yet.
 __device__ __forceinline__ void mma_m16n8k16_bf16_bf16_f32(
@@ -146,14 +175,19 @@ __device__ __forceinline__ float warp_group4_sum(float v)
 // Main kernel. BR=BC=16, one warp (32 threads) per block, grid = (ceil(T_q/BR), H).
 //
 // Smem layout (all figures for BR=BC=16):
-//     q_tile   bf16[BR, D]           BR*D*2  bytes
-//     kv_tile  bf16[BC, D]           BC*D*2  bytes    (K then V, reused)
-//     o_acc    fp32[BR, D]           BR*D*4  bytes
-//     m_row    fp32[BR]              BR*4    bytes
-//     l_row    fp32[BR]              BR*4    bytes
-// Total at D=256: 8192 + 8192 + 16384 + 64 + 64 = 32 896 bytes (fits 48 KiB default).
-// Total at D=512: 16384 + 16384 + 32768 + 64 + 64 = 65 664 bytes (needs
+//     sQ   bf16[BR, D]           BR*D*2  bytes
+//     sK   bf16[BC, D]           BC*D*2  bytes    (held across QK mma)
+//     sV   bf16[BC, D]           BC*D*2  bytes    (held across PV mma)
+//     sO   fp32[BR, D]           BR*D*4  bytes
+//     sM   fp32[BR]              BR*4    bytes
+//     sL   fp32[BR]              BR*4    bytes
+// Total at D=256: 8192 + 8192 + 8192 + 16384 + 64 + 64 = 40 960 bytes (fits 48 KiB default).
+// Total at D=512: 16384 + 16384 + 16384 + 32768 + 64 + 64 = 82 048 bytes (needs
 // cudaFuncSetAttribute to opt into dynamic shmem beyond 48 KiB).
+//
+// K and V now live in distinct buffers so V[i] can be cp.async-loaded while
+// QK[i] is computing, and K[i+1] can be cp.async-loaded into sK (on top of
+// the just-consumed K[i]) while PV[i] is computing.
 __global__ void xk_attn_flash_tc_bf16_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ q,
@@ -177,29 +211,30 @@ __global__ void xk_attn_flash_tc_bf16_kernel(
 
     // ---- Smem carve-up ----
     extern __shared__ uint8_t smem_raw[];
-    __nv_bfloat16* sQ  = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* sKV = sQ + BR * D;
-    float*         sO  = reinterpret_cast<float*>(sKV + BC * D);
-    float*         sM  = sO + BR * D;
-    float*         sL  = sM + BR;
+    __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* sK = sQ + BR * D;
+    __nv_bfloat16* sV = sK + BC * D;
+    float*         sO = reinterpret_cast<float*>(sV + BC * D);
+    float*         sM = sO + BR * D;
+    float*         sL = sM + BR;
 
-    // ---- Load Q tile [BR, D] as uint32 pairs (zero-pad rows past T_q) ----
-    // 2 bf16 per load halves the iteration count.
-    const int Q_PAIRS = (BR * D) / 2;
-    for (int i = tid; i < Q_PAIRS; i += 32) {
-        int r = (i * 2) / D;
-        int c = (i * 2) - r * D;
+    // Per-tile chunk counts for 16-byte cp.async loads (8 bf16 per chunk).
+    const int Q_CHUNKS  = (BR * D) / 8;
+    const int KV_CHUNKS = (BC * D) / 8;
+
+    // ---- Load Q tile via cp.async (16-byte chunks = 8 bf16) ----
+    for (int i = tid; i < Q_CHUNKS; i += 32) {
+        int r = (i * 8) / D;
+        int c = (i * 8) - r * D;
         int q_row = q_start + r;
-        uint32_t val;
-        if (q_row < T_q) {
-            val = *reinterpret_cast<const uint32_t*>(&q[((size_t)q_row * H + q_head) * D + c]);
-        } else {
-            val = 0;
-        }
-        reinterpret_cast<uint32_t*>(sQ)[i] = val;
+        const void* src = (q_row < T_q)
+            ? static_cast<const void*>(&q[((size_t)q_row * H + q_head) * D + c])
+            : static_cast<const void*>(&q[0]); // pointer value unused when src_size=0
+        uint32_t src_size = (q_row < T_q) ? 16u : 0u;
+        cp_async_16(&sQ[i * 8], src, src_size);
     }
 
-    // ---- Init O_acc = 0, m = -inf, l = 0 ----
+    // ---- Init O_acc = 0, m = -inf, l = 0 (scalar writes, no cp.async needed) ----
     for (int i = tid; i < BR * D; i += 32) {
         sO[i] = 0.0f;
     }
@@ -207,25 +242,36 @@ __global__ void xk_attn_flash_tc_bf16_kernel(
         sM[r] = -INFINITY;
         sL[r] = 0.0f;
     }
+
+    // ---- Prefetch K[0] into sK via cp.async ----
+    for (int i = tid; i < KV_CHUNKS; i += 32) {
+        int r = (i * 8) / D;
+        int c = (i * 8) - r * D;
+        int kv_row = 0 + r;
+        const void* src = (kv_row < T_kv)
+            ? static_cast<const void*>(&k[((size_t)kv_row * H_kv + kv_head) * D + c])
+            : static_cast<const void*>(&k[0]);
+        uint32_t src_size = (kv_row < T_kv) ? 16u : 0u;
+        cp_async_16(&sK[i * 8], src, src_size);
+    }
+    cp_async_commit();
+    cp_async_wait_group<0>();
     __syncthreads();
 
     // ---- Outer loop over K/V tiles ----
     for (int kv_start = 0; kv_start < T_kv; kv_start += BC) {
-        // ---- Load K tile (reuses sKV buffer), uint32-paired ----
-        const int KV_PAIRS = (BC * D) / 2;
-        for (int i = tid; i < KV_PAIRS; i += 32) {
-            int r = (i * 2) / D;
-            int c = (i * 2) - r * D;
+        // Issue V[current] → sV async; overlaps with the QK compute below.
+        for (int i = tid; i < KV_CHUNKS; i += 32) {
+            int r = (i * 8) / D;
+            int c = (i * 8) - r * D;
             int kv_row = kv_start + r;
-            uint32_t val;
-            if (kv_row < T_kv) {
-                val = *reinterpret_cast<const uint32_t*>(&k[((size_t)kv_row * H_kv + kv_head) * D + c]);
-            } else {
-                val = 0;
-            }
-            reinterpret_cast<uint32_t*>(sKV)[i] = val;
+            const void* src = (kv_row < T_kv)
+                ? static_cast<const void*>(&v[((size_t)kv_row * H_kv + kv_head) * D + c])
+                : static_cast<const void*>(&v[0]);
+            uint32_t src_size = (kv_row < T_kv) ? 16u : 0u;
+            cp_async_16(&sV[i * 8], src, src_size);
         }
-        __syncthreads();
+        cp_async_commit();
 
         // ---- Compute S = Q @ K^T, [BR, BC] (per-thread 8 fp32) ----
         // S per-thread positions (matching two back-to-back mma.m16n8k16 calls,
@@ -247,8 +293,8 @@ __global__ void xk_attn_flash_tc_bf16_kernel(
             {
                 int n_col = tid >> 2;             // 0..7
                 int r_row = (tid & 3) << 1;       // 0,2,4,6
-                uint32_t b0 = *reinterpret_cast<const uint32_t*>(&sKV[n_col * D + k_iter + r_row + 0]);
-                uint32_t b1 = *reinterpret_cast<const uint32_t*>(&sKV[n_col * D + k_iter + r_row + 8]);
+                uint32_t b0 = *reinterpret_cast<const uint32_t*>(&sK[n_col * D + k_iter + r_row + 0]);
+                uint32_t b1 = *reinterpret_cast<const uint32_t*>(&sK[n_col * D + k_iter + r_row + 8]);
                 mma_m16n8k16_bf16_bf16_f32(a0, a1, a2, a3, b0, b1,
                                            s[0], s[1], s[2], s[3],
                                            s[0], s[1], s[2], s[3]);
@@ -257,8 +303,8 @@ __global__ void xk_attn_flash_tc_bf16_kernel(
             {
                 int n_col = 8 + (tid >> 2);
                 int r_row = (tid & 3) << 1;
-                uint32_t b0 = *reinterpret_cast<const uint32_t*>(&sKV[n_col * D + k_iter + r_row + 0]);
-                uint32_t b1 = *reinterpret_cast<const uint32_t*>(&sKV[n_col * D + k_iter + r_row + 8]);
+                uint32_t b0 = *reinterpret_cast<const uint32_t*>(&sK[n_col * D + k_iter + r_row + 0]);
+                uint32_t b1 = *reinterpret_cast<const uint32_t*>(&sK[n_col * D + k_iter + r_row + 8]);
                 mma_m16n8k16_bf16_bf16_f32(a0, a1, a2, a3, b0, b1,
                                            s[4], s[5], s[6], s[7],
                                            s[4], s[5], s[6], s[7]);
@@ -337,20 +383,27 @@ __global__ void xk_attn_flash_tc_bf16_kernel(
         // (Rescale fused into the PV loop below — each mma's C operand is
         // loaded and scaled by alpha inline, saving a separate smem pass.)
 
-        // ---- Load V tile into sKV (overwrites K), uint32-paired ----
-        for (int i = tid; i < KV_PAIRS; i += 32) {
-            int r = (i * 2) / D;
-            int c = (i * 2) - r * D;
-            int kv_row = kv_start + r;
-            uint32_t val;
-            if (kv_row < T_kv) {
-                val = *reinterpret_cast<const uint32_t*>(&v[((size_t)kv_row * H_kv + kv_head) * D + c]);
-            } else {
-                val = 0;
-            }
-            reinterpret_cast<uint32_t*>(sKV)[i] = val;
-        }
+        // ---- Wait for V[current] to land in sV ----
+        cp_async_wait_group<0>();
         __syncthreads();
+
+        // ---- Prefetch K[next] into sK (overwrites now-unused K[current]) ----
+        // Overlaps with the PV mma below. Only issue if there's a next tile.
+        const int kv_next_start = kv_start + BC;
+        const bool has_next = kv_next_start < T_kv;
+        if (has_next) {
+            for (int i = tid; i < KV_CHUNKS; i += 32) {
+                int r = (i * 8) / D;
+                int c = (i * 8) - r * D;
+                int kv_row = kv_next_start + r;
+                const void* src = (kv_row < T_kv)
+                    ? static_cast<const void*>(&k[((size_t)kv_row * H_kv + kv_head) * D + c])
+                    : static_cast<const void*>(&k[0]);
+                uint32_t src_size = (kv_row < T_kv) ? 16u : 0u;
+                cp_async_16(&sK[i * 8], src, src_size);
+            }
+            cp_async_commit();
+        }
 
         // ---- Build P bf16 A-frag once (positions match mma A-frag) ----
         __nv_bfloat16 pb[8];
@@ -362,14 +415,14 @@ __global__ void xk_attn_flash_tc_bf16_kernel(
 
         // ---- PV mma: O += P @ V, one 16x8 tile per n-chunk, D/8 chunks ----
         for (int n_base = 0; n_base < D; n_base += 8) {
-            // B frag from V: V[k, n] = sKV[k * D + n]. Need four bf16 at
+            // B frag from V: V[k, n] = sV[k * D + n]. Need four bf16 at
             // (r_row+0, n_abs), (r_row+1, n_abs), (r_row+8, n_abs), (r_row+9, n_abs).
             int n_abs = n_base + (tid >> 2);
             int r_row = (tid & 3) << 1;
-            __nv_bfloat16 v0 = sKV[(r_row + 0) * D + n_abs];
-            __nv_bfloat16 v1 = sKV[(r_row + 1) * D + n_abs];
-            __nv_bfloat16 v2 = sKV[(r_row + 8) * D + n_abs];
-            __nv_bfloat16 v3 = sKV[(r_row + 9) * D + n_abs];
+            __nv_bfloat16 v0 = sV[(r_row + 0) * D + n_abs];
+            __nv_bfloat16 v1 = sV[(r_row + 1) * D + n_abs];
+            __nv_bfloat16 v2 = sV[(r_row + 8) * D + n_abs];
+            __nv_bfloat16 v3 = sV[(r_row + 9) * D + n_abs];
             uint32_t bv0 = pack_bf16_pair(v0, v1);
             uint32_t bv1 = pack_bf16_pair(v2, v3);
 
@@ -390,7 +443,12 @@ __global__ void xk_attn_flash_tc_bf16_kernel(
             sO[(rb+8) * D + n_base + cb + 0] = d2;
             sO[(rb+8) * D + n_base + cb + 1] = d3;
         }
-        __syncthreads();
+
+        // ---- Wait for K[next] before the next iter's QK mma ----
+        if (has_next) {
+            cp_async_wait_group<0>();
+            __syncthreads();
+        }
     }
 
     // ---- Final normalize: out = O_acc / l, write bf16 ----
@@ -421,10 +479,12 @@ extern "C" int xk_attn_flash_tc_bf16(
     constexpr int BR = 16, BC = 16;
     const int q_tiles = (T_q + BR - 1) / BR;
 
-    // Dynamic shmem sizing.
+    // Dynamic shmem sizing (sK and sV are separate buffers now — cp.async
+    // prefetches K[next] into sK while PV runs on sV).
     const size_t shmem_bytes =
         (size_t)(BR * D) * sizeof(__nv_bfloat16)   // sQ
-      + (size_t)(BC * D) * sizeof(__nv_bfloat16)   // sKV
+      + (size_t)(BC * D) * sizeof(__nv_bfloat16)   // sK
+      + (size_t)(BC * D) * sizeof(__nv_bfloat16)   // sV
       + (size_t)(BR * D) * sizeof(float)           // sO
       + (size_t)(BR)     * sizeof(float)           // sM
       + (size_t)(BR)     * sizeof(float);          // sL

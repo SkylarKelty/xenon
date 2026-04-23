@@ -263,14 +263,17 @@ that — deferred to the open-questions / future-phase bucket.
       - Kept as a future-ready primitive for batched serving (phase 5+)
         and long-prefill paths, NOT wired into `layer_forward`.
 
-### Phase 5 — server + OpenAI API [ ]
-- [ ] `POST /v1/chat/completions` with Gemma chat template
-- [ ] SSE streaming
-- [ ] `POST /v1/completions` (legacy)
-- [ ] `GET /v1/models`
-- [ ] Concurrent-request queuing (one request at a time on device in v1)
+### Phase 5 — server + OpenAI API [x]
+- [x] `POST /v1/chat/completions` with Gemma chat template + SSE streaming
+      (`8a8c340`).
+- [x] `POST /v1/completions` legacy endpoint; `cli generate` migrated to
+      share the `xenon-engine` code path (`6321902`).
+- [x] `GET /v1/models`.
+- [x] Concurrent-request handling: engine-level request batching
+      (`dcc44fa`) + server batcher that shares a forward pass across
+      concurrent requests (`1618d35`).
 - [~] **CUDA Graph capture — investigated, deprioritized.** Prereq
-      (persistent [`DecodeScratch`] covering all per-step buffers) was
+      (persistent `DecodeScratch` covering all per-step buffers) was
       built and benched: no meaningful change vs the cudaMallocAsync
       pool (189 ms/step either way; run variance ≈ ±2%). Profiling
       shows the decoder stack alone is ~121 ms of kernel time, so
@@ -282,7 +285,8 @@ that — deferred to the open-questions / future-phase bucket.
       still compatible if we revisit.
 - [ ] **Dispatch NVFP4 GEMM for large-M paths.** With concurrent-request
       batching (prefill M ≥ 128), the NVFP4 primitive (phase 4.1) becomes
-      viable for MLP GEMMs. Keep the bf16 fallback for small-M.
+      viable for MLP GEMMs. Keep the bf16 fallback for small-M. (Server
+      exists; this is the follow-up perf path.)
 
 ### Phase 6 — polish + bench [~]
 - [ ] Nsight Compute profile passes, fix obvious tuning wins
@@ -299,16 +303,21 @@ that — deferred to the open-questions / future-phase bucket.
       Same change mirrored to `forward_step_batched` for the server path.
       `forward_step_profiled` left sync (its job is per-phase timing via
       host syncs).
-- [x] **Tensor-core flash-attention for prefill D≤256** (2026-04-23, commit TBD).
+- [x] **Tensor-core flash-attention for prefill, all D** (2026-04-23,
+      commits `1d87afb` + cp.async follow-up).
       New `xk_attn_flash_tc_bf16_kernel` — flash-attention-2 style tiled
       kernel on `mma.m16n8k16` bf16. BR=BC=16, one warp per block, O_acc in
-      smem. Kernel-level 1.41× at D=256 window=0 and 1.65× at D=256
-      window=512 (sliding layers — the 35-layer hot path). D=512 full-attn
-      layers stay on naive (per-block smem >48 KiB cuts occupancy and
-      erases the win: measured 0.78×). Bench: prefill 2429 → 2541 tok/s
-      (+4.6% across 3 warm runs), decode unchanged.
-      `test-mma-bf16` sanity test validates the mma PTX + fragment layout
-      on sm_120a; `test-attn-flash-tc` times the kernel vs naive.
+      smem. K and V in separate smem buffers; `cp.async.cg` prefetches
+      V[i] (overlaps QK+softmax) and K[i+1] (overlaps PV). This doubles
+      memory/compute throughput and lets D=512 win too (it was a
+      regression without the overlap).
+      Kernel-level: D=256 window=0 3.66×, D=256 window=512 3.39×,
+      D=512 window=0 1.78×, D=512 window=512 1.81× vs naive.
+      Bench (3 warm runs): prefill 2541 → 3097 tok/s (+21.9%), decode
+      ~60 tok/s (unchanged within noise). Now **1.15× ollama prefill**
+      (2693 tok/s) — first time we cross the ollama line.
+      `test-mma-bf16` validates the mma PTX + fragment layout on sm_120a;
+      `test-attn-flash-tc` times the kernel vs naive.
 - [x] **Attention kernel rewrite — split-KV** (2026-04-23, commit TBD).
       New `xk_attn_split_kv_*_bf16_kernel` pair: partial kernel grids over
       `(q_tok × q_head × kv_chunk)` with naive's work pattern per chunk
@@ -378,17 +387,17 @@ merge-kernel overhead is pure loss — hence the conditional dispatch.
   KV, but the paper/config doesn't directly specify the mapping. Must be
   derived from the tensor presence pattern (layers without their own K/V
   proj weights reuse earlier ones). Resolve in phase 2.
-- **Attention kernel — further tensor-core work.** `mma.m16n8k16` landed
-  for prefill D≤256 (+4.6% prefill bench). Known follow-ups:
-  - D=512 full-attn path: current kernel's ~65 KiB smem cuts occupancy to
-    1 block/SM, erasing the win. Either async-loaded K/V (cp.async +
-    double-buffered tile, halving live smem) or moving O_acc to registers
-    (BR=16 at D=512 is 256 fp32/thread — needs spill analysis).
+- **Attention kernel — further tensor-core work.** `mma.m16n8k16` +
+  `cp.async` landed for all prefill D (+22% prefill bench, 1.15× ollama).
+  Remaining levers:
   - Upgrade to `wgmma.mma_async` (warpgroup, 128 threads) — lets 4 warps
-    pipeline K/V loads against MMA compute. Bigger rewrite but ~3× expected
-    on top of current mma path.
-  - Larger BR (32 or 64) — amortize per-tile overhead over more rows, but
-    pressures register/smem budget.
+    pipeline K/V loads against MMA compute at instruction level (multiple
+    in-flight MMA groups). Bigger rewrite; another 2-3× expected on top
+    of the current mma path.
+  - Larger BR (32 or 64) — amortize per-tile overhead across more rows
+    (needs register/smem budget work; may require wgmma first).
+  - For decode (currently split-KV): tensor cores don't help (M=1 < MMA
+    tile m=16). Decode bottleneck now shifts to lm_head GEMM (4 ms/step).
 - **Native FP4 GEMM migration.** Post-phase-3 we swap dequant+bf16 GEMM for
   cuBLASLt NVFP4 operand mode. Expected win: ~2-3× MLP throughput when
   compute-bound, nothing when bandwidth-bound (which is most of decode).

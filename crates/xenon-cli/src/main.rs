@@ -2353,9 +2353,6 @@ const DEVICE_SM_COUNT: usize = 26;
 const ATTN_SATURATION_BLOCKS: usize = DEVICE_SM_COUNT * 2;
 /// Flash-tc (mma.m16n8k16) minimum Q rows.
 const ATTN_FLASH_TC_MIN_TQ: usize = 16;
-/// Flash-tc head-dim ceiling — D > 256 pushes per-block smem past 50 KiB,
-/// cutting occupancy from 2 blocks/SM to 1 and erasing the compute win.
-const ATTN_FLASH_TC_MAX_D: usize = 256;
 
 #[derive(Clone, Copy)]
 struct LayerMeta {
@@ -2457,13 +2454,14 @@ fn layer_forward(
                            t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window,
                            chunk_size, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-    } else if t_q >= ATTN_FLASH_TC_MIN_TQ && d <= ATTN_FLASH_TC_MAX_D {
-        // Prefill-shaped, head_dim fits smem budget: tensor-core flash-tc.
+    } else if t_q >= ATTN_FLASH_TC_MIN_TQ {
+        // Prefill-shaped: tensor-core flash-tc (wins at both D=256 and D=512
+        // now that cp.async hides the K/V load latency).
         attn_flash_tc_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
                            t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     } else {
-        // D=512 full-attention, or odd shapes that don't fit either fast path.
+        // Odd shapes (t_q < MIN_TQ but > SATURATION/H) fall back to naive.
         attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
                          t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;

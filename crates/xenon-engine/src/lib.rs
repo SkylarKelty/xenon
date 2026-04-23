@@ -29,10 +29,6 @@ const ATTN_SATURATION_BLOCKS: usize = DEVICE_SM_COUNT * 2;
 /// Flash-tc (mma.m16n8k16) minimum Q rows. Under this we can't build a full
 /// mma tile; dispatch falls back to naive or split-KV.
 const ATTN_FLASH_TC_MIN_TQ: usize = 16;
-/// Flash-tc head-dim ceiling. D > 256 makes per-block smem exceed ~50 KB
-/// and drops occupancy to 1 block/SM, erasing the compute win (measured
-/// D=512 → 0.78×, D=256 → 1.65×). D=512 layers stay on naive.
-const ATTN_FLASH_TC_MAX_D: usize = 256;
 
 // -------------------- Weight containers --------------------
 
@@ -355,13 +351,14 @@ pub fn layer_forward(
                            t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window,
                            chunk_size, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-    } else if t_q >= ATTN_FLASH_TC_MIN_TQ && d <= ATTN_FLASH_TC_MAX_D {
-        // Prefill-shaped, head_dim fits smem budget: use tensor-core flash-tc.
+    } else if t_q >= ATTN_FLASH_TC_MIN_TQ {
+        // Prefill-shaped: tensor-core flash-tc. With cp.async K/V overlap
+        // this wins at both D=256 (3.4×) and D=512 (1.8×) vs naive.
         attn_flash_tc_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
                            t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     } else {
-        // D=512 full-attention layers, or odd shapes that don't fit either fast path.
+        // Oddly-sized t_q (< MIN_TQ but > SATURATION/H) — fall back to naive.
         attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
                          t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
