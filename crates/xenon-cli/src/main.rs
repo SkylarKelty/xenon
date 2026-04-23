@@ -2174,6 +2174,14 @@ struct QuantLinearDev {
     in_features: usize,
 }
 
+/// Shared FP4-quantized activation (mirror of engine::Fp4SharedActivation).
+struct Fp4SharedActivation {
+    packed: DeviceBuffer<u8>,
+    scales_swizzled: DeviceBuffer<u8>,
+    m: usize,
+    k: usize,
+}
+
 impl QuantLinearDev {
     fn load(q: &xenon_core::QuantLinearRef<'_>) -> anyhow::Result<Self> {
         let n = q.out_features;
@@ -2204,6 +2212,49 @@ impl QuantLinearDev {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    /// Quantize an activation once so multiple projections that share the
+    /// same x (q/k/v from d_normed, gate/up from d_mlp_normed) skip the
+    /// repeated xk_nvfp4_quantize_bf16 calls. See engine crate for details.
+    fn prepare_fp4_activation(
+        &self,
+        x: &DeviceBuffer<bf16>,
+        m: usize,
+        stream: &Stream,
+    ) -> anyhow::Result<Fp4SharedActivation> {
+        let k = self.in_features;
+        let k_blocks = k / 16;
+        let mut packed: DeviceBuffer<u8> =
+            DeviceBuffer::new_async(m * (k / 2), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut scales_linear: DeviceBuffer<u8> =
+            DeviceBuffer::new_async(m * k_blocks, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        nvfp4_quantize_bf16(&mut packed, &mut scales_linear, x, m, k, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let m_padded = round_up(m, 128);
+        let kb_padded = round_up(k_blocks, 4);
+        let mut scales_swizzled: DeviceBuffer<u8> =
+            DeviceBuffer::new_async(m_padded * kb_padded, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        swizzle_blockscale_ue4m3(&mut scales_swizzled, &scales_linear, m, k_blocks, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Fp4SharedActivation { packed, scales_swizzled, m, k })
+    }
+
+    fn forward_fp4_prepacked(
+        &self,
+        lt: &mut CublasLt,
+        y: &mut DeviceBuffer<bf16>,
+        x: &Fp4SharedActivation,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        debug_assert_eq!(x.k, self.in_features, "prepacked K mismatch");
+        let n = self.out_features;
+        let k = self.in_features;
+        let alpha_scale = self.global_scale;
+        lt.linear_nvfp4(y, &x.packed, &x.scales_swizzled,
+                         &self.packed, &self.scales_swizzled,
+                         alpha_scale, None, x.m, n, k, 1.0, 0.0, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     /// Three-way dispatch by M — see xenon-engine's QuantLinearDev::forward
     /// doc for the full rationale.
     fn forward(
@@ -2216,29 +2267,13 @@ impl QuantLinearDev {
     ) -> anyhow::Result<()> {
         let n = self.out_features;
         let k = self.in_features;
-        let k_blocks = k / 16;
         if m == 1 {
             fp4_gemv_bf16(y, x, &self.packed, &self.scales, self.global_scale,
                            n, k, Some(stream))
                 .map_err(|e| anyhow::anyhow!("{e}"))
         } else if m >= 128 {
-            let mut x_packed: DeviceBuffer<u8> =
-                DeviceBuffer::new_async(m * (k / 2), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut x_scales_linear: DeviceBuffer<u8> =
-                DeviceBuffer::new_async(m * k_blocks, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-            nvfp4_quantize_bf16(&mut x_packed, &mut x_scales_linear, x, m, k, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let m_padded = round_up(m, 128);
-            let kb_padded = round_up(k_blocks, 4);
-            let mut x_scales_swizzled: DeviceBuffer<u8> =
-                DeviceBuffer::new_async(m_padded * kb_padded, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-            swizzle_blockscale_ue4m3(&mut x_scales_swizzled, &x_scales_linear, m, k_blocks, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let alpha_scale = self.global_scale;
-            lt.linear_nvfp4(y, &x_packed, &x_scales_swizzled,
-                             &self.packed, &self.scales_swizzled,
-                             alpha_scale, None, m, n, k, 1.0, 0.0, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))
+            let fp4_x = self.prepare_fp4_activation(x, m, stream)?;
+            self.forward_fp4_prepacked(lt, y, &fp4_x, stream)
         } else {
             let mut w: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * k, stream)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2409,8 +2444,19 @@ fn layer_forward(
     rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), t_q, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // At prefill (t_q >= 128) q/k/v share d_normed — quantize once.
+    let attn_shared_act = if t_q >= 128 {
+        Some(lw.q_proj.prepare_fp4_activation(&d_normed, t_q, stream)?)
+    } else {
+        None
+    };
+
     let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.q_proj.forward(lt, &mut d_q, &d_normed, t_q, stream)?;
+    if let Some(ref sa) = attn_shared_act {
+        lw.q_proj.forward_fp4_prepacked(lt, &mut d_q, sa, stream)?;
+    } else {
+        lw.q_proj.forward(lt, &mut d_q, &d_normed, t_q, stream)?;
+    }
     {
         let q_tmp = clone_buffer_async(&d_q, stream)?;
         rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), t_q * h_heads, d, eps, Some(stream))
@@ -2425,8 +2471,13 @@ fn layer_forward(
         let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
         let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        kl.forward(lt, &mut d_k, &d_normed, t_q, stream)?;
-        vl.forward(lt, &mut d_v, &d_normed, t_q, stream)?;
+        if let Some(ref sa) = attn_shared_act {
+            kl.forward_fp4_prepacked(lt, &mut d_k, sa, stream)?;
+            vl.forward_fp4_prepacked(lt, &mut d_v, sa, stream)?;
+        } else {
+            kl.forward(lt, &mut d_k, &d_normed, t_q, stream)?;
+            vl.forward(lt, &mut d_v, &d_normed, t_q, stream)?;
+        }
         {
             let k_tmp = clone_buffer_async(&d_k, stream)?;
             rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), t_q * h_kv, d, eps, Some(stream))
@@ -2439,6 +2490,7 @@ fn layer_forward(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         kv.append(layer_idx, &d_k, &d_v, t_q).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    drop(attn_shared_act);
 
     let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     if t_q * h_heads < ATTN_SATURATION_BLOCKS {
@@ -2485,8 +2537,15 @@ fn layer_forward(
     let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new_async(t_q * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.gate_proj.forward(lt, &mut d_gate_out, &d_normed, t_q, stream)?;
-    lw.up_proj.forward(lt, &mut d_up_out, &d_normed, t_q, stream)?;
+    // gate_proj and up_proj both take d_normed — share the quantization.
+    if t_q >= 128 {
+        let mlp_shared_act = lw.gate_proj.prepare_fp4_activation(&d_normed, t_q, stream)?;
+        lw.gate_proj.forward_fp4_prepacked(lt, &mut d_gate_out, &mlp_shared_act, stream)?;
+        lw.up_proj.forward_fp4_prepacked(lt, &mut d_up_out, &mlp_shared_act, stream)?;
+    } else {
+        lw.gate_proj.forward(lt, &mut d_gate_out, &d_normed, t_q, stream)?;
+        lw.up_proj.forward(lt, &mut d_up_out, &d_normed, t_q, stream)?;
+    }
     gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     lw.down_proj.forward(lt, &mut d_mlp_out, &d_act, t_q, stream)?;

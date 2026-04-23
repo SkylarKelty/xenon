@@ -303,8 +303,17 @@ that — deferred to the open-questions / future-phase bucket.
       Same change mirrored to `forward_step_batched` for the server path.
       `forward_step_profiled` left sync (its job is per-phase timing via
       host syncs).
+- [x] **Shared NVFP4 activation across co-sourced projections** (2026-04-23,
+      commit TBD). `nvfp4_quantize_bf16` was 27% of prefill GPU time because
+      it was re-running on the same post-norm activation for each of q/k/v
+      and each of gate/up. Added `QuantLinearDev::prepare_fp4_activation` +
+      `forward_fp4_prepacked`: quantize once per shared activation, reuse
+      for all co-sourced projections. Saved ~90 quantize calls per forward
+      (3 per own-KV layer × 24 + 1 per shared-KV × 18). Bench: prefill
+      2976 → 3242 tok/s (+8.9%), decode unchanged. Now **1.20× ollama
+      prefill** (was 1.10×).
 - [x] **Tensor-core flash-attention for prefill, all D** (2026-04-23,
-      commits `1d87afb` + cp.async follow-up).
+      commits `1d87afb` + cp.async follow-up `e77db3f`).
       New `xk_attn_flash_tc_bf16_kernel` — flash-attention-2 style tiled
       kernel on `mma.m16n8k16` bf16. BR=BC=16, one warp per block, O_acc in
       smem. K and V in separate smem buffers; `cp.async.cg` prefetches
