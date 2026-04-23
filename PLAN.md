@@ -4,6 +4,24 @@ Inference engine for a single model on a single box, built from scratch in Rust
 + CUDA. Optimised for **cold start, idle power, and operational simplicity**,
 not for matching vLLM's server throughput.
 
+## Current status (2026-04-23, commit `c7e6aa1`)
+
+Single-stream, `cosmicproc/gemma-4-E4B-it-NVFP4` on RTX PRO 2000 Blackwell,
+T_prompt=155, max_new=50, warm GPU:
+
+| Metric | xenon | ollama 0.21 (same model) | ratio |
+| --- | --- | --- | --- |
+| Decode | ~60 tok/s | 23.79 tok/s | **2.5×** |
+| Prefill | 3242 tok/s | 2693 tok/s | **1.20×** |
+
+(ollama runs the same `gemma4:e4b` Q4_K_M with 68% of the model on CPU because
+it doesn't fit the 7.5 GiB VRAM; xenon keeps everything on device via PLE /
+lm_head host-offload.)
+
+Phases 0–5 complete (foundations, MLP, attention, full forward, decode, server
+with OpenAI API + streaming + request batching). Phase 4.1 native NVFP4 GEMM
+wired for prefill; phase 6 perf polish ongoing.
+
 ## Goals
 
 - Sub-2 s cold start to first token for a ~5 B-active model at NVFP4.
@@ -304,7 +322,7 @@ that — deferred to the open-questions / future-phase bucket.
       `forward_step_profiled` left sync (its job is per-phase timing via
       host syncs).
 - [x] **Shared NVFP4 activation across co-sourced projections** (2026-04-23,
-      commit TBD). `nvfp4_quantize_bf16` was 27% of prefill GPU time because
+      commit `c7e6aa1`). `nvfp4_quantize_bf16` was 27% of prefill GPU time because
       it was re-running on the same post-norm activation for each of q/k/v
       and each of gate/up. Added `QuantLinearDev::prepare_fp4_activation` +
       `forward_fp4_prepacked`: quantize once per shared activation, reuse
@@ -327,7 +345,7 @@ that — deferred to the open-questions / future-phase bucket.
       (2693 tok/s) — first time we cross the ollama line.
       `test-mma-bf16` validates the mma PTX + fragment layout on sm_120a;
       `test-attn-flash-tc` times the kernel vs naive.
-- [x] **Attention kernel rewrite — split-KV** (2026-04-23, commit TBD).
+- [x] **Attention kernel rewrite — split-KV** (2026-04-23, commit `da09d5d`).
       New `xk_attn_split_kv_*_bf16_kernel` pair: partial kernel grids over
       `(q_tok × q_head × kv_chunk)` with naive's work pattern per chunk
       (threads partition T_kv slice, each does a full D-dot, no intra-block
