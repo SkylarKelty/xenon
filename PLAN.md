@@ -320,10 +320,80 @@ that — deferred to the open-questions / future-phase bucket.
       quantized activation across co-sourced projections for +8.9% prefill.
 
 ### Phase 6 — polish + bench [~]
-- [ ] Nsight Compute profile passes, fix obvious tuning wins
-- [ ] PLE prefetch overlap (one layer ahead)
-- [ ] H2D overlap during decode if bandwidth-bound
-- [ ] Benchmark suite vs Ollama (same prompts, same model, same GPU)
+
+**Profile-driven ranking (nsys full-run, 2026-04-23, T_prompt=95 + 50 decode
+steps, trace at `results/nsys-full.nsys-rep`).**
+
+Decode step breakdown (17.8 ms/step):
+
+| Kernel / phase | ms/step | % of decode | Notes |
+| --- | --- | --- | --- |
+| `xk_fp4_gemv_bf16_kernel` | 9.1 | 51% | ~8 calls/layer × 42 layers + 1 lm_head-adjacent; M=1 FP4 weight path |
+| cuBLASLt bf16 gemvx | 4.1 | 23% | lm_head (bf16 [vocab=262144, hidden=2560]); bandwidth-bound |
+| CUTLASS small bf16 GEMMs | ~1.0 | 6% | cuBLASLt fallback for non-M=1 small shapes |
+| `xk_attn_split_kv_partial_bf16_kernel` | 1.1 | 6% | already near-optimal for decode shape |
+| `xk_rmsnorm_bf16_kernel` | 0.7 | 4% | 320 launches/step — launch-overhead-heavy |
+| kernel launch overhead | ~1.4 | 8% | 900+ launches × 1.57 μs per decode step |
+| misc (add_scale, gelu, rope, etc.) | ~0.4 | 2% | <0.5% each |
+
+Prefill (T=95, 206 ms): dominated by `xk_fp4_dequant_bf16_kernel` (195 ms
+cumulative, all prefill — decode is M=1 via fp4_gemv, no dequant). At
+T < 128 we fall off the native NVFP4 path (cuBLASLt silently wrong below
+M=128) into dequant→bf16_linear — the dequant alone accounts for most of
+prefill time at short prompts.
+
+**Scratched** (profile showed < 1% potential, or obviated):
+
+- ~~Nsight Compute profile passes~~ — this **was** that pass (done via nsys
+  since `ncu` is available but slow to replay; ncu can drill into a
+  specific hot kernel when one of the items below needs per-stall-reason
+  diagnosis).
+- ~~PLE prefetch overlap (one layer ahead)~~ — `ple assembly` phase is
+  0.24 ms/step (1.4% of decode). Even perfect elimination < 1%. Not worth.
+- ~~H2D overlap during decode if bandwidth-bound~~ — `lm_head` already
+  overlapped; remaining H2D is embed gather + PLE upload, both sub-0.2 ms.
+  Not a real lever.
+- ~~Benchmark suite vs Ollama~~ — ad-hoc `ollama run --verbose` next to
+  every perf claim has been sufficient; a structured harness is cost
+  without obvious benefit.
+
+**Ranked follow-ups informed by the profile:**
+
+- [ ] **Attack `xk_fp4_gemv_bf16_kernel` (biggest decode lever, 51%).**
+      Next step: `ncu --set full` on one invocation to pin whether it's
+      DRAM-bandwidth-bound (then try split-K along hidden), L2-latency-bound
+      (try `cp.async` prefetch of the next weight tile), or warp-issue-bound
+      (tune thread count / LUT in registers). Even a 20% improvement on
+      this kernel is ~10% decode tok/s.
+- [ ] **Revisit CUDA Graphs.** Phase 5 rejected at 189 ms/step when launch
+      overhead was <1% of wall time. Now decode is 17.8 ms and launch
+      overhead is 8% (1.4 ms/step across 900+ launches). The persistent-
+      scratch prereq already landed; graph capture on the steady-state
+      decode loop could recover most of that — expected 5–8% decode win.
+- [ ] **Lower the native NVFP4 threshold for prefill (M ∈ [32, 127]).**
+      cuBLASLt fails silently < 128; but for M in [32, 127] a hand-written
+      NVFP4 tensor-core kernel would avoid the dequant→bf16 round-trip that
+      dominates prefill at short prompts. Skip for M < 32 where FP4 tile
+      overhead swamps; keep fp4_gemv for M=1.
+- [ ] **Experimental: NVFP4-quantize `lm_head`.** Currently bf16,
+      1.34 GB/step read (~23% of decode). Quantizing to NVFP4 halves the
+      bandwidth, potentially dropping lm_head from 4 ms → 2 ms per step —
+      about 11% decode win. Risk: top-1 accuracy drift on rare tokens;
+      needs HF-reference validation.
+- [ ] **Fuse RMSNorm into adjacent kernels (residual-add, next-GEMM pre).**
+      320 RMSNorm launches/step × 1.57 μs ≈ 500 μs of pure launch overhead
+      vs 720 μs of actual work — RMSNorm is half launch-latency-bound.
+      Moderate-effort, low-impact (~2% decode). Do only after the bigger
+      items or bundled with a CUDA Graph pass.
+
+Deferred perf items (not in the current phase):
+
+- `wgmma.mma_async` attention — 2–3× over current flash-tc, but decode
+  shape can't use MMA tiles anyway, so this only helps prefill and is
+  a chunky rewrite. Current prefill attention is already 1.20× ollama.
+- Larger BR tile (32/64) in flash-tc — needs wgmma first for register/smem
+  budget. Same caveat: prefill-only.
+
 - [x] **Pre-dequant `per_layer_model_projection` at load** (2026-04-23).
       Was calling `dequant_to` (647 μs) every forward_step; now dequanted
       once into a 43 MB bf16 buffer at load, mirroring the lm_head pattern.
@@ -417,34 +487,15 @@ merge-kernel overhead is pure loss — hence the conditional dispatch.
 
 ## Deferred / open questions
 
-- **HF reference comparison.** Phase 3 needs bit-exact-ish baseline. Options:
-  (a) one-off Python script captures per-layer activations, (b) ONNX export,
-  (c) run HF transformers via PyO3. Lean: (a). Defer until phase 3.
 - **Weight layout on disk.** Currently read HF safetensors as-is. Preprocessing
   to a custom contiguous layout (tensors pre-aligned, scales interleaved) would
   cut cold-start time ~2×. Defer until the ops story demands it.
-- **KV-sharing semantics.** `num_kv_shared_layers: 18` means 18 layers reuse
-  KV, but the paper/config doesn't directly specify the mapping. Must be
-  derived from the tensor presence pattern (layers without their own K/V
-  proj weights reuse earlier ones). Resolve in phase 2.
-- **Attention kernel — further tensor-core work.** `mma.m16n8k16` +
-  `cp.async` landed for all prefill D (+22% prefill bench, 1.15× ollama).
-  Remaining levers:
-  - Upgrade to `wgmma.mma_async` (warpgroup, 128 threads) — lets 4 warps
-    pipeline K/V loads against MMA compute at instruction level (multiple
-    in-flight MMA groups). Bigger rewrite; another 2-3× expected on top
-    of the current mma path.
-  - Larger BR (32 or 64) — amortize per-tile overhead across more rows
-    (needs register/smem budget work; may require wgmma first).
-  - For decode (currently split-KV): tensor cores don't help (M=1 < MMA
-    tile m=16). Decode bottleneck now shifts to lm_head GEMM (4 ms/step).
-- **Native FP4 GEMM migration.** Post-phase-3 we swap dequant+bf16 GEMM for
-  cuBLASLt NVFP4 operand mode. Expected win: ~2-3× MLP throughput when
-  compute-bound, nothing when bandwidth-bound (which is most of decode).
 - **Multi-modal.** Vision/audio/image gen are out of v0 scope. Revisit once
   text-only is shipping well.
-- **Multiple concurrent requests.** v1 serves one at a time. Batching is a
-  phase 8+ discussion once we know the actual traffic pattern.
+- **Multiple concurrent requests beyond the current batcher.** v1 serves
+  concurrent requests by sharing a decode forward pass (server batcher).
+  PagedAttention / continuous-batching-style ragged prefill is a later
+  discussion.
 
 ## Out-of-scope (explicitly not doing)
 
