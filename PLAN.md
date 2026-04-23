@@ -299,6 +299,16 @@ that — deferred to the open-questions / future-phase bucket.
       Same change mirrored to `forward_step_batched` for the server path.
       `forward_step_profiled` left sync (its job is per-phase timing via
       host syncs).
+- [x] **Tensor-core flash-attention for prefill D≤256** (2026-04-23, commit TBD).
+      New `xk_attn_flash_tc_bf16_kernel` — flash-attention-2 style tiled
+      kernel on `mma.m16n8k16` bf16. BR=BC=16, one warp per block, O_acc in
+      smem. Kernel-level 1.41× at D=256 window=0 and 1.65× at D=256
+      window=512 (sliding layers — the 35-layer hot path). D=512 full-attn
+      layers stay on naive (per-block smem >48 KiB cuts occupancy and
+      erases the win: measured 0.78×). Bench: prefill 2429 → 2541 tok/s
+      (+4.6% across 3 warm runs), decode unchanged.
+      `test-mma-bf16` sanity test validates the mma PTX + fragment layout
+      on sm_120a; `test-attn-flash-tc` times the kernel vs naive.
 - [x] **Attention kernel rewrite — split-KV** (2026-04-23, commit TBD).
       New `xk_attn_split_kv_*_bf16_kernel` pair: partial kernel grids over
       `(q_tok × q_head × kv_chunk)` with naive's work pattern per chunk
@@ -368,11 +378,17 @@ merge-kernel overhead is pure loss — hence the conditional dispatch.
   KV, but the paper/config doesn't directly specify the mapping. Must be
   derived from the tensor presence pattern (layers without their own K/V
   proj weights reuse earlier ones). Resolve in phase 2.
-- **Attention kernel — tensor-core path.** Split-KV (2026-04-23) recovered
-  the grid-parallelism deficit and gave +14% decode tok/s wall. Next
-  attention-side lever is switching the QK dot and the PV projection onto
-  wgmma/mma.m16n8k16 bf16 — further 3-5× expected, but a much bigger
-  kernel project than split-KV was.
+- **Attention kernel — further tensor-core work.** `mma.m16n8k16` landed
+  for prefill D≤256 (+4.6% prefill bench). Known follow-ups:
+  - D=512 full-attn path: current kernel's ~65 KiB smem cuts occupancy to
+    1 block/SM, erasing the win. Either async-loaded K/V (cp.async +
+    double-buffered tile, halving live smem) or moving O_acc to registers
+    (BR=16 at D=512 is 256 fp32/thread — needs spill analysis).
+  - Upgrade to `wgmma.mma_async` (warpgroup, 128 threads) — lets 4 warps
+    pipeline K/V loads against MMA compute. Bigger rewrite but ~3× expected
+    on top of current mma path.
+  - Larger BR (32 or 64) — amortize per-tile overhead over more rows, but
+    pressures register/smem budget.
 - **Native FP4 GEMM migration.** Post-phase-3 we swap dequant+bf16 GEMM for
   cuBLASLt NVFP4 operand mode. Expected win: ~2-3× MLP throughput when
   compute-bound, nothing when bandwidth-bound (which is most of decode).

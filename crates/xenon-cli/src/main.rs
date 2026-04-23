@@ -10,8 +10,8 @@ use xenon_core::{
     GemmaConfig, LayerKind, Tokenizer,
 };
 use xenon_kernels::{
-    add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
-    attn_split_kv_auto_chunk_size, attn_split_kv_bf16,
+    add_scale_bf16, attn_flash_bf16, attn_flash_tc_bf16, attn_naive_bf16, attn_naive_bf16_reference,
+    attn_split_kv_auto_chunk_size, attn_split_kv_bf16, test_mma_bf16,
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
     embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
@@ -357,6 +357,37 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Stage-1 validation for the tensor-core attention work. Runs a single
+    /// mma.m16n8k16 bf16 on random A[16,16] and B[16,8] into D[16,8] fp32
+    /// and compares against a host reference. Proves the PTX + fragment
+    /// layout is correct before we build the full flash-tc kernel.
+    TestMmaBf16 {
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Flash-attention-2 style tensor-core attention (mma.m16n8k16 bf16).
+    /// Runs against the naive kernel on random Q/K/V, verifies correctness
+    /// and times both. Intended for prefill shapes (T_q ≥ 16).
+    TestAttnFlashTc {
+        #[arg(long, default_value_t = 155)]
+        t_q: usize,
+        #[arg(long, default_value_t = 155)]
+        t_kv: usize,
+        #[arg(long, default_value_t = 8)]
+        h: usize,
+        #[arg(long, default_value_t = 2)]
+        h_kv: usize,
+        #[arg(long, default_value_t = 256)]
+        head_dim: usize,
+        /// 0 = no sliding window (full causal).
+        #[arg(long, default_value_t = 0)]
+        window: i32,
+        /// q_pos_base (prefill: 0).
+        #[arg(long)]
+        q_pos_base: Option<i32>,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     /// Run the split-KV attention kernel vs the naive kernel on random Q/K/V,
     /// verify correctness, and time both. Split-KV parallelises T_kv across a
     /// third grid axis so decode (T_q=1) can saturate more SMs.
@@ -482,6 +513,9 @@ fn main() -> anyhow::Result<()> {
             cmd_test_tokenizer(model, text, add_specials),
         Command::TestAttnFlash { t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed } =>
             cmd_test_attn_flash(t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed),
+        Command::TestMmaBf16 { seed } => cmd_test_mma_bf16(seed),
+        Command::TestAttnFlashTc { t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed } =>
+            cmd_test_attn_flash_tc(t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, seed),
         Command::TestAttnSplitKv { t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, chunk_sizes, seed } =>
             cmd_test_attn_split_kv(t_q, t_kv, h, h_kv, head_dim, window, q_pos_base, chunk_sizes, seed),
         Command::TestVsHfEmbed { model, hf, ids } => cmd_test_vs_hf_embed(model, hf, ids),
@@ -2317,6 +2351,11 @@ const DEVICE_SM_COUNT: usize = 26;
 /// GPU, so split-KV's merge-kernel overhead is pure loss. Empirically ~2×
 /// SM count from `test-attn-split-kv` sweep.
 const ATTN_SATURATION_BLOCKS: usize = DEVICE_SM_COUNT * 2;
+/// Flash-tc (mma.m16n8k16) minimum Q rows.
+const ATTN_FLASH_TC_MIN_TQ: usize = 16;
+/// Flash-tc head-dim ceiling — D > 256 pushes per-block smem past 50 KiB,
+/// cutting occupancy from 2 blocks/SM to 1 and erasing the compute win.
+const ATTN_FLASH_TC_MAX_D: usize = 256;
 
 #[derive(Clone, Copy)]
 struct LayerMeta {
@@ -2418,7 +2457,13 @@ fn layer_forward(
                            t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window,
                            chunk_size, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else if t_q >= ATTN_FLASH_TC_MIN_TQ && d <= ATTN_FLASH_TC_MAX_D {
+        // Prefill-shaped, head_dim fits smem budget: tensor-core flash-tc.
+        attn_flash_tc_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
+                           t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     } else {
+        // D=512 full-attention, or odd shapes that don't fit either fast path.
         attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
                          t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3786,6 +3831,153 @@ fn cmd_test_attn_flash(
     let tol_rel: f32 = 5e-2;
     anyhow::ensure!(global_rel <= tol_rel, "global rel {global_rel} exceeds {tol_rel}");
     println!("OK: flash kernel matches reference within {tol_rel:.1e}.");
+    Ok(())
+}
+
+fn cmd_test_mma_bf16(seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    // A is [16, 16] row-major; B is [16, 8] col-major (so B[k, n] lives at
+    // index n*16 + k in memory).
+    let a_host: Vec<bf16> = (0..16 * 16).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let b_host: Vec<bf16> = (0..16 * 8).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_a: DeviceBuffer<bf16> = DeviceBuffer::new(a_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_b: DeviceBuffer<bf16> = DeviceBuffer::new(b_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(16 * 8).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_a.copy_from_host(&a_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_b.copy_from_host(&b_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    test_mma_bf16(&mut d_out, &d_a, &d_b, Some(&stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let got = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Host reference: D[m, n] = Σ_k A[m, k] * B[k, n] with B stored col-major.
+    let mut want = vec![0.0f32; 16 * 8];
+    for m in 0..16 {
+        for n in 0..8 {
+            let mut acc = 0.0f32;
+            for k in 0..16 {
+                let a = a_host[m * 16 + k].to_f32();
+                let b = b_host[n * 16 + k].to_f32(); // col-major
+                acc += a * b;
+            }
+            want[m * 8 + n] = acc;
+        }
+    }
+
+    // bf16 × bf16 → fp32 accumulator; compare via global rel.
+    let max_abs_ref = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1.0);
+    let max_abs_diff = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let global_rel = max_abs_diff / max_abs_ref;
+
+    println!("=== xenon-cli test-mma-bf16 ===");
+    println!("shape                    D[16,8] = A[16,16] @ B[16,8]");
+    println!("A layout                 row-major bf16");
+    println!("B layout                 col-major bf16");
+    println!("D layout                 row-major fp32");
+    println!("max abs diff             {:.3e}", max_abs_diff);
+    println!("max ref magnitude        {:.3e}", max_abs_ref);
+    println!("global rel diff          {:.3e}", global_rel);
+    // bf16 mantissa is 7 bits; worst-case relative per op ~2^-7 ≈ 8e-3.
+    // With K=16 accumulations in fp32 accum, drift is still dominated by
+    // operand rounding, so 5e-2 is a safe bound.
+    let tol_rel: f32 = 5e-2;
+    anyhow::ensure!(global_rel <= tol_rel,
+        "global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: mma.m16n8k16 bf16 PTX runs on sm_120a and fragment layout matches host reference.");
+    Ok(())
+}
+
+fn cmd_test_attn_flash_tc(
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    window: i32,
+    q_pos_base: Option<i32>,
+    seed: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(h % h_kv == 0, "h must be divisible by h_kv");
+    anyhow::ensure!(d % 16 == 0, "head_dim must be a multiple of 16");
+    anyhow::ensure!(t_q >= 16, "flash-tc requires t_q >= 16 (mma tile)");
+    anyhow::ensure!(t_kv >= t_q, "T_kv must be >= T_q");
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let q_pos_base = q_pos_base.unwrap_or(0);
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let q_host: Vec<bf16> = (0..t_q * h * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let k_host: Vec<bf16> = (0..t_kv * h_kv * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+    let v_host: Vec<bf16> = (0..t_kv * h_kv * d).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new(k_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(v_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_naive: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_tc: DeviceBuffer<bf16> = DeviceBuffer::new(q_host.len()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_q.copy_from_host(&q_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_k.copy_from_host(&k_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_v.copy_from_host(&v_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Ground truth: GPU naive.
+    attn_naive_bf16(
+        &mut d_naive, &d_q, &d_k, &d_v,
+        t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let want = d_naive.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Flash-TC correctness.
+    attn_flash_tc_bf16(
+        &mut d_tc, &d_q, &d_k, &d_v,
+        t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got = d_tc.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (max_abs, _per, global_rel) = compare_bf16(&got, &want);
+
+    // Time both.
+    let iters = 30;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        attn_naive_bf16(
+            &mut d_naive, &d_q, &d_k, &d_v,
+            t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let per_naive_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        attn_flash_tc_bf16(
+            &mut d_tc, &d_q, &d_k, &d_v,
+            t_q, t_kv, h, h_kv, d, scale, q_pos_base, window, Some(&stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let per_tc_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    println!("=== xenon-cli test-attn-flash-tc ===");
+    println!("shape                    T_q={t_q}, T_kv={t_kv}, H={h}, Hkv={h_kv}, D={d}");
+    println!("scale / q_pos_base       {:.6} / {}", scale, q_pos_base);
+    println!("window                   {window}");
+    println!("naive per-launch         {:>7.2} us", per_naive_us);
+    println!("flash-tc per-launch      {:>7.2} us", per_tc_us);
+    println!("naive / flash-tc         {:>7.2}x", per_naive_us / per_tc_us);
+    println!("max abs diff             {:.3e}", max_abs);
+    println!("global rel diff          {:.3e}", global_rel);
+    let tol_rel: f32 = 5e-2;
+    anyhow::ensure!(global_rel <= tol_rel,
+        "flash-tc global rel {global_rel} exceeds {tol_rel}");
+    println!("OK: flash-tc matches naive within {tol_rel:.1e}.");
     Ok(())
 }
 

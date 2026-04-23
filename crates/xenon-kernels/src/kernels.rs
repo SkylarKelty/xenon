@@ -176,6 +176,27 @@ unsafe extern "C" {
         chunk_size: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_test_mma_bf16(
+        d: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn xk_attn_flash_tc_bf16(
+        out: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        t_q: i32,
+        t_kv: i32,
+        h: i32,
+        h_kv: i32,
+        d: i32,
+        scale: f32,
+        q_pos_base: i32,
+        window: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Runs the hello kernel. Proves the Rust -> nvcc -> CUDA runtime link works.
@@ -926,6 +947,73 @@ pub fn attn_split_kv_bf16(
             h as i32, h_kv as i32, d as i32,
             scale, q_pos_base, window,
             chunk_size as i32,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Flash-attention-2 style prefill attention on tensor cores (mma.m16n8k16).
+/// Same signature as `attn_naive_bf16`. BR=16, BC=16 tiling; requires
+/// `D % 16 == 0`. Decode shapes (T_q=1) won't hit the tile minimum — use
+/// `attn_split_kv_bf16` there. See `attn_flash_tc.cu` for the smem layout.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_flash_tc_bf16(
+    out: &mut DeviceBuffer<bf16>,
+    q: &DeviceBuffer<bf16>,
+    k: &DeviceBuffer<bf16>,
+    v: &DeviceBuffer<bf16>,
+    t_q: usize,
+    t_kv: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    scale: f32,
+    q_pos_base: i32,
+    window: i32,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert!(q.len() >= t_q * h * d, "attn_flash_tc: q length");
+    assert!(k.len() >= t_kv * h_kv * d, "attn_flash_tc: k length");
+    assert!(v.len() >= t_kv * h_kv * d, "attn_flash_tc: v length");
+    assert!(out.len() >= t_q * h * d, "attn_flash_tc: out length");
+    assert!(h % h_kv == 0, "attn_flash_tc: h divisible by h_kv");
+    assert!(d % 16 == 0, "attn_flash_tc: d must be a multiple of 16 (mma k-dim)");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_attn_flash_tc_bf16(
+            out.as_device_ptr(),
+            q.as_device_ptr(),
+            k.as_device_ptr(),
+            v.as_device_ptr(),
+            t_q as i32, t_kv as i32,
+            h as i32, h_kv as i32, d as i32,
+            scale, q_pos_base, window, stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Stage-1 validation for the tensor-core attention kernel. Runs a single
+/// `mma.m16n8k16.row.col.f32.bf16.bf16.f32` on A[16,16] (row-major) and
+/// B[16,8] (col-major, i.e. B[k,n] at offset n*16+k) into D[16,8] fp32.
+/// Proves the PTX + sm_120a gencode combo works and that our fragment
+/// gather maps correctly. Only one block × 32 threads.
+pub fn test_mma_bf16(
+    d: &mut DeviceBuffer<f32>,
+    a: &DeviceBuffer<bf16>,
+    b: &DeviceBuffer<bf16>,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(a.len(), 16 * 16, "test_mma_bf16: A must be 16x16");
+    assert_eq!(b.len(), 16 * 8, "test_mma_bf16: B must be 16x8");
+    assert_eq!(d.len(), 16 * 8, "test_mma_bf16: D must be 16x8");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_test_mma_bf16(
+            d.as_device_ptr(),
+            a.as_device_ptr(),
+            b.as_device_ptr(),
             stream_ptr,
         )
     };

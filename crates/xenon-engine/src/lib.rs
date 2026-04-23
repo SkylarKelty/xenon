@@ -11,7 +11,8 @@ use std::path::Path;
 use half::bf16;
 use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
-    add_scale_bf16, attn_naive_bf16, attn_split_kv_auto_chunk_size, attn_split_kv_bf16,
+    add_scale_bf16, attn_flash_tc_bf16, attn_naive_bf16, attn_split_kv_auto_chunk_size,
+    attn_split_kv_bf16,
     cuda::{Device, DeviceBuffer, Stream},
     fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, nvfp4_quantize_bf16,
     per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, scale_bf16, softcap_bf16,
@@ -25,6 +26,13 @@ const DEVICE_SM_COUNT: usize = 26;
 /// GPU, so split-KV's merge-kernel overhead is pure loss. Empirically ~2×
 /// SM count from `test-attn-split-kv` sweep.
 const ATTN_SATURATION_BLOCKS: usize = DEVICE_SM_COUNT * 2;
+/// Flash-tc (mma.m16n8k16) minimum Q rows. Under this we can't build a full
+/// mma tile; dispatch falls back to naive or split-KV.
+const ATTN_FLASH_TC_MIN_TQ: usize = 16;
+/// Flash-tc head-dim ceiling. D > 256 makes per-block smem exceed ~50 KB
+/// and drops occupancy to 1 block/SM, erasing the compute win (measured
+/// D=512 → 0.78×, D=256 → 1.65×). D=512 layers stay on naive.
+const ATTN_FLASH_TC_MAX_D: usize = 256;
 
 // -------------------- Weight containers --------------------
 
@@ -347,7 +355,13 @@ pub fn layer_forward(
                            t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window,
                            chunk_size, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else if t_q >= ATTN_FLASH_TC_MIN_TQ && d <= ATTN_FLASH_TC_MAX_D {
+        // Prefill-shaped, head_dim fits smem budget: use tensor-core flash-tc.
+        attn_flash_tc_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
+                           t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     } else {
+        // D=512 full-attention layers, or odd shapes that don't fit either fast path.
         attn_naive_bf16(&mut d_attn_out, &d_q, kv.k_buf(layer_idx), kv.v_buf(layer_idx),
                          t_q, t_kv, h_heads, h_kv, d, 1.0, q_pos_base, window, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;

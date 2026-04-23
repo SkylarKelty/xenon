@@ -17,7 +17,7 @@ pub use cuda::{device_synchronize, mem_info, CudaError, Device, DeviceBuffer, Pi
 pub use kv_cache::{KvCache, SlotSpec};
 pub use kernels::{
     add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
-    attn_split_kv_auto_chunk_size, attn_split_kv_bf16, embed_gather_bf16, fp4_dequant_bf16,
+    attn_flash_tc_bf16, attn_split_kv_auto_chunk_size, attn_split_kv_bf16, test_mma_bf16, embed_gather_bf16, fp4_dequant_bf16,
     fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16, gelu_tanh_bf16_reference,
     gelu_tanh_glu_bf16, hello, nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16,
     rmsnorm_bf16_reference, rope_bf16, rope_bf16_reference, round_up, scale_bf16, softcap_bf16,
