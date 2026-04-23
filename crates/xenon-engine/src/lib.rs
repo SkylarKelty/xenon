@@ -300,6 +300,148 @@ pub struct ModelShape {
     pub softcap: f32,
 }
 
+/// Pre-allocated per-forward scratch for the batched decode path.
+///
+/// Owned by `Engine` and reused across decode steps so every buffer is a
+/// single permanent allocation. Sized for `max_batch × max_len × largest
+/// head_dim`; smaller requests just use the prefix (kernels accept
+/// `buf.len() >= required`).
+///
+/// **Why this exists:** CUDA graphs cannot capture `cudaMallocAsync` /
+/// `cudaFreeAsync`. Moving all per-step allocations out of the hot path is
+/// a prerequisite for graph capture in `xenon-server`. Without this, every
+/// `forward_step_batched` invocation issued 40+ stream-ordered allocations
+/// (one per scratch buffer × 42 layers); with this, it issues zero.
+///
+/// The CLI (`xenon-cli generate`, `xenon-cli bench`) does not use graphs
+/// per the project decision, but it still benefits from persistent scratch
+/// — same-or-slightly-faster with less allocator pressure.
+pub struct DecodeScratch {
+    pub max_batch: usize,
+    pub max_len: usize,
+    pub shape: ModelShape,
+    /// Max head_dim across all layers (sliding 256, full 512 → 512).
+    pub head_dim_max: usize,
+
+    // --- Top-level (once per forward). ---
+    pub positions: DeviceBuffer<i32>,        // [max_batch]
+    pub h: DeviceBuffer<bf16>,               // [max_batch * hidden]
+    pub raw: DeviceBuffer<bf16>,             // [max_batch * ple_width]
+    pub ctx: DeviceBuffer<bf16>,             // [max_batch * ple_width]
+    pub ctx_normed: DeviceBuffer<bf16>,      // [max_batch * ple_width]
+    pub combined: DeviceBuffer<bf16>,        // [max_batch * ple_width]
+    pub ple_layer: DeviceBuffer<bf16>,       // [max_batch * per_layer]
+    pub normed_all: DeviceBuffer<bf16>,      // [max_batch * hidden]
+    pub logits: DeviceBuffer<bf16>,          // [max_batch * vocab]
+    pub capped: DeviceBuffer<bf16>,          // [max_batch * vocab]
+
+    // --- Per-layer, reused across all n_layers iterations. ---
+    pub residual: DeviceBuffer<bf16>,        // [max_batch * hidden]
+    pub normed: DeviceBuffer<bf16>,          // [max_batch * hidden]
+    pub tmp: DeviceBuffer<bf16>,             // [max_batch * hidden]
+    pub h_clone: DeviceBuffer<bf16>,         // [max_batch * hidden] (for layer_scalar tail)
+    pub q: DeviceBuffer<bf16>,               // [max_batch * h_heads * head_dim_max]
+    pub q_tmp: DeviceBuffer<bf16>,           // clone for q_norm (in-place avoidance)
+    pub k: DeviceBuffer<bf16>,               // [max_batch * h_kv * head_dim_max]
+    pub k_tmp: DeviceBuffer<bf16>,           // clone for k_norm
+    pub v: DeviceBuffer<bf16>,               // [max_batch * h_kv * head_dim_max]
+    pub v_tmp: DeviceBuffer<bf16>,           // clone for v RMSNorm
+    pub attn_out: DeviceBuffer<bf16>,        // [max_batch * h_heads * head_dim_max]
+    pub attn_hidden: DeviceBuffer<bf16>,     // [max_batch * hidden]
+    pub gate_out: DeviceBuffer<bf16>,        // [max_batch * inter]
+    pub up_out: DeviceBuffer<bf16>,          // [max_batch * inter]
+    pub act: DeviceBuffer<bf16>,             // [max_batch * inter]
+    pub mlp_out: DeviceBuffer<bf16>,         // [max_batch * hidden]
+    pub ple_gate_out: DeviceBuffer<bf16>,    // [max_batch * per_layer]
+    pub ple_glu: DeviceBuffer<bf16>,         // [max_batch * per_layer]
+    pub ple_proj_out: DeviceBuffer<bf16>,    // [max_batch * hidden]
+
+    // --- Attention per-slot workspace (reused N times per layer). ---
+    pub q_row: DeviceBuffer<bf16>,           // [h_heads * head_dim_max]
+    pub out_row: DeviceBuffer<bf16>,         // [h_heads * head_dim_max]
+    /// Split-KV partials sized for worst case: t_kv=max_len, chunk=32 (the
+    /// kernel's MIN_CHUNK), so `n_chunks = ceil(max_len / 32)`.
+    pub pmax: DeviceBuffer<f32>,             // [h_heads * n_chunks_max]
+    pub psum: DeviceBuffer<f32>,             // [h_heads * n_chunks_max]
+    pub pnum: DeviceBuffer<f32>,             // [h_heads * n_chunks_max * head_dim_max]
+}
+
+impl DecodeScratch {
+    /// MIN_CHUNK in split-KV attention — keep in sync with
+    /// `attn_split_kv_auto_chunk_size` in xenon-kernels.
+    const ATTN_MIN_CHUNK: usize = 32;
+
+    pub fn new(shape: ModelShape, max_batch: usize, max_len: usize, stream: &Stream)
+        -> anyhow::Result<Self>
+    {
+        // Gemma 4 head_dim is 256 (sliding) or 512 (full) — pick the max so
+        // either layer kind fits. If the model later grows more variants,
+        // caller can pass a larger max via a new constructor.
+        let head_dim_max = 512;
+        let n_chunks_max = max_len.div_ceil(Self::ATTN_MIN_CHUNK);
+        let nb = max_batch;
+        let hidden = shape.hidden;
+        let inter = shape.inter;
+        let vocab = shape.vocab;
+        let per_layer = shape.per_layer;
+        let ple_width = shape.ple_width;
+        let q_heads = shape.h_heads * head_dim_max;
+        let kv_heads = shape.h_kv * head_dim_max;
+
+        let alloc_bf16 = |n: usize| -> anyhow::Result<DeviceBuffer<bf16>> {
+            DeviceBuffer::<bf16>::new_async(n, stream).map_err(|e| anyhow::anyhow!("{e}"))
+        };
+        let alloc_f32 = |n: usize| -> anyhow::Result<DeviceBuffer<f32>> {
+            DeviceBuffer::<f32>::new_async(n, stream).map_err(|e| anyhow::anyhow!("{e}"))
+        };
+        let alloc_i32 = |n: usize| -> anyhow::Result<DeviceBuffer<i32>> {
+            DeviceBuffer::<i32>::new_async(n, stream).map_err(|e| anyhow::anyhow!("{e}"))
+        };
+
+        let s = Self {
+            max_batch, max_len, shape, head_dim_max,
+            positions: alloc_i32(nb)?,
+            h: alloc_bf16(nb * hidden)?,
+            raw: alloc_bf16(nb * ple_width)?,
+            ctx: alloc_bf16(nb * ple_width)?,
+            ctx_normed: alloc_bf16(nb * ple_width)?,
+            combined: alloc_bf16(nb * ple_width)?,
+            ple_layer: alloc_bf16(nb * per_layer)?,
+            normed_all: alloc_bf16(nb * hidden)?,
+            logits: alloc_bf16(nb * vocab)?,
+            capped: alloc_bf16(nb * vocab)?,
+            residual: alloc_bf16(nb * hidden)?,
+            normed: alloc_bf16(nb * hidden)?,
+            tmp: alloc_bf16(nb * hidden)?,
+            h_clone: alloc_bf16(nb * hidden)?,
+            q: alloc_bf16(nb * q_heads)?,
+            q_tmp: alloc_bf16(nb * q_heads)?,
+            k: alloc_bf16(nb * kv_heads)?,
+            k_tmp: alloc_bf16(nb * kv_heads)?,
+            v: alloc_bf16(nb * kv_heads)?,
+            v_tmp: alloc_bf16(nb * kv_heads)?,
+            attn_out: alloc_bf16(nb * q_heads)?,
+            attn_hidden: alloc_bf16(nb * hidden)?,
+            gate_out: alloc_bf16(nb * inter)?,
+            up_out: alloc_bf16(nb * inter)?,
+            act: alloc_bf16(nb * inter)?,
+            mlp_out: alloc_bf16(nb * hidden)?,
+            ple_gate_out: alloc_bf16(nb * per_layer)?,
+            ple_glu: alloc_bf16(nb * per_layer)?,
+            ple_proj_out: alloc_bf16(nb * hidden)?,
+            q_row: alloc_bf16(q_heads)?,
+            out_row: alloc_bf16(q_heads)?,
+            pmax: alloc_f32(shape.h_heads * n_chunks_max)?,
+            psum: alloc_f32(shape.h_heads * n_chunks_max)?,
+            pnum: alloc_f32(shape.h_heads * n_chunks_max * head_dim_max)?,
+        };
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(s)
+    }
+
+    pub fn can_handle(&self, n: usize) -> bool { n <= self.max_batch }
+}
+
 #[derive(Clone, Copy)]
 pub struct LayerMeta {
     pub layer_idx: usize,
@@ -648,21 +790,24 @@ pub fn forward_step_batched(
     top: &TopLevelWeights,
     slots: &mut [BatchSlot],
     new_tokens: &[i32],
+    scratch: &mut DecodeScratch,
     lt: &mut CublasLt,
     stream: &Stream,
     stream_lm: &Stream,
 ) -> anyhow::Result<Vec<Vec<bf16>>> {
     let n = slots.len();
     assert_eq!(new_tokens.len(), n, "new_tokens length must match slots");
+    assert!(scratch.can_handle(n), "DecodeScratch sized for max_batch={}; called with N={}",
+        scratch.max_batch, n);
     let tc = &cfg.text_config;
-    let ModelShape { hidden, inter, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
+    let ModelShape { hidden, inter: _, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
     let _ = stream_lm; // kept for signature compatibility; lm_head is resident.
 
-    // Positions array: one per request row. rope_bf16 already accepts a
-    // positions vector of length `tokens`, one position per row.
+    // Positions array: one per request row.
     let positions_host: Vec<i32> = slots.iter().map(|s| s.cur_pos).collect();
-    let mut d_positions: DeviceBuffer<i32> = DeviceBuffer::new_async(n, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_positions.copy_from_host_bytes_async(bytemuck::cast_slice(&positions_host), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    scratch.positions
+        .copy_from_host_bytes_async(bytemuck::cast_slice(&positions_host), stream)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Input embedding: host-gather N rows of embed_tokens, scale, upload.
     let ie_host = mm.gather_rows_bf16(
@@ -670,8 +815,9 @@ pub fn forward_step_batched(
     let embed_scale = (hidden as f32).sqrt();
     let ie_scaled: Vec<bf16> = ie_host.iter()
         .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
-    let mut d_h: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_h.copy_from_host_bytes_async(bytemuck::cast_slice(&ie_scaled), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    scratch.h
+        .copy_from_host_bytes_async(bytemuck::cast_slice(&ie_scaled), stream)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // PLE assembly across the N-row batch.
     let raw_host = mm.gather_rows_bf16(
@@ -679,25 +825,22 @@ pub fn forward_step_batched(
     let raw_scale = (per_layer as f32).sqrt();
     let raw_scaled: Vec<bf16> = raw_host.iter()
         .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
-    let mut d_raw: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    d_raw.copy_from_host_bytes_async(bytemuck::cast_slice(&raw_scaled), stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    scratch.raw
+        .copy_from_host_bytes_async(bytemuck::cast_slice(&raw_scaled), stream)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_ctx: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ctx_normed: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_combined: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * ple_width, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_ctx, &d_h, &top.per_layer_model_projection, None,
+    lt.linear_bf16(&mut scratch.ctx, &scratch.h, &top.per_layer_model_projection, None,
                     n, ple_width, hidden, (hidden as f32).powf(-0.5), 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    rmsnorm_bf16(&mut d_ctx_normed, &d_ctx, Some(&top.per_layer_projection_norm),
+    rmsnorm_bf16(&mut scratch.ctx_normed, &scratch.ctx, Some(&top.per_layer_projection_norm),
                   n * n_layers, per_layer, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    add_scale_bf16(&mut d_combined, &d_ctx_normed, &d_raw, (0.5f32).sqrt(), Some(stream))
+    add_scale_bf16(&mut scratch.combined, &scratch.ctx_normed, &scratch.raw,
+                   (0.5f32).sqrt(), Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    drop(d_raw); drop(d_ctx); drop(d_ctx_normed);
 
-    let mut d_ple_layer: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     for layer_idx in 0..n_layers {
-        per_layer_slice_bf16(&mut d_ple_layer, &d_combined,
+        per_layer_slice_bf16(&mut scratch.ple_layer, &scratch.combined,
                               n, n_layers, per_layer, layer_idx, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let (rope_theta, rotary_dim) = cfg.rope_for_layer(layer_idx);
@@ -708,10 +851,10 @@ pub fn forward_step_batched(
         };
         layer_forward_batched(&layers[layer_idx], BatchedLayerMeta {
             layer_idx,
-            n, hidden, inter, h_heads, h_kv,
+            n, hidden, inter: shape.inter, h_heads, h_kv,
             head_dim: d_layer, per_layer, eps, window, rope_theta, rotary_dim,
             owns_kv: mm.layer_owns_kv(layer_idx),
-        }, &mut d_h, &d_ple_layer, &d_positions, slots, lt, stream)?;
+        }, scratch, slots, lt, stream)?;
     }
 
     // Bump cur_pos AND advance each slot's KV cache. Missing the advance
@@ -723,20 +866,18 @@ pub fn forward_step_batched(
     }
 
     // Final norm + lm_head + softcap for all N rows.
-    let mut d_normed_all: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    rmsnorm_bf16(&mut d_normed_all, &d_h, Some(&top.norm), n, hidden, eps, Some(stream))
+    rmsnorm_bf16(&mut scratch.normed_all, &scratch.h, Some(&top.norm),
+                  n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_logits: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * vocab, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lt.linear_bf16(&mut d_logits, &d_normed_all, &top.lm_head, None,
+    lt.linear_bf16(&mut scratch.logits, &scratch.normed_all, &top.lm_head, None,
                     n, vocab, hidden, 1.0, 0.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_capped: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * vocab, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    softcap_bf16(&mut d_capped, &d_logits, softcap, Some(stream))
+    softcap_bf16(&mut scratch.capped, &scratch.logits, softcap, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let all = d_capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Capped is sized for max_batch*vocab; only read the first N rows.
+    let all = scratch.capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Split [N, vocab] into N per-request rows.
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         out.push(all[i * vocab .. (i + 1) * vocab].to_vec());
@@ -746,6 +887,7 @@ pub fn forward_step_batched(
 
 /// Per-call meta for batched layer_forward.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct BatchedLayerMeta {
     layer_idx: usize,
     n: usize,
@@ -765,70 +907,65 @@ struct BatchedLayerMeta {
 fn layer_forward_batched(
     lw: &LayerWeights,
     meta: BatchedLayerMeta,
-    h: &mut DeviceBuffer<bf16>,
-    ple_layer: &DeviceBuffer<bf16>,
-    positions: &DeviceBuffer<i32>,
+    scratch: &mut DecodeScratch,
     slots: &mut [BatchSlot],
     lt: &mut CublasLt,
     stream: &Stream,
 ) -> anyhow::Result<()> {
     let BatchedLayerMeta {
-        layer_idx, n, hidden, inter, h_heads, h_kv, head_dim: d, per_layer,
+        layer_idx, n, hidden, inter: _, h_heads, h_kv, head_dim: d, per_layer: _,
         eps, window, rope_theta, rotary_dim, owns_kv,
     } = meta;
 
-    let mut d_residual: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_normed:   DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_tmp:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Attention block.
-    d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
-    rmsnorm_bf16(&mut d_normed, h, Some(&lw.input_layernorm), n, hidden, eps, Some(stream))
+    // Attention block: residual ← h, normed ← rmsnorm(h).
+    scratch.residual.copy_from_device(&scratch.h)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut scratch.normed, &scratch.h, Some(&lw.input_layernorm),
+                  n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_q: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.q_proj.forward(lt, &mut d_q, &d_normed, n, stream)?;
-    {
-        let q_tmp = clone_buffer_async(&d_q, stream)?;
-        rmsnorm_bf16(&mut d_q, &q_tmp, Some(&lw.q_norm), n * h_heads, d, eps, Some(stream))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    rope_bf16(&mut d_q, positions, n, h_heads, d, rotary_dim, rope_theta, Some(stream))
+    lw.q_proj.forward(lt, &mut scratch.q, &scratch.normed, n, stream)?;
+    scratch.q_tmp.copy_from_device(&scratch.q)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut scratch.q, &scratch.q_tmp, Some(&lw.q_norm),
+                  n * h_heads, d, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rope_bf16(&mut scratch.q, &scratch.positions, n, h_heads, d, rotary_dim, rope_theta, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if owns_kv {
         let kl = lw.k_proj.as_ref().expect("owner layer missing k_proj");
         let vl = lw.v_proj.as_ref().expect("owner layer missing v_proj");
         let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
-        let mut d_k: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_kv * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        kl.forward(lt, &mut d_k, &d_normed, n, stream)?;
-        vl.forward(lt, &mut d_v, &d_normed, n, stream)?;
-        {
-            let k_tmp = clone_buffer_async(&d_k, stream)?;
-            rmsnorm_bf16(&mut d_k, &k_tmp, Some(knw), n * h_kv, d, eps, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let v_tmp = clone_buffer_async(&d_v, stream)?;
-            rmsnorm_bf16(&mut d_v, &v_tmp, None, n * h_kv, d, eps, Some(stream))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        rope_bf16(&mut d_k, positions, n, h_kv, d, rotary_dim, rope_theta, Some(stream))
+        kl.forward(lt, &mut scratch.k, &scratch.normed, n, stream)?;
+        vl.forward(lt, &mut scratch.v, &scratch.normed, n, stream)?;
+        scratch.k_tmp.copy_from_device(&scratch.k).map_err(|e| anyhow::anyhow!("{e}"))?;
+        rmsnorm_bf16(&mut scratch.k, &scratch.k_tmp, Some(knw),
+                      n * h_kv, d, eps, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Scatter each row into its slot's KV cache.
+        scratch.v_tmp.copy_from_device(&scratch.v).map_err(|e| anyhow::anyhow!("{e}"))?;
+        rmsnorm_bf16(&mut scratch.v, &scratch.v_tmp, None,
+                      n * h_kv, d, eps, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        rope_bf16(&mut scratch.k, &scratch.positions, n, h_kv, d, rotary_dim, rope_theta, Some(stream))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Append each slot's row into its own KV cache, reading directly
+        // from the batched k/v buffers via the new append_from_offset path
+        // (no per-slot scratch alloc needed).
         let row_kv = h_kv * d;
         for i in 0..n {
-            let mut d_k_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_kv, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut d_v_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_kv, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-            d_k_row.copy_region_from_device(0, &d_k, i * row_kv, row_kv).map_err(|e| anyhow::anyhow!("{e}"))?;
-            d_v_row.copy_region_from_device(0, &d_v, i * row_kv, row_kv).map_err(|e| anyhow::anyhow!("{e}"))?;
-            slots[i].kv_cache.append(layer_idx, &d_k_row, &d_v_row, 1)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            slots[i].kv_cache.append_from_offset(
+                layer_idx,
+                &scratch.k, i * row_kv,
+                &scratch.v, i * row_kv,
+                1,
+            ).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
     }
 
-    // Per-request attention (kv_len varies per slot, so we loop). GEMMs
-    // elsewhere remain batched at M=N.
-    let mut d_attn_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * h_heads * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Per-request attention (kv_len varies per slot, so we loop). The q_row,
+    // out_row, and split-KV partials buffers are all in scratch and reused
+    // for each slot i.
     let row_q = h_heads * d;
     for i in 0..n {
         // At this point we've appended 1 token but not advanced cur_len yet.
@@ -837,66 +974,62 @@ fn layer_forward_batched(
         // the new token is included.
         let t_kv_i = slots[i].cur_pos as usize + 1;
         let q_pos_i = slots[i].cur_pos;
-        let mut d_q_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_q, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut d_out_row: DeviceBuffer<bf16> = DeviceBuffer::new_async(row_q, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        d_q_row.copy_region_from_device(0, &d_q, i * row_q, row_q).map_err(|e| anyhow::anyhow!("{e}"))?;
+        scratch.q_row.copy_region_from_device(0, &scratch.q, i * row_q, row_q)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         // Per-slot t_q=1; always split-KV territory (h_heads × 1 < ATTN_SATURATION_BLOCKS).
         let chunk_size = attn_split_kv_auto_chunk_size(1, t_kv_i, h_heads, DEVICE_SM_COUNT);
-        let n_chunks = t_kv_i.div_ceil(chunk_size);
-        let partials_len = h_heads * n_chunks;
-        let mut d_pmax: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut d_psum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut d_pnum: DeviceBuffer<f32> = DeviceBuffer::new_async(partials_len * d, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-        attn_split_kv_bf16(&mut d_out_row, &mut d_pmax, &mut d_psum, &mut d_pnum,
-                           &d_q_row,
-                           slots[i].kv_cache.k_buf(layer_idx),
-                           slots[i].kv_cache.v_buf(layer_idx),
-                           1, t_kv_i, h_heads, h_kv, d, 1.0, q_pos_i, window,
-                           chunk_size, Some(stream))
+        attn_split_kv_bf16(
+            &mut scratch.out_row, &mut scratch.pmax, &mut scratch.psum, &mut scratch.pnum,
+            &scratch.q_row,
+            slots[i].kv_cache.k_buf(layer_idx),
+            slots[i].kv_cache.v_buf(layer_idx),
+            1, t_kv_i, h_heads, h_kv, d, 1.0, q_pos_i, window,
+            chunk_size, Some(stream),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        scratch.attn_out.copy_slice_from_device(i * row_q, &scratch.out_row)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Scatter result back into d_attn_out[i].
-        d_attn_out.copy_slice_from_device(i * row_q, &d_out_row).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    let mut d_attn_hidden: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.o_proj.forward(lt, &mut d_attn_hidden, &d_attn_out, n, stream)?;
-    rmsnorm_bf16(&mut d_tmp, &d_attn_hidden, Some(&lw.post_attention_layernorm),
+    lw.o_proj.forward(lt, &mut scratch.attn_hidden, &scratch.attn_out, n, stream)?;
+    rmsnorm_bf16(&mut scratch.tmp, &scratch.attn_hidden, Some(&lw.post_attention_layernorm),
                   n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream))
+    add_scale_bf16(&mut scratch.h, &scratch.residual, &scratch.tmp, 1.0, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // MLP block — all batched at M=N.
-    d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
-    rmsnorm_bf16(&mut d_normed, h, Some(&lw.pre_feedforward_layernorm),
+    // MLP block.
+    scratch.residual.copy_from_device(&scratch.h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    rmsnorm_bf16(&mut scratch.normed, &scratch.h, Some(&lw.pre_feedforward_layernorm),
                   n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lw.gate_proj.forward(lt, &mut scratch.gate_out, &scratch.normed, n, stream)?;
+    lw.up_proj.forward(lt, &mut scratch.up_out, &scratch.normed, n, stream)?;
+    gelu_tanh_glu_bf16(&mut scratch.act, &scratch.gate_out, &scratch.up_out, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lw.down_proj.forward(lt, &mut scratch.mlp_out, &scratch.act, n, stream)?;
+    rmsnorm_bf16(&mut scratch.tmp, &scratch.mlp_out, Some(&lw.post_feedforward_layernorm),
+                  n, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(&mut scratch.h, &scratch.residual, &scratch.tmp, 1.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut d_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_up_out:   DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_act:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * inter, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_mlp_out:  DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.gate_proj.forward(lt, &mut d_gate_out, &d_normed, n, stream)?;
-    lw.up_proj.forward(lt, &mut d_up_out, &d_normed, n, stream)?;
-    gelu_tanh_glu_bf16(&mut d_act, &d_gate_out, &d_up_out, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.down_proj.forward(lt, &mut d_mlp_out, &d_act, n, stream)?;
-    rmsnorm_bf16(&mut d_tmp, &d_mlp_out, Some(&lw.post_feedforward_layernorm), n, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // PLE block.
+    scratch.residual.copy_from_device(&scratch.h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    lw.per_layer_input_gate.forward(lt, &mut scratch.ple_gate_out, &scratch.h, n, stream)?;
+    gelu_tanh_glu_bf16(&mut scratch.ple_glu, &scratch.ple_gate_out, &scratch.ple_layer, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lw.per_layer_projection.forward(lt, &mut scratch.ple_proj_out, &scratch.ple_glu, n, stream)?;
+    rmsnorm_bf16(&mut scratch.tmp, &scratch.ple_proj_out, Some(&lw.post_per_layer_input_norm),
+                  n, hidden, eps, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    add_scale_bf16(&mut scratch.h, &scratch.residual, &scratch.tmp, 1.0, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // PLE block — batched.
-    d_residual.copy_from_device(h).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ple_gate_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ple_glu:      DeviceBuffer<bf16> = DeviceBuffer::new_async(n * per_layer, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d_ple_proj_out: DeviceBuffer<bf16> = DeviceBuffer::new_async(n * hidden, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.per_layer_input_gate.forward(lt, &mut d_ple_gate_out, h, n, stream)?;
-    gelu_tanh_glu_bf16(&mut d_ple_glu, &d_ple_gate_out, ple_layer, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    lw.per_layer_projection.forward(lt, &mut d_ple_proj_out, &d_ple_glu, n, stream)?;
-    rmsnorm_bf16(&mut d_tmp, &d_ple_proj_out, Some(&lw.post_per_layer_input_norm), n, hidden, eps, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    add_scale_bf16(h, &d_residual, &d_tmp, 1.0, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // layer_scalar tail multiply (applies to all N rows equally).
-    let h_in = clone_buffer_async(h, stream)?;
-    scale_bf16(h, &h_in, lw.layer_scalar, Some(stream)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // layer_scalar tail multiply (applies to all N rows equally). Clone via
+    // the persistent h_clone buffer to avoid the in-place aliasing.
+    scratch.h_clone.copy_from_device(&scratch.h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    scale_bf16(&mut scratch.h, &scratch.h_clone, lw.layer_scalar, Some(stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
@@ -1078,6 +1211,10 @@ pub struct Engine {
     pub stream_lm: Stream,
     /// Reusable device-side top-K sampler (non-greedy path only).
     pub sampler: Sampler,
+    /// Pre-allocated scratch for `forward_step_batched`. Lazy-inited on the
+    /// first `generate_batch` call sized to the observed batch size; cached
+    /// and reused as long as subsequent calls fit inside `max_batch`.
+    pub decode_scratch: Option<DecodeScratch>,
     /// Absolute position of the next token to be fed. Advances as KV is filled.
     pub cur_pos: i32,
     pub max_len: usize,
@@ -1177,7 +1314,10 @@ impl Engine {
         let kv = build_kv_cache(&mm, &cfg, max_len)?;
         let sampler = Sampler::new(shape.vocab, &stream)?;
 
-        Ok(Self { cfg, shape, mm, tokenizer, layers, top, kv, lt, stream, stream_lm, sampler, cur_pos: 0, max_len })
+        Ok(Self {
+            cfg, shape, mm, tokenizer, layers, top, kv, lt, stream, stream_lm,
+            sampler, decode_scratch: None, cur_pos: 0, max_len,
+        })
     }
 
     /// Reset KV cache + position tracking for a new request.
@@ -1284,6 +1424,18 @@ impl Engine {
         let mut last_tokens: Vec<i32> = vec![0; n];
         let mut done: Vec<bool> = vec![false; n];
 
+        // Lazy-init the persistent decode scratch. If an earlier call sized
+        // it for a smaller batch than this one, reallocate to cover the
+        // larger request set. The scratch is reused across subsequent calls
+        // whose batch fits.
+        let need_realloc = self.decode_scratch
+            .as_ref()
+            .map_or(true, |s| !s.can_handle(n));
+        if need_realloc {
+            self.decode_scratch = Some(DecodeScratch::new(
+                self.shape, n, self.max_len, &self.stream)?);
+        }
+
         // --- Serial prefill ---
         for i in 0..n {
             let prompt_i32: Vec<i32> = requests[i].prompt_ids.iter().map(|&x| x as i32).collect();
@@ -1323,9 +1475,12 @@ impl Engine {
             if done.iter().all(|&d| d) { break; }
 
             let t_step = Instant::now();
+            let scratch = self.decode_scratch.as_mut()
+                .expect("decode_scratch lazy-init above");
             let logits_per_req = forward_step_batched(
                 &self.mm, &self.cfg, self.shape,
                 &self.layers, &self.top, &mut slots, &last_tokens,
+                scratch,
                 &mut self.lt, &self.stream, &self.stream_lm,
             )?;
             let ms = t_step.elapsed().as_secs_f64() * 1e3;

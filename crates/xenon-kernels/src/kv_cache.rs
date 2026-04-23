@@ -111,6 +111,36 @@ impl KvCache {
         Ok(())
     }
 
+    /// Append `n_tokens` worth of K/V starting at the given element offsets
+    /// into `new_k` / `new_v`. Avoids needing per-slot row scratch buffers
+    /// when the caller already has a batched `[N, h_kv, head_dim]` buffer
+    /// and wants to append row `i` of it to slot `i`'s KV cache.
+    pub fn append_from_offset(
+        &mut self,
+        layer: usize,
+        new_k: &DeviceBuffer<bf16>,
+        k_src_offset: usize,
+        new_v: &DeviceBuffer<bf16>,
+        v_src_offset: usize,
+        n_tokens: usize,
+    ) -> Result<(), CudaError> {
+        let spec = self.slot_spec(layer);
+        let row_elts = spec.h_kv * spec.head_dim;
+        let n_elts = n_tokens * row_elts;
+        assert!(new_k.len() >= k_src_offset + n_elts, "append_from_offset: new_k too short");
+        assert!(new_v.len() >= v_src_offset + n_elts, "append_from_offset: new_v too short");
+        assert!(
+            self.cur_len + n_tokens <= self.max_len,
+            "append_from_offset: overflows max_len (cur {}, add {}, max {})",
+            self.cur_len, n_tokens, self.max_len
+        );
+        let slot = self.slot_for(layer);
+        let dst_offset = self.cur_len * row_elts;
+        self.k[slot].copy_region_from_device(dst_offset, new_k, k_src_offset, n_elts)?;
+        self.v[slot].copy_region_from_device(dst_offset, new_v, v_src_offset, n_elts)?;
+        Ok(())
+    }
+
     /// Mark that `n_tokens` positions have been consumed across all layers.
     /// Caller invokes this exactly once after processing a batch of tokens.
     pub fn advance(&mut self, n_tokens: usize) {
