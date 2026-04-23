@@ -365,11 +365,22 @@ prefill time at short prompts.
       (try `cp.async` prefetch of the next weight tile), or warp-issue-bound
       (tune thread count / LUT in registers). Even a 20% improvement on
       this kernel is ~10% decode tok/s.
-- [ ] **Revisit CUDA Graphs.** Phase 5 rejected at 189 ms/step when launch
-      overhead was <1% of wall time. Now decode is 17.8 ms and launch
-      overhead is 8% (1.4 ms/step across 900+ launches). The persistent-
-      scratch prereq already landed; graph capture on the steady-state
-      decode loop could recover most of that — expected 5–8% decode win.
+- [x] **CUDA Graphs revisited (2026-04-23).** Captured the decode step on
+      `self.stream` with `CAPTURE_MODE_RELAXED`. Prerequisites: persistent
+      `DecodeScratch` (eliminates per-step `cudaMallocAsync`), device-
+      resident KV `cur_len` + graph-capturable attention (`attn_split_kv_bf16_device`
+      reads `cur_pos` via pointer), pinned-memory host sources for all H2D
+      uploads (pageable memory triggers hidden default-stream sync during
+      capture), async D2D copies (sync `cudaMemcpy` trips error 906).
+      A/B on `bench-batch --batch 1`: eager 64.5 tok/s vs graphs 64.7 tok/s —
+      **~0.4% win, much smaller than the 5-8% projection.** The bigger win
+      (59.3 → 64.5 tok/s ≈ 8%) came from `DecodeScratch` eliminating
+      `cudaMallocAsync` per step, not from graph capture itself. At
+      17 ms/step with ~900 launches, host-side kernel submission already
+      pipelines well with GPU execution. See `project_xenon_cuda_graphs_scope`
+      memory. Graph capture stays in (minor win, infrastructure already
+      landed); real decode wins still come from `xk_fp4_gemv` tuning.
+
 - [ ] **Lower the native NVFP4 threshold for prefill (M ∈ [32, 127]).**
       cuBLASLt fails silently < 128; but for M in [32, 127] a hand-written
       NVFP4 tensor-core kernel would avoid the dequant→bf16 round-trip that

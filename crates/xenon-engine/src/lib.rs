@@ -15,8 +15,8 @@ use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
     add_scale_bf16, attn_flash_tc_bf16, attn_naive_bf16, attn_split_kv_auto_chunk_size,
     attn_split_kv_bf16, attn_split_kv_bf16_device,
-    cuda::{Device, DeviceBuffer, Stream},
-    fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, nvfp4_quantize_bf16,
+    cuda::{Device, DeviceBuffer, GraphExec, PinnedBuffer, Stream, CAPTURE_MODE_RELAXED},
+    fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, inc_i32_device, nvfp4_quantize_bf16,
     per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, sample_topk_bf16, scale_bf16,
     softcap_bf16, swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
 };
@@ -364,6 +364,19 @@ pub struct DecodeScratch {
     pub pmax: DeviceBuffer<f32>,             // [h_heads * n_chunks_max]
     pub psum: DeviceBuffer<f32>,             // [h_heads * n_chunks_max]
     pub pnum: DeviceBuffer<f32>,             // [h_heads * n_chunks_max * head_dim_max]
+
+    // --- Stable host-side source/dest buffers for the H2D / D2H memcpy
+    // nodes in the captured decode graph. `PinnedBuffer` (cudaMallocHost)
+    // is required here: CUDA graph capture of `cudaMemcpyAsync` only
+    // works truly asynchronously when the host side is pinned; pageable
+    // host memory triggers a hidden stream sync during capture that
+    // defeats graph replay (values get frozen at capture time instead of
+    // being re-read at each replay). Non-pinned `Vec<T>` appeared to work
+    // in eager mode but produced stuck/repeating outputs under graphs.
+    pub positions_host: PinnedBuffer<i32>,   // [max_batch]
+    pub h_host: PinnedBuffer<bf16>,          // [max_batch * hidden]
+    pub raw_host: PinnedBuffer<bf16>,        // [max_batch * ple_width]
+    pub capped_host: PinnedBuffer<bf16>,     // [max_batch * vocab] (logits readback)
 }
 
 impl DecodeScratch {
@@ -437,6 +450,14 @@ impl DecodeScratch {
             pmax: alloc_f32(shape.h_heads * n_chunks_max)?,
             psum: alloc_f32(shape.h_heads * n_chunks_max)?,
             pnum: alloc_f32(shape.h_heads * n_chunks_max * head_dim_max)?,
+            positions_host: PinnedBuffer::<i32>::new(nb)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            h_host: PinnedBuffer::<bf16>::new(nb * hidden)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            raw_host: PinnedBuffer::<bf16>::new(nb * ple_width)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            capped_host: PinnedBuffer::<bf16>::new(nb * vocab)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
         };
         stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(s)
@@ -785,6 +806,70 @@ impl BatchSlot {
 ///
 /// Returns `Vec<Vec<bf16>>` of length N, each inner vec is `[vocab]` softcap
 /// logits — caller picks next tokens independently per request.
+/// Populate the stable host-side source buffers in `scratch` for one
+/// decode step. Runs purely on the CPU: reads positions from `slots`,
+/// gathers + scales embed_tokens and embed_tokens_per_layer rows for
+/// `new_tokens` from the mmapped safetensors, writes everything in place
+/// into `scratch.positions_host` / `scratch.h_host` / `scratch.raw_host`.
+///
+/// Call this before every invocation of `forward_step_batched` — both
+/// the first-step capture and every subsequent replay. The device-side
+/// H2D memcpy nodes in the captured graph read from these fixed addresses
+/// at replay time, so the captured graph picks up whatever contents this
+/// function most recently wrote.
+pub fn prepare_batched_inputs(
+    mm: &MmapWeights,
+    shape: ModelShape,
+    scratch: &mut DecodeScratch,
+    slots: &[BatchSlot],
+    new_tokens: &[i32],
+) -> anyhow::Result<()> {
+    let n = slots.len();
+    assert_eq!(new_tokens.len(), n, "new_tokens length must match slots");
+    assert!(scratch.can_handle(n));
+    let ModelShape { hidden, per_layer, ple_width, .. } = shape;
+
+    {
+        let pos = scratch.positions_host.as_mut_slice();
+        for (i, s) in slots.iter().enumerate() {
+            pos[i] = s.cur_pos;
+        }
+    }
+
+    let ie_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens.weight", new_tokens, hidden)?;
+    let embed_scale = (hidden as f32).sqrt();
+    {
+        let h = scratch.h_host.as_mut_slice();
+        for (dst, src) in h[..n * hidden].iter_mut().zip(ie_host.iter()) {
+            *dst = bf16::from_f32(src.to_f32() * embed_scale);
+        }
+    }
+
+    let raw_host = mm.gather_rows_bf16(
+        "model.language_model.embed_tokens_per_layer.weight", new_tokens, ple_width)?;
+    let raw_scale = (per_layer as f32).sqrt();
+    {
+        let raw = scratch.raw_host.as_mut_slice();
+        for (dst, src) in raw[..n * ple_width].iter_mut().zip(raw_host.iter()) {
+            *dst = bf16::from_f32(src.to_f32() * raw_scale);
+        }
+    }
+    Ok(())
+}
+
+/// Issue the CUDA ops for one batched decode step onto `stream`. Safe to
+/// call inside a `cudaStreamBeginCapture` region — no `stream.synchronize()`,
+/// no synchronous memcpy, no device allocations. Caller must:
+/// 1. Have run `prepare_batched_inputs` first this step (populates the
+///    host source buffers).
+/// 2. `stream.synchronize()` after this returns (or after launching the
+///    captured graph) before reading `scratch.capped_host`.
+///
+/// Also, each slot's host-side `cur_pos` is **not** touched here — the
+/// device counter advances via `kv_cache.advance_device` (captured), but
+/// the host mirror must be bumped by the caller between steps for
+/// `prepare_batched_inputs` to emit the right positions next time.
 pub fn forward_step_batched(
     mm: &MmapWeights,
     cfg: &GemmaConfig,
@@ -792,44 +877,29 @@ pub fn forward_step_batched(
     layers: &[LayerWeights],
     top: &TopLevelWeights,
     slots: &mut [BatchSlot],
-    new_tokens: &[i32],
     scratch: &mut DecodeScratch,
     lt: &mut CublasLt,
     stream: &Stream,
     stream_lm: &Stream,
-) -> anyhow::Result<Vec<Vec<bf16>>> {
+) -> anyhow::Result<()> {
     let n = slots.len();
-    assert_eq!(new_tokens.len(), n, "new_tokens length must match slots");
     assert!(scratch.can_handle(n), "DecodeScratch sized for max_batch={}; called with N={}",
         scratch.max_batch, n);
     let tc = &cfg.text_config;
     let ModelShape { hidden, inter: _, vocab, h_heads, h_kv, per_layer, n_layers, ple_width, eps, softcap } = shape;
-    let _ = stream_lm; // kept for signature compatibility; lm_head is resident.
+    let _ = stream_lm;
 
-    // Positions array: one per request row.
-    let positions_host: Vec<i32> = slots.iter().map(|s| s.cur_pos).collect();
+    // H2D uploads from the stable host buffers populated by
+    // `prepare_batched_inputs`. These memcpy nodes are captured into the
+    // decode graph; at replay time they read the then-current contents.
     scratch.positions
-        .copy_from_host_bytes_async(bytemuck::cast_slice(&positions_host), stream)
+        .copy_from_host_bytes_async(scratch.positions_host.as_bytes(), stream)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Input embedding: host-gather N rows of embed_tokens, scale, upload.
-    let ie_host = mm.gather_rows_bf16(
-        "model.language_model.embed_tokens.weight", new_tokens, hidden)?;
-    let embed_scale = (hidden as f32).sqrt();
-    let ie_scaled: Vec<bf16> = ie_host.iter()
-        .map(|v| bf16::from_f32(v.to_f32() * embed_scale)).collect();
     scratch.h
-        .copy_from_host_bytes_async(bytemuck::cast_slice(&ie_scaled), stream)
+        .copy_from_host_bytes_async(scratch.h_host.as_bytes(), stream)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // PLE assembly across the N-row batch.
-    let raw_host = mm.gather_rows_bf16(
-        "model.language_model.embed_tokens_per_layer.weight", new_tokens, ple_width)?;
-    let raw_scale = (per_layer as f32).sqrt();
-    let raw_scaled: Vec<bf16> = raw_host.iter()
-        .map(|v| bf16::from_f32(v.to_f32() * raw_scale)).collect();
     scratch.raw
-        .copy_from_host_bytes_async(bytemuck::cast_slice(&raw_scaled), stream)
+        .copy_from_host_bytes_async(scratch.raw_host.as_bytes(), stream)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     lt.linear_bf16(&mut scratch.ctx, &scratch.h, &top.per_layer_model_projection, None,
@@ -860,18 +930,13 @@ pub fn forward_step_batched(
         }, scratch, slots, lt, stream)?;
     }
 
-    // Bump cur_pos AND advance each slot's KV cache. `advance_device` bumps
-    // both the host-side `cur_len` and the device-resident `cur_len_dev`
-    // via a kernel, so the captured graph picks up the new offset on each
-    // replay. Missing the advance would leave cur_len at 0 and every
-    // subsequent append would rewrite the same physical slot.
+    // Advance each slot's device counter via a kernel (captured). Host
+    // counter is NOT touched here — caller handles host-side bookkeeping.
     for s in slots.iter_mut() {
-        s.cur_pos += 1;
-        s.kv_cache.advance_device(1, stream)
+        inc_i32_device(&mut s.kv_cache.cur_len_dev, 1, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    // Final norm + lm_head + softcap for all N rows.
     rmsnorm_bf16(&mut scratch.normed_all, &scratch.h, Some(&top.norm),
                   n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -880,15 +945,26 @@ pub fn forward_step_batched(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     softcap_bf16(&mut scratch.capped, &scratch.logits, softcap, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
-    // Capped is sized for max_batch*vocab; only read the first N rows.
-    let all = scratch.capped.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Async D2H of the capped logits into scratch.capped_host (stable
+    // buffer). Caller must sync the stream before reading capped_host.
+    scratch.capped
+        .copy_to_host_async(scratch.capped_host.as_mut_slice(), stream)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Slice the logits D2H'd into `scratch.capped_host` into N per-request
+/// `[vocab]` rows. Caller must have synced the stream after
+/// `forward_step_batched` (or after launching the captured graph).
+pub fn split_batched_logits(scratch: &DecodeScratch, n: usize) -> Vec<Vec<bf16>> {
+    let vocab = scratch.shape.vocab;
+    let buf = scratch.capped_host.as_slice();
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        out.push(all[i * vocab .. (i + 1) * vocab].to_vec());
+        out.push(buf[i * vocab .. (i + 1) * vocab].to_vec());
     }
-    Ok(out)
+    out
 }
 
 /// Per-call meta for batched layer_forward.
@@ -923,15 +999,18 @@ fn layer_forward_batched(
         eps, window, rope_theta, rotary_dim, owns_kv,
     } = meta;
 
-    // Attention block: residual ← h, normed ← rmsnorm(h).
-    scratch.residual.copy_from_device(&scratch.h)
+    // Attention block: residual ← h, normed ← rmsnorm(h). All D2D uses
+    // the async variant so this function is safe to call inside a CUDA
+    // graph-capture region (the sync `cudaMemcpy` runs on the legacy
+    // default stream and would trip `cudaErrorStreamCaptureIsolation`).
+    scratch.residual.copy_from_device_async(&scratch.h, stream)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut scratch.normed, &scratch.h, Some(&lw.input_layernorm),
                   n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     lw.q_proj.forward(lt, &mut scratch.q, &scratch.normed, n, stream)?;
-    scratch.q_tmp.copy_from_device(&scratch.q)
+    scratch.q_tmp.copy_from_device_async(&scratch.q, stream)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut scratch.q, &scratch.q_tmp, Some(&lw.q_norm),
                   n * h_heads, d, eps, Some(stream))
@@ -945,11 +1024,13 @@ fn layer_forward_batched(
         let knw = lw.k_norm.as_ref().expect("owner layer missing k_norm");
         kl.forward(lt, &mut scratch.k, &scratch.normed, n, stream)?;
         vl.forward(lt, &mut scratch.v, &scratch.normed, n, stream)?;
-        scratch.k_tmp.copy_from_device(&scratch.k).map_err(|e| anyhow::anyhow!("{e}"))?;
+        scratch.k_tmp.copy_from_device_async(&scratch.k, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         rmsnorm_bf16(&mut scratch.k, &scratch.k_tmp, Some(knw),
                       n * h_kv, d, eps, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        scratch.v_tmp.copy_from_device(&scratch.v).map_err(|e| anyhow::anyhow!("{e}"))?;
+        scratch.v_tmp.copy_from_device_async(&scratch.v, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         rmsnorm_bf16(&mut scratch.v, &scratch.v_tmp, None,
                       n * h_kv, d, eps, Some(stream))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -978,7 +1059,7 @@ fn layer_forward_batched(
     let chunk_size = DecodeScratch::ATTN_MIN_CHUNK;
     let n_chunks_fixed = scratch.max_len.div_ceil(chunk_size);
     for i in 0..n {
-        scratch.q_row.copy_region_from_device(0, &scratch.q, i * row_q, row_q)
+        scratch.q_row.copy_region_from_device_async(0, &scratch.q, i * row_q, row_q, stream)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         attn_split_kv_bf16_device(
             &mut scratch.out_row, &mut scratch.pmax, &mut scratch.psum, &mut scratch.pnum,
@@ -990,7 +1071,7 @@ fn layer_forward_batched(
             h_heads, h_kv, d, 1.0, window,
             chunk_size, n_chunks_fixed, Some(stream),
         ).map_err(|e| anyhow::anyhow!("{e}"))?;
-        scratch.attn_out.copy_slice_from_device(i * row_q, &scratch.out_row)
+        scratch.attn_out.copy_slice_from_device_async(i * row_q, &scratch.out_row, stream)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
@@ -1002,7 +1083,7 @@ fn layer_forward_batched(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // MLP block.
-    scratch.residual.copy_from_device(&scratch.h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    scratch.residual.copy_from_device_async(&scratch.h, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     rmsnorm_bf16(&mut scratch.normed, &scratch.h, Some(&lw.pre_feedforward_layernorm),
                   n, hidden, eps, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1018,7 +1099,7 @@ fn layer_forward_batched(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // PLE block.
-    scratch.residual.copy_from_device(&scratch.h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    scratch.residual.copy_from_device_async(&scratch.h, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     lw.per_layer_input_gate.forward(lt, &mut scratch.ple_gate_out, &scratch.h, n, stream)?;
     gelu_tanh_glu_bf16(&mut scratch.ple_glu, &scratch.ple_gate_out, &scratch.ple_layer, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1031,7 +1112,7 @@ fn layer_forward_batched(
 
     // layer_scalar tail multiply (applies to all N rows equally). Clone via
     // the persistent h_clone buffer to avoid the in-place aliasing.
-    scratch.h_clone.copy_from_device(&scratch.h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    scratch.h_clone.copy_from_device_async(&scratch.h, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     scale_bf16(&mut scratch.h, &scratch.h_clone, lw.layer_scalar, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
@@ -1469,9 +1550,21 @@ impl Engine {
         }
 
         // --- Batched decode ---
+        //
+        // CUDA-graph capture: on the first decode step, we wrap
+        // `forward_step_batched` in `begin_capture` / `end_capture`,
+        // instantiate the graph, and use `GraphExec::launch` for every
+        // step (including the first). Host state (positions, new-token
+        // embed scaling, per-slot cur_pos) is updated between launches;
+        // the captured H2D memcpy nodes pick up the fresh contents via
+        // the stable scratch host buffers. The graph instance lives for
+        // the duration of this `generate_batch` call and is dropped at
+        // the end — KV cache pointers change per request so cross-call
+        // reuse would require a separate pooling pass.
+        let mut decode_graph: Option<GraphExec> = None;
+        let graphs_disabled = std::env::var("XENON_DISABLE_GRAPHS").is_ok();
         let max_max_new = requests.iter().map(|r| r.max_new).max().unwrap_or(0);
         for step in 0..max_max_new {
-            // Check which requests finished since the last step.
             for i in 0..n {
                 if done[i] { continue; }
                 let gen_len = results[i].generated.len();
@@ -1486,15 +1579,63 @@ impl Engine {
             if done.iter().all(|&d| d) { break; }
 
             let t_step = Instant::now();
-            let scratch = self.decode_scratch.as_mut()
-                .expect("decode_scratch lazy-init above");
-            let logits_per_req = forward_step_batched(
-                &self.mm, &self.cfg, self.shape,
-                &self.layers, &self.top, &mut slots, &last_tokens,
-                scratch,
-                &mut self.lt, &self.stream, &self.stream_lm,
-            )?;
+
+            // Host prep: populate scratch's stable input buffers for this step.
+            {
+                let scratch = self.decode_scratch.as_mut()
+                    .expect("decode_scratch lazy-init above");
+                prepare_batched_inputs(&self.mm, self.shape, scratch, &slots, &last_tokens)?;
+            }
+
+            // Capture on blocking self.stream with PinnedBuffer host sources.
+            // Step 0 eager warms cuBLASLt's algo cache. Step 1 captures.
+            // Steps 2+ replay.
+            // `XENON_DISABLE_GRAPHS=1` forces eager every step for A/B
+            // benching; the captured path is the default.
+            if step == 0 || graphs_disabled {
+                let scratch = self.decode_scratch.as_mut()
+                    .expect("decode_scratch lazy-init above");
+                forward_step_batched(
+                    &self.mm, &self.cfg, self.shape,
+                    &self.layers, &self.top, &mut slots,
+                    scratch, &mut self.lt, &self.stream, &self.stream_lm,
+                )?;
+                self.stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                if decode_graph.is_none() {
+                    xenon_kernels::device_synchronize()
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    self.stream.begin_capture(CAPTURE_MODE_RELAXED)
+                        .map_err(|e| anyhow::anyhow!("begin_capture: {e}"))?;
+                    let scratch = self.decode_scratch.as_mut()
+                        .expect("decode_scratch lazy-init above");
+                    forward_step_batched(
+                        &self.mm, &self.cfg, self.shape,
+                        &self.layers, &self.top, &mut slots,
+                        scratch, &mut self.lt, &self.stream, &self.stream_lm,
+                    )?;
+                    let graph = self.stream.end_capture()
+                        .map_err(|e| anyhow::anyhow!("end_capture: {e}"))?;
+                    decode_graph = Some(graph.instantiate()
+                        .map_err(|e| anyhow::anyhow!("graph instantiate: {e}"))?);
+                }
+                decode_graph.as_ref().unwrap()
+                    .launch(&self.stream)
+                    .map_err(|e| anyhow::anyhow!("graph launch: {e}"))?;
+                self.stream.synchronize()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+
             let ms = t_step.elapsed().as_secs_f64() * 1e3;
+
+            // Host cur_pos bump — device counter advanced inside the graph.
+            for s in slots.iter_mut() {
+                s.cur_pos += 1;
+            }
+
+            let scratch = self.decode_scratch.as_ref()
+                .expect("decode_scratch lazy-init above");
+            let logits_per_req = split_batched_logits(scratch, n);
 
             for i in 0..n {
                 if done[i] { continue; }

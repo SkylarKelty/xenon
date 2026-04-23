@@ -21,12 +21,35 @@ unsafe extern "C" {
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
     fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
     fn cudaStreamCreate(stream: *mut *mut c_void) -> i32;
+    fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> i32;
     fn cudaStreamDestroy(stream: *mut c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
     fn cudaDeviceSynchronize() -> i32;
     fn cudaGetErrorString(err: i32) -> *const i8;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+
+    // Graph capture / instantiation / replay.
+    fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
+    fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
+    fn cudaGraphInstantiate(
+        graph_exec: *mut *mut c_void,
+        graph: *mut c_void,
+        error_node: *mut *mut c_void,
+        log_buf: *mut i8,
+        log_size: usize,
+    ) -> i32;
+    fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) -> i32;
+    fn cudaGraphDestroy(graph: *mut c_void) -> i32;
+    fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> i32;
 }
+
+/// `cudaStreamCaptureMode` — how strictly the capture validates stream-
+/// crossing and memory ops during capture. `Relaxed` accepts anything that
+/// would otherwise trip the validator (we've manually verified our decode
+/// step is free of forbidden ops — see project_xenon_cuda_graphs_scope).
+pub const CAPTURE_MODE_GLOBAL: i32 = 0;
+pub const CAPTURE_MODE_THREAD_LOCAL: i32 = 1;
+pub const CAPTURE_MODE_RELAXED: i32 = 2;
 
 const MEMCPY_HOST_TO_DEVICE: i32 = 1;
 const MEMCPY_DEVICE_TO_HOST: i32 = 2;
@@ -110,10 +133,26 @@ pub struct Stream {
 unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
+/// `cudaStreamNonBlocking`: stream does NOT implicitly synchronize with the
+/// legacy default stream. Required for CUDA-graph capture — a blocking
+/// stream that depends on the default stream aborts capture with
+/// `cudaErrorStreamCaptureIsolation` (906).
+const STREAM_NON_BLOCKING: u32 = 0x1;
+
 impl Stream {
     pub fn new() -> Result<Self, CudaError> {
         let mut raw: *mut c_void = std::ptr::null_mut();
         CudaError::check(unsafe { cudaStreamCreate(&mut raw) })?;
+        Ok(Self { raw })
+    }
+
+    /// Non-blocking stream — does NOT implicitly synchronize with the
+    /// legacy default stream. Required for CUDA-graph capture (a blocking
+    /// stream with a dependency on the default stream aborts capture with
+    /// cudaErrorStreamCaptureIsolation = 906).
+    pub fn new_nonblocking() -> Result<Self, CudaError> {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        CudaError::check(unsafe { cudaStreamCreateWithFlags(&mut raw, STREAM_NON_BLOCKING) })?;
         Ok(Self { raw })
     }
 
@@ -131,6 +170,102 @@ impl Drop for Stream {
         if !self.raw.is_null() {
             let _ = unsafe { cudaStreamDestroy(self.raw) };
         }
+    }
+}
+
+// -------------------- CUDA Graphs --------------------
+//
+// Stream capture records the sequence of kernel launches + memcpy operations
+// issued on a stream into a `Graph`, which can then be `instantiate()`d into
+// a reusable `GraphExec`. Replaying a `GraphExec` on a stream re-runs the
+// captured work as a single submission with per-step launch overhead
+// amortized across one CUDA driver call.
+//
+// Xenon scope: graphs are used only by `xenon-server`'s decode loop, one
+// `GraphExec` per batch size, cached for the engine's lifetime. Never
+// captured from `xenon-cli` — see project_xenon_cuda_graphs_scope memory.
+
+/// An immutable record of a captured stream's operations.
+pub struct CudaGraph {
+    raw: *mut c_void,
+}
+
+unsafe impl Send for CudaGraph {}
+unsafe impl Sync for CudaGraph {}
+
+impl CudaGraph {
+    /// Instantiate this graph into a runnable `GraphExec`. The graph remains
+    /// valid afterwards and could in principle be instantiated again, but
+    /// xenon only instantiates once per captured graph.
+    pub fn instantiate(&self) -> Result<GraphExec, CudaError> {
+        let mut exec: *mut c_void = std::ptr::null_mut();
+        CudaError::check(unsafe {
+            cudaGraphInstantiate(
+                &mut exec,
+                self.raw,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        })?;
+        Ok(GraphExec { raw: exec })
+    }
+
+    pub fn as_raw(&self) -> *mut c_void { self.raw }
+}
+
+impl Drop for CudaGraph {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let _ = unsafe { cudaGraphDestroy(self.raw) };
+        }
+    }
+}
+
+/// A runnable, instantiated graph. Replay with `launch(&stream)`.
+pub struct GraphExec {
+    raw: *mut c_void,
+}
+
+unsafe impl Send for GraphExec {}
+unsafe impl Sync for GraphExec {}
+
+impl GraphExec {
+    /// Submit all recorded operations to `stream`. Non-blocking; follow
+    /// with `stream.synchronize()` if you need to read results back.
+    pub fn launch(&self, stream: &Stream) -> Result<(), CudaError> {
+        CudaError::check(unsafe { cudaGraphLaunch(self.raw, stream.raw) })
+    }
+
+    pub fn as_raw(&self) -> *mut c_void { self.raw }
+}
+
+impl Drop for GraphExec {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let _ = unsafe { cudaGraphExecDestroy(self.raw) };
+        }
+    }
+}
+
+impl Stream {
+    /// Begin recording operations issued on this stream into a CUDA graph.
+    /// The caller issues the work to capture, then calls `end_capture` to
+    /// get the `CudaGraph`.
+    ///
+    /// `mode = CAPTURE_MODE_RELAXED` accepts cross-stream operations and
+    /// other advanced patterns; xenon's single-stream decode step is fine
+    /// with any mode but `Relaxed` is the most permissive.
+    pub fn begin_capture(&self, mode: i32) -> Result<(), CudaError> {
+        CudaError::check(unsafe { cudaStreamBeginCapture(self.raw, mode) })
+    }
+
+    /// Finish capture and return the recorded graph. Must be paired with
+    /// a prior `begin_capture`; otherwise the CUDA driver errors.
+    pub fn end_capture(&self) -> Result<CudaGraph, CudaError> {
+        let mut graph: *mut c_void = std::ptr::null_mut();
+        CudaError::check(unsafe { cudaStreamEndCapture(self.raw, &mut graph) })?;
+        Ok(CudaGraph { raw: graph })
     }
 }
 
@@ -280,6 +415,28 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
         })
     }
 
+    /// Async D2H: enqueue `cudaMemcpyAsync` into `dst`. Caller must sync
+    /// the stream before reading `dst`. Unlike `copy_to_host`, this is
+    /// captureable by `cudaStreamBeginCapture` — the destination pointer
+    /// is recorded in the graph node and reads happen at replay time, so
+    /// the caller must keep `dst` alive at a stable address across
+    /// replays.
+    pub fn copy_to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<(), CudaError> {
+        assert_eq!(dst.len(), self.len, "DeviceBuffer::copy_to_host_async length mismatch");
+        if self.len == 0 {
+            return Ok(());
+        }
+        CudaError::check(unsafe {
+            cudaMemcpyAsync(
+                dst.as_mut_ptr() as *mut c_void,
+                self.ptr as *const c_void,
+                self.bytes(),
+                MEMCPY_DEVICE_TO_HOST,
+                stream.as_raw(),
+            )
+        })
+    }
+
     pub fn copy_to_host_vec(&self) -> Result<Vec<T>, CudaError> {
         let mut v = vec![T::zeroed(); self.len];
         self.copy_to_host(&mut v)?;
@@ -297,6 +454,24 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
         })
     }
 
+    /// Async D2D copy via `cudaMemcpyAsync` on `stream`. Required for
+    /// paths that run under CUDA graph capture: the synchronous
+    /// `cudaMemcpy` used by `copy_from_device` runs on the legacy default
+    /// stream and trips `cudaErrorStreamCaptureIsolation` (906) when the
+    /// capturing stream tries to depend on it.
+    pub fn copy_from_device_async(
+        &mut self, src: &DeviceBuffer<T>, stream: &Stream,
+    ) -> Result<(), CudaError> {
+        assert_eq!(src.len, self.len, "copy_from_device_async: length mismatch");
+        if self.len == 0 { return Ok(()); }
+        CudaError::check(unsafe {
+            cudaMemcpyAsync(
+                self.ptr, src.ptr, self.bytes(),
+                MEMCPY_DEVICE_TO_DEVICE, stream.as_raw(),
+            )
+        })
+    }
+
     /// D2D copy of `src` into this buffer starting at `dst_offset` elements.
     /// `dst_offset + src.len()` must not exceed `self.len()`.
     pub fn copy_slice_from_device(
@@ -305,6 +480,17 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
         src: &DeviceBuffer<T>,
     ) -> Result<(), CudaError> {
         self.copy_region_from_device(dst_offset, src, 0, src.len)
+    }
+
+    /// Async version of `copy_slice_from_device` — see `copy_from_device_async`
+    /// for why the sync variant breaks graph capture.
+    pub fn copy_slice_from_device_async(
+        &mut self,
+        dst_offset: usize,
+        src: &DeviceBuffer<T>,
+        stream: &Stream,
+    ) -> Result<(), CudaError> {
+        self.copy_region_from_device_async(dst_offset, src, 0, src.len, stream)
     }
 
     /// General D2D region copy: copy `len` elements from `src[src_offset..]`
@@ -328,6 +514,32 @@ impl<T: bytemuck::Pod> DeviceBuffer<T> {
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset * esz) as *const c_void };
         CudaError::check(unsafe {
             cudaMemcpy(dst_ptr, src_ptr, len * esz, MEMCPY_DEVICE_TO_DEVICE)
+        })
+    }
+
+    /// Async version of `copy_region_from_device` — runs on the provided
+    /// stream via `cudaMemcpyAsync`, capture-safe.
+    pub fn copy_region_from_device_async(
+        &mut self,
+        dst_offset: usize,
+        src: &DeviceBuffer<T>,
+        src_offset: usize,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<(), CudaError> {
+        let dst_end = dst_offset.checked_add(len).expect("overflow");
+        let src_end = src_offset.checked_add(len).expect("overflow");
+        assert!(dst_end <= self.len, "copy_region_async: dst slice out of range");
+        assert!(src_end <= src.len, "copy_region_async: src slice out of range");
+        if len == 0 { return Ok(()); }
+        let esz = std::mem::size_of::<T>();
+        let dst_ptr = unsafe { (self.ptr as *mut u8).add(dst_offset * esz) as *mut c_void };
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset * esz) as *const c_void };
+        CudaError::check(unsafe {
+            cudaMemcpyAsync(
+                dst_ptr, src_ptr, len * esz,
+                MEMCPY_DEVICE_TO_DEVICE, stream.as_raw(),
+            )
         })
     }
 }

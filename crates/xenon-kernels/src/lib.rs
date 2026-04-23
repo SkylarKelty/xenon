@@ -13,7 +13,10 @@ pub mod kv_cache;
 pub use cublas::{
     linear_bf16_reference, matmul_bf16_reference, CublasError, CublasLt, GemmError,
 };
-pub use cuda::{device_synchronize, mem_info, CudaError, Device, DeviceBuffer, PinnedBuffer, Stream};
+pub use cuda::{
+    device_synchronize, mem_info, CudaError, CudaGraph, Device, DeviceBuffer, GraphExec,
+    PinnedBuffer, Stream, CAPTURE_MODE_GLOBAL, CAPTURE_MODE_RELAXED, CAPTURE_MODE_THREAD_LOCAL,
+};
 pub use kv_cache::{KvCache, SlotSpec};
 pub use kernels::{
     add_scale_bf16, attn_flash_bf16, attn_naive_bf16, attn_naive_bf16_reference,
