@@ -1,0 +1,10 @@
+[build]
+rustflags = [
+    # Target this exact CPU (Arrow Lake / Core Ultra 7 265HX)
+    # Enables: AVX2, AVX-VNNI, FMA, BMI1/2, GFNI, VAES, VPCLMULQDQ, etc.
+    "-C", "target-cpu=native",
+    # Control LLVM inlining via llvm-args (modern replacement for inline-threshold)
+    "-C", "llvm-args=--inline-threshold=275",
+    # Force frame pointers off for max perf
+    "-C", "force-frame-pointers=no",
+]
