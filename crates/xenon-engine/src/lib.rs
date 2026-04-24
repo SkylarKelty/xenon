@@ -42,15 +42,16 @@ const ATTN_FLASH_TC_MIN_TQ: usize = 16;
 /// - `scales_swizzled` — 128×4 interleaved layout required by cuBLASLt's
 ///    `VEC16_UE4M3` mode, produced once at load via `swizzle_blockscale_ue4m3`.
 ///
-/// `global_scale` is the weight per-tensor f32 (weight_scale_2 in modelopt);
-/// `input_scale` is the calibrated activation per-tensor f32. Both fold into
-/// `alpha` on the native NVFP4 GEMM path.
+/// `global_scale` is the weight per-tensor f32 (weight_scale_2 in modelopt),
+/// used as `alpha` on the native NVFP4 GEMM path. The checkpoint also carries
+/// a per-tensor `input_scale` but we don't use it: `nvfp4_quantize_bf16`
+/// stores block scales as `amax/6`, so FP4 × FP8 reconstructs `x` directly
+/// and `alpha = weight_scale_2` alone is correct.
 pub struct QuantLinearDev {
     pub packed: DeviceBuffer<u8>,
     pub scales: DeviceBuffer<u8>,
     pub scales_swizzled: DeviceBuffer<u8>,
     pub global_scale: f32,
-    pub input_scale: f32,
     pub out_features: usize,
     pub in_features: usize,
 }
@@ -86,7 +87,6 @@ impl QuantLinearDev {
         Ok(Self {
             packed, scales, scales_swizzled,
             global_scale: q.global_scale,
-            input_scale: q.input_scale,
             out_features: n,
             in_features: k,
         })
@@ -153,9 +153,10 @@ impl QuantLinearDev {
     /// - `m >= 128` → native NVFP4 tensor-core GEMM: quantize the
     ///   activation to FP4 (`nvfp4_quantize_bf16`), swizzle its block scales
     ///   into cuBLASLt's 128×4-interleaved layout, call `linear_nvfp4` with
-    ///   the pre-swizzled weight scales and `alpha = weight_scale_2 ×
-    ///   input_scale`. This was broken before the swizzle/input_scale fix
-    ///   landed — see `project_xenon_nvfp4_swizzle` memory.
+    ///   the pre-swizzled weight scales and `alpha = weight_scale_2`. Our
+    ///   activation quantizer stores scales as amax/6, so the FP4 × FP8
+    ///   product reconstructs x directly and no `input_scale` factor is
+    ///   needed. See `project_xenon_nvfp4_swizzle` memory for the history.
     /// - otherwise → dequant weight to bf16 scratch + `linear_bf16`.
     ///
     /// cuBLASLt's FP4 kernel is silently broken at `m < 128` on sm_120a, so
@@ -1160,14 +1161,12 @@ impl SamplerParams {
         self.temperature <= 0.0
     }
     /// Effective top-K after applying defaults + the kernel cap. Returns at
-    /// least 1. When only top-P is set (no explicit top-K), we pick
-    /// `TOP_K_LIMIT` so top-P has a candidate pool to filter.
+    /// least 1. `top_k = 0` means "no explicit K cap" — use `TOP_K_LIMIT`
+    /// so the kernel returns a full softmax sample pool; top-P (if < 1)
+    /// filters it further, and plain temperature-only sampling sees the
+    /// whole pool.
     fn effective_top_k(&self, vocab: usize) -> usize {
-        let raw = if self.top_k == 0 {
-            if self.top_p < 1.0 { TOP_K_LIMIT } else { 1 }
-        } else {
-            self.top_k as usize
-        };
+        let raw = if self.top_k == 0 { TOP_K_LIMIT } else { self.top_k as usize };
         raw.clamp(1, TOP_K_LIMIT.min(vocab))
     }
 }

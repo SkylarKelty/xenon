@@ -2289,7 +2289,6 @@ struct QuantLinearDev {
     scales: DeviceBuffer<u8>,
     scales_swizzled: DeviceBuffer<u8>,
     global_scale: f32,
-    input_scale: f32,
     out_features: usize,
     in_features: usize,
 }
@@ -2320,7 +2319,6 @@ impl QuantLinearDev {
         Ok(Self {
             packed, scales, scales_swizzled,
             global_scale: q.global_scale,
-            input_scale: q.input_scale,
             out_features: n,
             in_features: k,
         })

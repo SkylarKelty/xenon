@@ -90,7 +90,8 @@ __global__ void xk_fp4_gemv_bf16_kernel(
     if (tid < 16) s_lut[tid] = XK_FP4_GEMV_LUT[tid];
     __syncthreads();
 
-    float acc = 0.0f;
+    // LOOP2: four accumulators hoisted across b-blocks for ILP.
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
 
     // Each thread strides through K/16-sized blocks. Within a warp, threads
     // 0..31 read consecutive 8-byte chunks -> 256-byte coalesced load.
@@ -109,8 +110,6 @@ __global__ void xk_fp4_gemv_bf16_kernel(
         const __nv_bfloat16* xa0p = reinterpret_cast<const __nv_bfloat16*>(&xa0);
         const __nv_bfloat16* xa1p = reinterpret_cast<const __nv_bfloat16*>(&xa1);
 
-        // LOOP2: manual 4-way unroll to give ILP and schedule ahead.
-        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
         #pragma unroll
         for (int i = 0; i < 16; i += 4) {
             uint8_t b0 = (uint8_t)(w_pack >> ((i >> 1) * 8));
@@ -134,8 +133,8 @@ __global__ void xk_fp4_gemv_bf16_kernel(
             acc2 = fmaf(w2, x2, acc2);
             acc3 = fmaf(w3, x3, acc3);
         }
-        acc = acc0 + acc1 + acc2 + acc3;
     }
+    float acc = (acc0 + acc1) + (acc2 + acc3);
 
     float sum = xk_block_reduce_sum(acc);
     if (tid == 0) {
