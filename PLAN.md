@@ -482,6 +482,22 @@ merge-kernel overhead is pure loss — hence the conditional dispatch.
 - [ ] Investigate https://transformer-circuits.pub/2026/emotions/index.html#toc-15 - add in support for measuring/mapping emotion vectors
 - [ ] Implement extra api return "emotions": ["happy": 0.2, "anxious": 0.1], etc
 
+### Phase 8 — IsoQuant KV Cache Compression [ ]
+
+KV cache quantization via blockwise quaternion rotation (arXiv:2603.28430). See `PLAN_IsoQuant.md` for full research plan, implementation breakdown, and decision gates.
+
+Motivation: at `max_len=131072`, the bf16 KV cache is **~8.4 GiB** — it does not fit on this 7.53 GiB card. IsoQuant 4-bit compresses the same cache to **~2.1 GiB**, unlocking long-context inference. At `max_len=4096` the savings are marginal (~261 MiB → 65 MiB); this phase only pays off at ≥ 8K context.
+
+**Scope:**
+- [ ] Kernel: `isoquant_rotate_bf16` + `isoquant_inv_rotate_bf16` (unit tests, round-trip MSE)
+- [ ] Kernel: `kv_append_isoquant` — fused rotate+quantize on append path
+- [ ] Kernel: `attn_split_kv` modified to read quantized K/V + inv_rotate on-the-fly
+- [ ] Calibration harness: fit quaternions to reference K/V activations per layer
+- [ ] Validation: `test-vs-hf-layer` with IsoQuant KV within tolerance
+- [ ] Benchmark: decode throughput at 4K / 16K / 32K / 64K context
+
+**Decision gate:** Do not start until Phase 6 decode targets are stable (~60 tok/s sustained) and at least one 32K long-context benchmark is regularly run. See `PLAN_IsoQuant.md` §Decision Gate.
+
 ## Key technical decisions
 
 | Decision | Rationale |
