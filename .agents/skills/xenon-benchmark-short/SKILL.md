@@ -32,23 +32,25 @@ Benchmark the engine with prompts ≤ 256 tokens. This exercises the decode fast
 
 ## Quick Commands
 
+The default model (`gemma-4-4b-it-NVFP4`) is **instruction-tuned**. Always pass `--chat` so raw prompts get wrapped in the Gemma chat template. Without it, bare prompts ("Design a...") can fall into repetition loops because the model expects a conversation context.
+
 ```bash
 MODEL=~/.cache/huggingface/hub/models--cosmicproc--gemma-4-E4B-it-NVFP4/snapshots/02ecc99b351ea32f7d332fc7566e44bfc79baf0b
 
 # 32 tokens — minimal prefill
 P="Explain quantum computing in one sentence."
-cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 32 --label short-32tok
+cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 32 --chat --label short-32tok
 
 # 128 tokens — moderate prefill
 P="Write a Python function that reads a CSV file and returns a list of dictionaries. Include docstring, type hints, and error handling for missing files."
-cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 32 --label short-128tok
+cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 32 --chat --label short-128tok
 
 # 256 tokens — boundary case (just under long-prompt threshold)
 P=$(cat <<'EOF'
 Design a REST API for a task management app. Support creating tasks with title, description, priority, due date, and assignee. Organize tasks into projects. Each project has a name, description, and owner. Users can comment on tasks and upload attachments. Implement filtering by status, priority, and assignee. Include pagination with cursor-based navigation. Document all endpoints with request/response examples and error codes.
 EOF
 )
-cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 32 --label short-256tok
+cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 32 --chat --label short-256tok
 ```
 
 ## Expected Performance (Gemma-4-E4B, RTX PRO 2000)

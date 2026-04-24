@@ -109,7 +109,7 @@ cargo run --release --bin xenon-cli -- generate "$MODEL" --prompt "The capital o
 cargo run --release --bin xenon-cli -- generate "$MODEL" --prompt "What is 2+2?" --max-new 10 --chat
 ```
 
-Expected: Sensible continuations. For "The capital of France is", expect " Paris" or similar.
+Expected: Sensible continuations. For "The capital of France is", expect " Paris" or similar. Note: `--chat` is required because the default model (`gemma-4-4b-it-NVFP4`) is instruction-tuned. Without it, the model may fall into repetition loops.
 
 ## Full Verification Checklist
 

@@ -924,7 +924,12 @@ pub fn attn_split_kv_auto_chunk_size(
     h: usize,
     sm_count: usize,
 ) -> usize {
-    const MIN_CHUNK: usize = 32;
+    // LOOP1: raise MIN_CHUNK from 32 to 128.
+    // Trade-off: fewer partials → less merge work, but fewer blocks.
+    // For decode (T_q=1, H=8) on 26 SMs, target 52 blocks.
+    // At 128 chunks, we get ceil(512/128)=4 chunks per head → 32 blocks
+    // which is enough to keep most SMs busy per wave.
+    const MIN_CHUNK: usize = 128;
     let target_blocks = (sm_count * 2).max(1);
     let heads = (t_q * h).max(1);
     if heads >= target_blocks {

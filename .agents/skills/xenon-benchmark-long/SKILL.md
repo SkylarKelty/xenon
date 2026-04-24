@@ -43,6 +43,8 @@ For Gemma-4-E4B with `max_len=4096`:
 
 ## Quick Commands
 
+The default model (`gemma-4-4b-it-NVFP4`) is **instruction-tuned**. Always pass `--chat` so raw prompts get wrapped in the Gemma chat template. Without it, bare prompts can fall into repetition loops because the model expects a conversation context.
+
 ```bash
 MODEL=/home/k1811651/.cache/huggingface/hub/models--cosmicproc--gemma-4-E4B-it-NVFP4/snapshots/02ecc99b351ea32f7d332fc7566e44bfc79baf0b
 
@@ -51,7 +53,7 @@ P=$(cat <<'EOF'
 Design a REST API for a task management application. The API should support creating tasks with title, description, priority (low/medium/high), due date, and assignee. Tasks can be organized into projects. Each project has a name, description, and owner. Users can comment on tasks and upload attachments. Implement filtering by status, priority, and assignee. Include pagination with cursor-based navigation. Document all endpoints with request/response examples and error codes. Consider rate limiting and authentication using JWT tokens. The API should follow REST conventions and use JSON for all exchanges. Include webhook support for real-time notifications on task changes.
 EOF
 )
-cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 64 --label long-400tok
+cargo run --release --bin xenon-cli -- bench "$MODEL" --prompt "$P" --max-new 64 --chat --label long-400tok
 
 # 1000 tokens — long prefill
 P=$(python3 -c "

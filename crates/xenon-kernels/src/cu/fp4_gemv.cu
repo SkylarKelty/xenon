@@ -109,17 +109,32 @@ __global__ void xk_fp4_gemv_bf16_kernel(
         const __nv_bfloat16* xa0p = reinterpret_cast<const __nv_bfloat16*>(&xa0);
         const __nv_bfloat16* xa1p = reinterpret_cast<const __nv_bfloat16*>(&xa1);
 
+        // LOOP2: manual 4-way unroll to give ILP and schedule ahead.
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
         #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            const int byte_idx = i >> 1;
-            const uint8_t byte = (uint8_t)(w_pack >> (byte_idx * 8));
-            const uint8_t code = (i & 1) ? (byte >> 4) : (byte & 0xF);
-            const float   w_val = s_lut[code] * bs;
-            const float   x_val = (i < 8)
-                ? __bfloat162float(xa0p[i])
-                : __bfloat162float(xa1p[i - 8]);
-            acc = fmaf(w_val, x_val, acc);
+        for (int i = 0; i < 16; i += 4) {
+            uint8_t b0 = (uint8_t)(w_pack >> ((i >> 1) * 8));
+            uint8_t b1 = (uint8_t)(w_pack >> (((i + 1) >> 1) * 8));
+            uint8_t b2 = (uint8_t)(w_pack >> (((i + 2) >> 1) * 8));
+            uint8_t b3 = (uint8_t)(w_pack >> (((i + 3) >> 1) * 8));
+            uint8_t c0 = (i & 1)     ? (b0 >> 4) : (b0 & 0xF);
+            uint8_t c1 = ((i+1) & 1) ? (b1 >> 4) : (b1 & 0xF);
+            uint8_t c2 = ((i+2) & 1) ? (b2 >> 4) : (b2 & 0xF);
+            uint8_t c3 = ((i+3) & 1) ? (b3 >> 4) : (b3 & 0xF);
+            float w0 = s_lut[c0] * bs;
+            float w1 = s_lut[c1] * bs;
+            float w2 = s_lut[c2] * bs;
+            float w3 = s_lut[c3] * bs;
+            float x0 = __bfloat162float((i     < 8) ? xa0p[i]     : xa1p[i - 8]);
+            float x1 = __bfloat162float((i + 1 < 8) ? xa0p[i + 1] : xa1p[i - 7]);
+            float x2 = __bfloat162float((i + 2 < 8) ? xa0p[i + 2] : xa1p[i - 6]);
+            float x3 = __bfloat162float((i + 3 < 8) ? xa0p[i + 3] : xa1p[i - 5]);
+            acc0 = fmaf(w0, x0, acc0);
+            acc1 = fmaf(w1, x1, acc1);
+            acc2 = fmaf(w2, x2, acc2);
+            acc3 = fmaf(w3, x3, acc3);
         }
+        acc = acc0 + acc1 + acc2 + acc3;
     }
 
     float sum = xk_block_reduce_sum(acc);

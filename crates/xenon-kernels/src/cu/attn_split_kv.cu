@@ -80,23 +80,34 @@ __global__ void xk_attn_split_kv_partial_bf16_kernel(
     __syncthreads();
 
     // Phase 2: local max over chunk.
+    // LOOP3: warp-shuffle reduction instead of shared-memory tree.
     float local_max = -FLT_MAX;
     for (int j_local = tid; j_local < chunk_size; j_local += BLOCK_THREADS) {
         if (scores[j_local] > local_max) local_max = scores[j_local];
     }
-    reduce[tid] = local_max;
-    __syncthreads();
-    for (int s = BLOCK_THREADS / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float a = reduce[tid];
-            float b = reduce[tid + s];
-            reduce[tid] = a > b ? a : b;
-        }
-        __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_xor_sync(0xFFFFFFFFu, local_max, off);
+        if (other > local_max) local_max = other;
     }
-    const float mx = reduce[0];
+    __shared__ float warp_max[4];
+    const int lane = tid & 31; const int wid = tid >> 5;
+    if (lane == 0) warp_max[wid] = local_max;
+    __syncthreads();
+    if (wid == 0) {
+        float b = (lane < 4) ? warp_max[lane] : -FLT_MAX;
+        #pragma unroll
+        for (int off = 2; off > 0; off >>= 1) {
+            float other = __shfl_xor_sync(0xFFFFFFFFu, b, off);
+            if (other > b) b = other;
+        }
+        if (lane == 0) warp_max[0] = b;
+    }
+    __syncthreads();
+    const float mx = warp_max[0];
 
     // Phase 3: exp(score - mx) -> scores[]; zero masked slots; local sum.
+    // LOOP3: warp-shuffle reduction for sum too.
     float local_sum = 0.0f;
     for (int j_local = tid; j_local < chunk_size; j_local += BLOCK_THREADS) {
         if (scores[j_local] > -FLT_MAX * 0.5f) {
@@ -107,13 +118,23 @@ __global__ void xk_attn_split_kv_partial_bf16_kernel(
             scores[j_local] = 0.0f;
         }
     }
-    reduce[tid] = local_sum;
-    __syncthreads();
-    for (int s = BLOCK_THREADS / 2; s > 0; s >>= 1) {
-        if (tid < s) reduce[tid] += reduce[tid + s];
-        __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_xor_sync(0xFFFFFFFFu, local_sum, off);
     }
-    const float sum_exp = reduce[0];
+    __shared__ float warp_sum[4];
+    if (lane == 0) warp_sum[wid] = local_sum;
+    __syncthreads();
+    if (wid == 0) {
+        float b = (lane < 4) ? warp_sum[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 2; off > 0; off >>= 1) {
+            b += __shfl_xor_sync(0xFFFFFFFFu, b, off);
+        }
+        if (lane == 0) warp_sum[0] = b;
+    }
+    __syncthreads();
+    const float sum_exp = warp_sum[0];
 
     // Phase 4: numerator[d] = Σ_j scores[j] * V[j, d] across this chunk.
     // Each thread owns a strided set of d's and iterates over the chunk.
