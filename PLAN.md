@@ -478,9 +478,40 @@ merge-kernel overhead is pure loss — hence the conditional dispatch.
 - prefill 2441 → 2522 tok/s (+3.3%, within noise)
 - 2.58× ollama's 23.8 tok/s decode (was 2.17×)
 
-### Phase 7 - emotion vectors [ ]
-- [ ] Investigate https://transformer-circuits.pub/2026/emotions/index.html#toc-15 - add in support for measuring/mapping emotion vectors
-- [ ] Implement extra api return "emotions": ["happy": 0.2, "anxious": 0.1], etc
+### Phase 7 - emotion vectors [~]
+
+Research: Anthropic paper (Sofroniew et al. 2026) + Ryan Codrai's
+Gemma-4-E4B implementation of the same recipe. Inference math is a
+centered dot product: `score_e(t) = (h_{L,t} - global_mean_L) . v_e` at
+a single residual-stream layer L ≈ two-thirds of the way through (=28
+for this model's 42 layers), where `v_e ∈ R^2560` is a unit-normed
+direction. 171 emotions total.
+
+Split into two workstreams:
+- [x] **7a — inference integration** (2026-04-24):
+  - `xk_emotion_score_bf16` kernel (`crates/xenon-kernels/src/cu/emotion_score.cu`).
+    `(x - μ) @ V^T → [T, N] fp32`, with `accumulate=true` atomicAdd mode
+    for running sums across decode steps. Kernel test `test-emotion-score`
+    matches host fp32 ref to 1e-6 global rel.
+  - Artifact format (`crates/xenon-core/src/emotion.rs`): single
+    `.safetensors` with `vectors [L, N, H] bf16`, `global_mean [L, H] bf16`,
+    optional `z_mean`/`z_std`, and `__metadata__` holding layer indices +
+    emotion-name list + `version` + `model_id` for integrity.
+  - Engine: `EmotionProbes` (device-resident), `EmotionAccum`
+    (single-request), `BatchedEmotionAccums` (multi-request batched path).
+    Hook at the post-`scale_bf16` tail of `layer_forward` / `layer_forward_batched`.
+    Batched hook is capture-safe — the kernel is part of the decode graph;
+    host tracks `count` between replays.
+  - `GenerateStats.emotions` / `BatchGenResult.emotions` carry
+    `Vec<(String, f32)>`. Server exposes top-K map on `ChatResponse.emotions` /
+    `CompletionResponse.emotions` behind `--emotion-probes <path>`.
+  - `xenon-cli emotion-stub <out>` builds a synthetic-vector artifact for
+    bring-up; `xenon-cli generate --emotion-probes` prints top-8 to stderr.
+    Decode overhead vs baseline: within run-to-run noise.
+- [ ] **7b — probe generation**: run the Ryan Codrai extraction pipeline
+  on bf16 Gemma-4-E4B to produce the real 74 MB artifact. Needs a GPU
+  that fits bf16 Gemma-4-E4B (>9.5 GiB) since HF transformers has no
+  PLE-offload; our 7.5 GiB laptop can't do this directly. Deferred.
 
 ### Phase 8 — IsoQuant KV Cache Compression [ ]
 

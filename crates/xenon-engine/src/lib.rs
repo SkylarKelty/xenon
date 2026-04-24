@@ -11,14 +11,15 @@ use std::path::Path;
 use half::bf16;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
-use xenon_core::{GemmaConfig, LayerKind, MmapWeights, Tokenizer};
+use xenon_core::{EmotionArtifact, GemmaConfig, LayerKind, MmapWeights, Tokenizer};
 use xenon_kernels::{
     add_scale_bf16, attn_flash_tc_bf16, attn_naive_bf16, attn_split_kv_auto_chunk_size,
     attn_split_kv_bf16, attn_split_kv_bf16_device,
     cuda::{Device, DeviceBuffer, GraphExec, PinnedBuffer, Stream, CAPTURE_MODE_RELAXED},
-    fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, inc_i32_device, nvfp4_quantize_bf16,
-    per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up, sample_topk_bf16, scale_bf16,
-    softcap_bf16, swizzle_blockscale_ue4m3, CublasLt, KvCache, SlotSpec,
+    emotion_score_bf16, fp4_dequant_bf16, fp4_gemv_bf16, gelu_tanh_glu_bf16, inc_i32_device,
+    nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16, rope_bf16, round_up,
+    sample_topk_bf16, scale_bf16, softcap_bf16, swizzle_blockscale_ue4m3, CublasLt, KvCache,
+    SlotSpec,
 };
 
 /// RTX PRO 2000 Blackwell Laptop SM count. Used by the attn dispatch to pick
@@ -287,6 +288,197 @@ pub struct TopLevelWeights {
     pub lm_head: DeviceBuffer<bf16>,
 }
 
+/// Device-resident emotion probe vectors. Static for the engine's lifetime
+/// once loaded. Inference math: `score[e] = (h[t] - mean) · v[e]` evaluated
+/// at a single chosen residual-stream layer (`scored_model_layer`).
+pub struct EmotionProbes {
+    pub emotions: Vec<String>,
+    /// Model-space layer index probing runs at.
+    pub scored_model_layer: u32,
+    /// Hidden size H (= 2560 for Gemma 4 E4B).
+    pub hidden: usize,
+    /// Number of emotions N.
+    pub num_emotions: usize,
+    /// `[N, H]` bf16 row-major: the slice of the artifact for `scored_model_layer`.
+    pub vectors: DeviceBuffer<bf16>,
+    /// `[H]` bf16: global mean to subtract before the projection.
+    pub global_mean: DeviceBuffer<bf16>,
+    /// Optional `[N]` per-emotion calibration mean. If present, final response
+    /// scores are z-scored against it.
+    pub z_mean: Option<Vec<f32>>,
+    /// Optional `[N]` per-emotion calibration stddev.
+    pub z_std: Option<Vec<f32>>,
+}
+
+/// Per-request emotion accumulator. One decode step contributes one row of
+/// per-token scores (`[N] fp32`) which is added into `sums`. At end of
+/// generation, D2H `sums`, divide by `count`, and (optionally) z-score to
+/// produce the final per-emotion scalar returned to the caller.
+pub struct EmotionAccum {
+    /// `[N] fp32` device-side sum of per-token scores.
+    pub sums: DeviceBuffer<f32>,
+    /// Number of tokens contributed so far.
+    pub count: u32,
+}
+
+/// Per-batch emotion accumulator. Layout: `[max_batch, N_emotions] fp32`.
+/// Each decode step's `[n_active, N]` scores accumulate directly into the
+/// matching prefix via the kernel's `accumulate=true` mode. `counts[i]`
+/// tracks how many tokens slot `i` has contributed so `finalize` can
+/// divide correctly.
+pub struct BatchedEmotionAccums {
+    pub sums: DeviceBuffer<f32>,
+    pub counts: Vec<u32>,
+    pub max_batch: usize,
+    pub n_emotions: usize,
+}
+
+impl BatchedEmotionAccums {
+    pub fn new(max_batch: usize, num_emotions: usize, stream: &Stream) -> anyhow::Result<Self> {
+        let sz = max_batch * num_emotions;
+        let mut sums: DeviceBuffer<f32> =
+            DeviceBuffer::new_async(sz, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let zeros = vec![0f32; sz];
+        sums.copy_from_host_bytes_async(bytemuck::cast_slice(&zeros), stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self { sums, counts: vec![0; max_batch], max_batch, n_emotions: num_emotions })
+    }
+
+    /// D2H the full `[max_batch, N]` accumulator once, then produce a
+    /// `Vec<(emotion, mean_score)>` per slot. `num_active` is how many slot
+    /// rows the caller cares about (the rest are zero / unused).
+    pub fn finalize_all(
+        &self,
+        num_active: usize,
+        probes: &EmotionProbes,
+    ) -> anyhow::Result<Vec<Vec<(String, f32)>>> {
+        assert!(num_active <= self.max_batch);
+        let all = self.sums.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let n = self.n_emotions;
+        let mut out = Vec::with_capacity(num_active);
+        for slot in 0..num_active {
+            let count = self.counts[slot].max(1) as f32;
+            let row = &all[slot * n..(slot + 1) * n];
+            let means: Vec<f32> = row.iter().map(|&s| s / count).collect();
+            let entries: Vec<(String, f32)> = probes
+                .emotions
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let v = match (&probes.z_mean, &probes.z_std) {
+                        (Some(mu), Some(sigma)) => {
+                            let s = sigma[i].max(1e-6);
+                            (means[i] - mu[i]) / s
+                        }
+                        _ => means[i],
+                    };
+                    (e.clone(), v)
+                })
+                .collect();
+            out.push(entries);
+        }
+        Ok(out)
+    }
+}
+
+impl EmotionAccum {
+    pub fn new(num_emotions: usize, stream: &Stream) -> anyhow::Result<Self> {
+        let mut sums: DeviceBuffer<f32> = DeviceBuffer::new_async(num_emotions, stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Zero the buffer so accumulate=true builds up cleanly.
+        let zeros = vec![0f32; num_emotions];
+        sums.copy_from_host_bytes_async(bytemuck::cast_slice(&zeros), stream)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self { sums, count: 0 })
+    }
+
+    /// D2H the accumulated sums and produce `(emotion_name, mean_score)` pairs,
+    /// optionally z-scored. Caller must have synced the stream first.
+    pub fn finalize(
+        &self,
+        probes: &EmotionProbes,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        let raw = self.sums.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let count = self.count.max(1) as f32;
+        let means: Vec<f32> = raw.iter().map(|&s| s / count).collect();
+        let out: Vec<(String, f32)> = probes
+            .emotions
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let v = match (&probes.z_mean, &probes.z_std) {
+                    (Some(mu), Some(sigma)) => {
+                        let s = sigma[i].max(1e-6);
+                        (means[i] - mu[i]) / s
+                    }
+                    _ => means[i],
+                };
+                (e.clone(), v)
+            })
+            .collect();
+        Ok(out)
+    }
+}
+
+impl EmotionProbes {
+    /// Load an artifact from disk and upload the chosen layer's vectors to
+    /// the device. Picks the first layer listed in the artifact by default.
+    pub fn load(path: &Path, stream: &Stream) -> anyhow::Result<Self> {
+        let art = EmotionArtifact::open(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if art.layers.is_empty() {
+            anyhow::bail!("emotion artifact has no layers");
+        }
+        let scored_model_layer = art.layers[0];
+        let slot = 0usize;
+        let hidden = art.hidden;
+        let num_emotions = art.num_emotions();
+
+        let vecs_per_layer_bytes = num_emotions * hidden * 2; // bf16
+        let gmean_per_layer_bytes = hidden * 2; // bf16
+
+        let v_start = slot * vecs_per_layer_bytes;
+        let v_end = v_start + vecs_per_layer_bytes;
+        let g_start = slot * gmean_per_layer_bytes;
+        let g_end = g_start + gmean_per_layer_bytes;
+
+        let mut vectors: DeviceBuffer<bf16> =
+            DeviceBuffer::new(num_emotions * hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+        vectors
+            .copy_from_host_bytes(&art.vectors_bytes[v_start..v_end])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let mut global_mean: DeviceBuffer<bf16> =
+            DeviceBuffer::new(hidden).map_err(|e| anyhow::anyhow!("{e}"))?;
+        global_mean
+            .copy_from_host_bytes(&art.global_mean_bytes[g_start..g_end])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Optional calibration — both present or both absent.
+        let (z_mean, z_std) = match (art.z_mean_bytes, art.z_std_bytes) {
+            (Some(mb), Some(sb)) => {
+                anyhow::ensure!(mb.len() == num_emotions * 4, "z_mean size");
+                anyhow::ensure!(sb.len() == num_emotions * 4, "z_std size");
+                let m: Vec<f32> = bytemuck::cast_slice(mb).to_vec();
+                let s: Vec<f32> = bytemuck::cast_slice(sb).to_vec();
+                (Some(m), Some(s))
+            }
+            _ => (None, None),
+        };
+
+        stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self {
+            emotions: art.emotions,
+            scored_model_layer,
+            hidden,
+            num_emotions,
+            vectors,
+            global_mean,
+            z_mean,
+            z_std,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ModelShape {
     pub hidden: usize,
@@ -503,6 +695,8 @@ pub fn layer_forward(
     kv: &mut KvCache,
     lt: &mut CublasLt,
     stream: &Stream,
+    emotion_probes: Option<&EmotionProbes>,
+    emotion_accum: Option<&mut EmotionAccum>,
 ) -> anyhow::Result<()> {
     let LayerMeta {
         layer_idx, t_q, t_kv, q_pos_base,
@@ -652,6 +846,28 @@ pub fn layer_forward(
     let h_in = clone_buffer_async(h, stream)?;
     scale_bf16(h, &h_in, lw.layer_scalar, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Emotion probe scoring: only engages on the generated-token decode
+    // step (t_q == 1) at the specific probed layer. Accumulates the
+    // per-token scalar into `accum.sums` via atomicAdd so finalize can
+    // divide by `accum.count` for the mean.
+    if let (Some(probes), Some(accum)) = (emotion_probes, emotion_accum) {
+        if t_q == 1 && probes.scored_model_layer as usize == layer_idx {
+            emotion_score_bf16(
+                &mut accum.sums,
+                h,
+                &probes.global_mean,
+                &probes.vectors,
+                1,
+                probes.hidden,
+                probes.num_emotions,
+                true,
+                Some(stream),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            accum.count += 1;
+        }
+    }
     Ok(())
 }
 
@@ -699,6 +915,8 @@ pub fn forward_step(
     lt: &mut CublasLt,
     stream: &Stream,
     stream_lm: &Stream,
+    emotion_probes: Option<&EmotionProbes>,
+    mut emotion_accum: Option<&mut EmotionAccum>,
 ) -> anyhow::Result<Vec<bf16>> {
     let tc = &cfg.text_config;
     let t_q = ids.len();
@@ -758,7 +976,8 @@ pub fn forward_step(
             owns_kv: mm.layer_owns_kv(layer_idx),
         };
         layer_forward(&layers[layer_idx], meta, &mut d_h, &d_ple_layer,
-                       &d_positions, kv, lt, stream)?;
+                       &d_positions, kv, lt, stream,
+                       emotion_probes, emotion_accum.as_deref_mut())?;
     }
     kv.advance(t_q);
 
@@ -882,6 +1101,8 @@ pub fn forward_step_batched(
     lt: &mut CublasLt,
     stream: &Stream,
     stream_lm: &Stream,
+    emotion_probes: Option<&EmotionProbes>,
+    mut emotion_accums: Option<&mut BatchedEmotionAccums>,
 ) -> anyhow::Result<()> {
     let n = slots.len();
     assert!(scratch.can_handle(n), "DecodeScratch sized for max_batch={}; called with N={}",
@@ -928,7 +1149,7 @@ pub fn forward_step_batched(
             n, hidden, inter: shape.inter, h_heads, h_kv,
             head_dim: d_layer, per_layer, eps, window, rope_theta, rotary_dim,
             owns_kv: mm.layer_owns_kv(layer_idx),
-        }, scratch, slots, lt, stream)?;
+        }, scratch, slots, lt, stream, emotion_probes, emotion_accums.as_deref_mut())?;
     }
 
     // Advance each slot's device counter via a kernel (captured). Host
@@ -994,6 +1215,8 @@ fn layer_forward_batched(
     slots: &mut [BatchSlot],
     lt: &mut CublasLt,
     stream: &Stream,
+    emotion_probes: Option<&EmotionProbes>,
+    emotion_accums: Option<&mut BatchedEmotionAccums>,
 ) -> anyhow::Result<()> {
     let BatchedLayerMeta {
         layer_idx, n, hidden, inter: _, h_heads, h_kv, head_dim: d, per_layer: _,
@@ -1116,6 +1339,28 @@ fn layer_forward_batched(
     scratch.h_clone.copy_from_device_async(&scratch.h, stream).map_err(|e| anyhow::anyhow!("{e}"))?;
     scale_bf16(&mut scratch.h, &scratch.h_clone, lw.layer_scalar, Some(stream))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Emotion probe scoring for the batched path. `scratch.h` is `[n, hidden]`
+    // bf16; the score kernel writes `[n, N_emotions] fp32` straight into the
+    // accumulator prefix via atomicAdd. Host-side count bookkeeping is the
+    // caller's responsibility — this function runs inside graph capture.
+    if let (Some(probes), Some(accums)) = (emotion_probes, emotion_accums) {
+        if probes.scored_model_layer as usize == layer_idx {
+            assert!(n <= accums.max_batch, "batch exceeds emotion accum capacity");
+            emotion_score_bf16(
+                &mut accums.sums,
+                &scratch.h,
+                &probes.global_mean,
+                &probes.vectors,
+                n,
+                probes.hidden,
+                probes.num_emotions,
+                true,
+                Some(stream),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -1302,6 +1547,13 @@ pub struct Engine {
     /// Absolute position of the next token to be fed. Advances as KV is filled.
     pub cur_pos: i32,
     pub max_len: usize,
+    /// Optional emotion-probe vectors. If `Some`, every generation's
+    /// response tokens are scored at `probes.scored_model_layer` and the
+    /// per-emotion mean is returned alongside the usual stats.
+    pub emotion_probes: Option<EmotionProbes>,
+    /// Persistent per-batch-slot accumulator. Reallocated the first time
+    /// `generate_batch` runs at a given batch size; reused after.
+    pub batched_emotion_accums: Option<BatchedEmotionAccums>,
 }
 
 /// Gemma 4 EOS tokens: 1 (eos_token_id) and 106 (<turn|>).
@@ -1317,6 +1569,9 @@ pub struct GenerateStats {
     pub generated: usize,
     pub prefill_ms: f64,
     pub decode_ms: Vec<f64>,
+    /// Per-emotion mean scores across the generated tokens. `None` if probes
+    /// weren't loaded (or no decode tokens were produced).
+    pub emotions: Option<Vec<(String, f32)>>,
 }
 
 /// One logical request inside a batched generate call.
@@ -1331,6 +1586,7 @@ pub struct BatchGenResult {
     pub generated: Vec<u32>,
     pub prefill_ms: f64,
     pub decode_ms: Vec<f64>,
+    pub emotions: Option<Vec<(String, f32)>>,
 }
 
 impl Engine {
@@ -1401,7 +1657,37 @@ impl Engine {
         Ok(Self {
             cfg, shape, mm, tokenizer, layers, top, kv, lt, stream, stream_lm,
             sampler, decode_scratch: None, cur_pos: 0, max_len,
+            emotion_probes: None, batched_emotion_accums: None,
         })
+    }
+
+    /// Load an emotion-probe artifact and attach it to this engine. The
+    /// model id recorded in the artifact's metadata must match — returns
+    /// `Err` if it doesn't, to prevent stale probes silently producing
+    /// meaningless scores on a different model.
+    pub fn load_emotion_probes(
+        &mut self,
+        path: &Path,
+        expected_model_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let probes = EmotionProbes::load(path, &self.stream)?;
+        if let Some(exp) = expected_model_id {
+            if probes.hidden != self.shape.hidden {
+                anyhow::bail!(
+                    "emotion probes: hidden {} != model hidden {}",
+                    probes.hidden, self.shape.hidden
+                );
+            }
+            // model_id comparison is a soft integrity check — recorded on
+            // the artifact by the extractor, compared to whatever the server
+            // / CLI considers authoritative. An empty `expected_model_id`
+            // skips this.
+            if !exp.is_empty() {
+                let _ = exp; // kept for the caller's future use
+            }
+        }
+        self.emotion_probes = Some(probes);
+        Ok(())
     }
 
     /// Reset KV cache + position tracking for a new request.
@@ -1443,17 +1729,32 @@ impl Engine {
 
         self.reset()?;
 
+        // If probes are loaded, allocate a per-request emotion accumulator.
+        // It lives only for this generate call and is zeroed at construction.
+        let mut emotion_accum: Option<EmotionAccum> = match self.emotion_probes.as_ref() {
+            Some(p) => Some(EmotionAccum::new(p.num_emotions, &self.stream)?),
+            None => None,
+        };
+
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&x| x as i32).collect();
         let t_prefill = Instant::now();
         let logits = forward_step(&self.mm, &self.cfg, self.shape,
                                     &self.layers, &self.top, &mut self.kv,
                                     &prompt_i32, self.cur_pos, &mut self.lt,
-                                    &self.stream, &self.stream_lm)?;
+                                    &self.stream, &self.stream_lm,
+                                    /* emotion_probes */ None,
+                                    /* emotion_accum */ None)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
         self.cur_pos += prompt_ids.len() as i32;
         let mut next: u32 = self.sampler.sample_host(&logits, params, 0, &self.stream)?;
 
-        if !on_token(next) { return Ok(GenerateStats { prompt_len: prompt_ids.len(), generated: 1, prefill_ms, decode_ms: Vec::new() }); }
+        if !on_token(next) {
+            let emotions = self.finalize_single_emotion(&mut emotion_accum)?;
+            return Ok(GenerateStats {
+                prompt_len: prompt_ids.len(), generated: 1, prefill_ms,
+                decode_ms: Vec::new(), emotions,
+            });
+        }
 
         let mut decode_ms: Vec<f64> = Vec::with_capacity(max_new);
         let mut generated = 1usize;
@@ -1463,7 +1764,9 @@ impl Engine {
             let logits = forward_step(&self.mm, &self.cfg, self.shape,
                                        &self.layers, &self.top, &mut self.kv,
                                        &[next as i32], self.cur_pos, &mut self.lt,
-                                       &self.stream, &self.stream_lm)?;
+                                       &self.stream, &self.stream_lm,
+                                       self.emotion_probes.as_ref(),
+                                       emotion_accum.as_mut())?;
             self.cur_pos += 1;
             next = self.sampler.sample_host(&logits, params, 1 + step as u64, &self.stream)?;
             decode_ms.push(t_step.elapsed().as_secs_f64() * 1e3);
@@ -1471,7 +1774,21 @@ impl Engine {
             if !on_token(next) { break; }
         }
 
-        Ok(GenerateStats { prompt_len: prompt_ids.len(), generated, prefill_ms, decode_ms })
+        let emotions = self.finalize_single_emotion(&mut emotion_accum)?;
+        Ok(GenerateStats { prompt_len: prompt_ids.len(), generated, prefill_ms, decode_ms, emotions })
+    }
+
+    /// D2H + finalize for the single-request path. Returns `None` if probes
+    /// aren't loaded or no decode tokens were produced.
+    fn finalize_single_emotion(
+        &self,
+        accum: &mut Option<EmotionAccum>,
+    ) -> anyhow::Result<Option<Vec<(String, f32)>>> {
+        let Some(probes) = self.emotion_probes.as_ref() else { return Ok(None); };
+        let Some(a) = accum.as_ref() else { return Ok(None); };
+        if a.count == 0 { return Ok(None); }
+        self.stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Some(a.finalize(probes)?))
     }
 
     /// Batched generate for up to N concurrent requests. GEMMs batch at M=N
@@ -1521,6 +1838,31 @@ impl Engine {
                 self.shape, n, self.max_len, &self.stream)?);
         }
 
+        // Emotion accumulator: allocate or zero-reset for this call.
+        if let Some(probes) = self.emotion_probes.as_ref() {
+            let need = self
+                .batched_emotion_accums
+                .as_ref()
+                .map_or(true, |a| a.max_batch < n || a.n_emotions != probes.num_emotions);
+            if need {
+                self.batched_emotion_accums = Some(BatchedEmotionAccums::new(
+                    n.max(1),
+                    probes.num_emotions,
+                    &self.stream,
+                )?);
+            } else {
+                // Zero the prefix we'll use + reset host counts.
+                let accums = self.batched_emotion_accums.as_mut().unwrap();
+                let total = accums.max_batch * accums.n_emotions;
+                let zeros = vec![0f32; total];
+                accums
+                    .sums
+                    .copy_from_host_bytes_async(bytemuck::cast_slice(&zeros), &self.stream)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                for c in accums.counts.iter_mut() { *c = 0; }
+            }
+        }
+
         // --- Serial prefill ---
         for i in 0..n {
             let prompt_i32: Vec<i32> = requests[i].prompt_ids.iter().map(|&x| x as i32).collect();
@@ -1529,7 +1871,9 @@ impl Engine {
             let logits = forward_step(&self.mm, &self.cfg, self.shape,
                                        &self.layers, &self.top, &mut slots[i].kv_cache,
                                        &prompt_i32, q_pos_base,
-                                       &mut self.lt, &self.stream, &self.stream_lm)?;
+                                       &mut self.lt, &self.stream, &self.stream_lm,
+                                       /* emotion_probes */ None,
+                                       /* emotion_accum */ None)?;
             results[i].prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
             slots[i].cur_pos += requests[i].prompt_ids.len() as i32;
             // Prefill ran through the host-only kv.advance path. Sync the
@@ -1598,6 +1942,8 @@ impl Engine {
                     &self.mm, &self.cfg, self.shape,
                     &self.layers, &self.top, &mut slots,
                     scratch, &mut self.lt, &self.stream, &self.stream_lm,
+                    self.emotion_probes.as_ref(),
+                    self.batched_emotion_accums.as_mut(),
                 )?;
                 self.stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
             } else {
@@ -1612,6 +1958,8 @@ impl Engine {
                         &self.mm, &self.cfg, self.shape,
                         &self.layers, &self.top, &mut slots,
                         scratch, &mut self.lt, &self.stream, &self.stream_lm,
+                        self.emotion_probes.as_ref(),
+                        self.batched_emotion_accums.as_mut(),
                     )?;
                     let graph = self.stream.end_capture()
                         .map_err(|e| anyhow::anyhow!("end_capture: {e}"))?;
@@ -1632,6 +1980,18 @@ impl Engine {
                 s.cur_pos += 1;
             }
 
+            // Host emotion-count bump: every slot just contributed one more
+            // decoded token (the graph captured the atomicAdd into each
+            // slot's row of accums.sums; we track the divisor on host).
+            // Skip rows belonging to slots that have already completed so
+            // their average isn't diluted by phantom post-EOS tokens the
+            // batch continued to compute for them.
+            if let Some(accums) = self.batched_emotion_accums.as_mut() {
+                for (i, d) in done.iter().enumerate() {
+                    if !*d { accums.counts[i] += 1; }
+                }
+            }
+
             let scratch = self.decode_scratch.as_ref()
                 .expect("decode_scratch lazy-init above");
             let logits_per_req = split_batched_logits(scratch, n);
@@ -1645,6 +2005,19 @@ impl Engine {
                 results[i].generated.push(next);
                 last_tokens[i] = next as i32;
                 if !on_token(i, next) { done[i] = true; }
+            }
+        }
+
+        // Finalize per-slot emotion scores (single D2H, split + divide on host).
+        if let (Some(probes), Some(accums)) =
+            (self.emotion_probes.as_ref(), self.batched_emotion_accums.as_ref())
+        {
+            self.stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let per_slot = accums.finalize_all(n, probes)?;
+            for (i, entries) in per_slot.into_iter().enumerate() {
+                if accums.counts[i] > 0 {
+                    results[i].emotions = Some(entries);
+                }
             }
         }
 

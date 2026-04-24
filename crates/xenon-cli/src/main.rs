@@ -13,7 +13,7 @@ use xenon_kernels::{
     add_scale_bf16, attn_flash_bf16, attn_flash_tc_bf16, attn_naive_bf16, attn_naive_bf16_reference,
     attn_split_kv_auto_chunk_size, attn_split_kv_bf16, test_mma_bf16,
     cuda::{device_synchronize, mem_info, Device, DeviceBuffer, Stream},
-    embed_gather_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
+    embed_gather_bf16, emotion_score_bf16, fp4_dequant_bf16, fp4_dequant_bf16_reference, fp4_gemv_bf16, gelu_tanh_bf16,
     gelu_tanh_bf16_reference, gelu_tanh_glu_bf16, linear_bf16_reference, matmul_bf16_reference,
     nvfp4_quantize_bf16, per_layer_slice_bf16, rmsnorm_bf16, rmsnorm_bf16_reference, rope_bf16,
     rope_bf16_reference, round_up, sample_topk_bf16, sample_topk_bf16_reference, scale_bf16,
@@ -163,6 +163,36 @@ enum Command {
     TestGelu {
         #[arg(long, default_value_t = 4096)]
         n: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Run the emotion-probe scoring kernel on random input and compare
+    /// to a host fp32 reference.
+    TestEmotionScore {
+        #[arg(long, default_value_t = 4)]
+        t: usize,
+        #[arg(long, default_value_t = 2560)]
+        h: usize,
+        #[arg(long, default_value_t = 171)]
+        n: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Generate a synthetic emotion-probe artifact (random unit vectors,
+    /// zero means) in the xenon safetensors+metadata format. Useful for
+    /// bringing up the inference pipeline before real probe vectors exist.
+    EmotionStub {
+        /// Output path. Writes a single `.safetensors` file.
+        out: PathBuf,
+        #[arg(long, default_value_t = 2560)]
+        hidden: usize,
+        /// Layer indices the artifact covers. First layer is the one used
+        /// at inference time.
+        #[arg(long, default_values_t = [28u32])]
+        layers: Vec<u32>,
+        /// Model identity string stamped into metadata for integrity check.
+        #[arg(long, default_value = "cosmicproc/gemma-4-E4B-it-NVFP4")]
+        model_id: String,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
@@ -373,6 +403,11 @@ enum Command {
         /// PRNG seed for reproducibility in non-greedy runs.
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Path to an emotion-probe artifact. If set, per-emotion mean
+        /// projection scores over the generated tokens are printed to
+        /// stderr after generation.
+        #[arg(long)]
+        emotion_probes: Option<PathBuf>,
     },
     /// Run the FlashAttention-2 tiled kernel vs the naive kernel on random
     /// Q/K/V and verify they agree. Exercises the online-softmax path at
@@ -535,6 +570,9 @@ fn main() -> anyhow::Result<()> {
         Command::TestSwizzle { src, expected, m, k_blocks } => cmd_test_swizzle(src, expected, m, k_blocks),
         Command::TestNvfp4Roundtrip { rows, cols, seed } => cmd_test_nvfp4_roundtrip(rows, cols, seed),
         Command::TestGelu { n, seed } => cmd_test_gelu(n, seed),
+        Command::TestEmotionScore { t, h, n, seed } => cmd_test_emotion_score(t, h, n, seed),
+        Command::EmotionStub { out, hidden, layers, model_id, seed } =>
+            cmd_emotion_stub(out, hidden, layers, model_id, seed),
         Command::TestSample { vocab, top_k, temperature, seed } =>
             cmd_test_sample(vocab, top_k, temperature, seed),
         Command::TestMlp { model, layer, batch, seed } => cmd_test_mlp(model, layer, batch, seed),
@@ -566,9 +604,10 @@ fn main() -> anyhow::Result<()> {
             cmd_test_vs_hf_layer(model, hf, ids, layer),
         Command::TestVsHfTail { model, hf } => cmd_test_vs_hf_tail(model, hf),
         Command::TestVsHfFull { model, hf, ids } => cmd_test_vs_hf_full(model, hf, ids),
-        Command::Generate { model, prompt, max_new, max_len, chat, temperature, top_p, top_k, seed } =>
+        Command::Generate { model, prompt, max_new, max_len, chat, temperature, top_p, top_k, seed, emotion_probes } =>
             cmd_generate(model, prompt, max_new, max_len, chat,
-                         xenon_engine::SamplerParams { temperature, top_p, top_k, seed }),
+                         xenon_engine::SamplerParams { temperature, top_p, top_k, seed },
+                         emotion_probes),
         Command::Bench { model, prompt, chat, max_new, max_len, warmup, iters, label,
                          temperature, top_p, top_k, seed } =>
             cmd_bench(model, prompt, chat, max_new, max_len, warmup, iters, label,
@@ -1021,6 +1060,190 @@ fn cmd_test_gelu(n: usize, seed: u64) -> anyhow::Result<()> {
     let tol_rel: f32 = 1e-2;
     anyhow::ensure!(global_rel <= tol_rel, "global rel diff {global_rel} exceeds tolerance {tol_rel}");
     println!("OK: within bf16 tolerance (global rel {tol_rel:.1e}).");
+    Ok(())
+}
+
+fn cmd_test_emotion_score(t: usize, h: usize, n: usize, seed: u64) -> anyhow::Result<()> {
+    Device(0).set().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream = Stream::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x_host: Vec<bf16> = (0..t * h).map(|_| bf16::from_f32(rng.gen_range(-2.0..2.0))).collect();
+    let mean_host: Vec<bf16> = (0..h).map(|_| bf16::from_f32(rng.gen_range(-0.5..0.5))).collect();
+    let v_host: Vec<bf16> = (0..n * h).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0))).collect();
+
+    let mut d_x: DeviceBuffer<bf16> = DeviceBuffer::new(t * h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_mean: DeviceBuffer<bf16> = DeviceBuffer::new(h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_v: DeviceBuffer<bf16> = DeviceBuffer::new(n * h).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(t * n).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_x.copy_from_host(&x_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_mean.copy_from_host(&mean_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    d_v.copy_from_host(&v_host).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    emotion_score_bf16(&mut d_out, &d_x, &d_mean, &d_v, t, h, n, false, Some(&stream))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stream.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got = d_out.copy_to_host_vec().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Host reference: (x[t] - mean) · v[n], all in f32 via bf16 round-trip.
+    let mut want = vec![0f32; t * n];
+    for ti in 0..t {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for i in 0..h {
+                let xi = x_host[ti * h + i].to_f32() - mean_host[i].to_f32();
+                let vi = v_host[ni * h + i].to_f32();
+                acc += xi * vi;
+            }
+            want[ti * n + ni] = acc;
+        }
+    }
+
+    let mut max_abs = 0.0f32;
+    let mut max_mag = 0.0f32;
+    for (&a, &b) in got.iter().zip(want.iter()) {
+        let d = (a - b).abs();
+        if d > max_abs { max_abs = d; }
+        let mb = b.abs();
+        if mb > max_mag { max_mag = mb; }
+    }
+    let global_rel = if max_mag > 0.0 { max_abs / max_mag } else { 0.0 };
+
+    println!("=== xenon-cli test-emotion-score ===");
+    println!("shape                   t={t} h={h} n={n}");
+    println!("max abs diff            {:.3e}", max_abs);
+    println!("max |ref|               {:.3e}", max_mag);
+    println!("global rel diff         {:.3e}", global_rel);
+    let tol: f32 = 1e-2;
+    anyhow::ensure!(global_rel <= tol, "global rel diff {global_rel} exceeds tolerance {tol}");
+    println!("OK: within bf16 tolerance (global rel {tol:.1e}).");
+    Ok(())
+}
+
+/// Static list of emotion names drawn from the Anthropic paper's 171-word
+/// vocabulary. The exact count here (178) differs slightly from the paper —
+/// real extraction will rewrite this list anyway. The stub only needs a
+/// representative set so the end-to-end plumbing can be exercised.
+const STUB_EMOTIONS_171: &[&str] = &[
+    "afraid", "alarmed", "alert", "amazed", "amused", "angry", "annoyed",
+    "anxious", "apathetic", "apprehensive", "aroused", "ashamed", "astonished",
+    "at ease", "awestruck", "bewildered", "bitter", "blissful", "bored",
+    "brooding", "calm", "cautious", "cheerful", "compassionate", "confident",
+    "confused", "contemptuous", "content", "curious", "defiant", "delighted",
+    "dependent", "depressed", "desperate", "despondent", "determined",
+    "devastated", "disappointed", "disgusted", "dismayed", "disoriented",
+    "distressed", "doubtful", "dreading", "eager", "ecstatic", "elated",
+    "embarrassed", "empathetic", "enchanted", "energetic", "enraged", "envious",
+    "euphoric", "exasperated", "excited", "exhausted", "exuberant", "fascinated",
+    "fearful", "flustered", "fond", "foolish", "frantic", "friendly",
+    "frightened", "frustrated", "fulfilled", "furious", "gleeful", "gloomy",
+    "grateful", "grieving", "guilty", "happy", "heartbroken", "helpless",
+    "hopeful", "hopeless", "horrified", "hostile", "humbled", "humiliated",
+    "hurt", "hysterical", "impressed", "indignant", "inspired", "insulted",
+    "interested", "intimidated", "invigorated", "irritated", "jealous",
+    "jittery", "joyful", "jubilant", "lonely", "lost", "loving", "melancholy",
+    "mischievous", "miserable", "mistrustful", "moved", "mournful", "needy",
+    "nervous", "nostalgic", "numb", "optimistic", "outraged", "overjoyed",
+    "overwhelmed", "panicked", "passionate", "peaceful", "pensive", "perplexed",
+    "playful", "pleased", "poised", "powerful", "preoccupied", "pressured",
+    "proud", "puzzled", "rageful", "reflective", "regretful", "rejected",
+    "relaxed", "relieved", "reluctant", "remorseful", "resentful", "resigned",
+    "respectful", "restless", "reverent", "sad", "satisfied", "scared",
+    "self-conscious", "sensitive", "serene", "shocked", "skeptical", "sleepy",
+    "smug", "somber", "sorrowful", "spiteful", "startled", "stressed",
+    "stubborn", "stunned", "submissive", "suspicious", "sympathetic", "tearful",
+    "tense", "terrified", "threatened", "tired", "touched", "tranquil",
+    "triumphant", "uncertain", "uncomfortable", "uneasy", "unhappy", "vengeful",
+    "vulnerable", "wary", "weary", "worried", "worthless",
+];
+
+fn cmd_emotion_stub(
+    out: PathBuf,
+    hidden: usize,
+    layers: Vec<u32>,
+    model_id: String,
+    seed: u64,
+) -> anyhow::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    anyhow::ensure!(!layers.is_empty(), "need at least one layer");
+    let emotions: Vec<String> = STUB_EMOTIONS_171.iter().map(|s| s.to_string()).collect();
+    let num_emotions = emotions.len();
+    let num_layers = layers.len();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    // Random unit-normed vectors: `[L, N, H] bf16`. Draw Gaussian (box-muller
+    // via two uniforms) then normalize per [l, n] row.
+    let mut vectors: Vec<bf16> = Vec::with_capacity(num_layers * num_emotions * hidden);
+    for _ in 0..num_layers {
+        for _ in 0..num_emotions {
+            let mut row = vec![0f32; hidden];
+            let mut sq = 0.0f32;
+            for x in row.iter_mut() {
+                let u1: f32 = rng.gen_range(1e-7..1.0);
+                let u2: f32 = rng.gen_range(0.0..1.0);
+                let g = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+                *x = g;
+                sq += g * g;
+            }
+            let inv_norm = 1.0 / sq.sqrt().max(1e-6);
+            for x in row.iter_mut() { *x *= inv_norm; }
+            vectors.extend(row.iter().map(|&v| bf16::from_f32(v)));
+        }
+    }
+    // Zero global means (valid for a stub; the real pipeline subtracts a
+    // learned mean, here the dot product is just `h · v`).
+    let global_mean: Vec<bf16> = vec![bf16::from_f32(0.0); num_layers * hidden];
+
+    // Build tensor table. Raw bf16 bytes, little-endian (host is already LE).
+    let vectors_bytes: Vec<u8> = bytemuck::cast_slice::<bf16, u8>(&vectors).to_vec();
+    let gmean_bytes: Vec<u8> = bytemuck::cast_slice::<bf16, u8>(&global_mean).to_vec();
+
+    let v_begin: u64 = 0;
+    let v_end: u64 = vectors_bytes.len() as u64;
+    let g_begin: u64 = v_end;
+    let g_end: u64 = g_begin + gmean_bytes.len() as u64;
+
+    // Safetensors header JSON. Tensors sorted by name (alphabetical) for
+    // deterministic header output.
+    let header = serde_json::json!({
+        "__metadata__": {
+            "version": "1",
+            "model_id": model_id,
+            "hidden": hidden.to_string(),
+            "layers": serde_json::to_string(&layers).unwrap(),
+            "emotions": serde_json::to_string(&emotions).unwrap(),
+        },
+        "global_mean": {
+            "dtype": "BF16",
+            "shape": [num_layers, hidden],
+            "data_offsets": [g_begin, g_end],
+        },
+        "vectors": {
+            "dtype": "BF16",
+            "shape": [num_layers, num_emotions, hidden],
+            "data_offsets": [v_begin, v_end],
+        },
+    });
+    let mut header_buf = serde_json::to_vec(&header)?;
+    // Pad to 8-byte alignment (safetensors convention).
+    while header_buf.len() % 8 != 0 { header_buf.push(b' '); }
+
+    let mut f = File::create(&out)?;
+    f.write_all(&(header_buf.len() as u64).to_le_bytes())?;
+    f.write_all(&header_buf)?;
+    f.write_all(&vectors_bytes)?;
+    f.write_all(&gmean_bytes)?;
+
+    println!("=== xenon-cli emotion-stub ===");
+    println!("output    {}", out.display());
+    println!("layers    {:?}", layers);
+    println!("emotions  {}", num_emotions);
+    println!("hidden    {}", hidden);
+    let size = std::fs::metadata(&out)?.len();
+    println!("size      {:.2} MB", size as f64 / 1e6);
     Ok(())
 }
 
@@ -2932,10 +3155,17 @@ fn cmd_bench_batch(
 fn cmd_generate(
     model_dir: PathBuf, prompt: String, max_new: usize, max_len: usize, chat: bool,
     sampler: xenon_engine::SamplerParams,
+    emotion_probes: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let t_load = Instant::now();
     let mut engine = xenon_engine::Engine::load(&model_dir, max_len)?;
+    if let Some(path) = emotion_probes.as_ref() {
+        engine.load_emotion_probes(path, None)?;
+        let p = engine.emotion_probes.as_ref().unwrap();
+        eprintln!("[xenon] emotion probes {}  ({} emotions, layer {})",
+                  path.display(), p.num_emotions, p.scored_model_layer);
+    }
     let (mem_free, mem_total) = mem_info().map_err(|e| anyhow::anyhow!("{e}"))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
@@ -2984,6 +3214,15 @@ fn cmd_generate(
     eprintln!("[xenon] decoded {} tokens in {:.1} ms ({:.1} tok/s, prefill excluded)",
              stats.decode_ms.len(), decode_total_ms,
              stats.decode_ms.len() as f64 / (decode_total_ms / 1000.0));
+
+    // Print top emotions if probes were loaded.
+    if let Some(mut entries) = stats.emotions {
+        entries.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("[xenon] emotions (top 8 by |score|):");
+        for (e, v) in entries.iter().take(8) {
+            eprintln!("    {:<16} {:+.4}", e, v);
+        }
+    }
     Ok(())
 }
 

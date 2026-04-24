@@ -9,6 +9,7 @@
 //! `token_tx` channel, then wrap the matching `token_rx` in an SSE stream
 //! (or collect fully for non-streaming).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -48,6 +49,16 @@ struct Args {
     /// collect more before launching the batch. 0 = never wait.
     #[arg(long, default_value_t = 20)]
     batch_wait_ms: u64,
+    /// Optional path to an emotion-probe artifact (`.safetensors`). If set,
+    /// every completion response includes an `emotions` field with a
+    /// ranked map of emotion → mean projection score over the generated
+    /// tokens.
+    #[arg(long)]
+    emotion_probes: Option<PathBuf>,
+    /// When emotion probes are loaded, only return the top-K emotions by
+    /// absolute score in the response JSON.
+    #[arg(long, default_value_t = 8)]
+    emotion_top_k: usize,
 }
 
 /// A message from the batcher to a waiting handler about one request's output.
@@ -56,7 +67,13 @@ enum ResponseChunk {
     Delta(String),
     /// Final aggregated text and completion tokens (for non-streaming).
     /// Sent ALONGSIDE deltas, so handlers can use either.
-    Final { text: String, completion_tokens: usize },
+    Final {
+        text: String,
+        completion_tokens: usize,
+        /// Top-K emotion → score (already ranked by |score|) if probes
+        /// were loaded. Left empty / `None` otherwise.
+        emotions: Option<Vec<(String, f32)>>,
+    },
     /// Generation finished (reason: "stop" or "length").
     Done { finish_reason: &'static str },
 }
@@ -76,6 +93,7 @@ struct AppState {
     tokenizer: Arc<Tokenizer>,
     model_id: String,
     max_len: usize,
+    emotion_top_k: usize,
 }
 
 fn now_epoch() -> u64 {
@@ -163,7 +181,10 @@ fn run_batch(engine: &mut Engine, batch: Vec<PendingRequest>) {
                     true,
                 ).unwrap_or_default();
                 let completion_tokens = res.generated.len();
-                let _ = txs[i].blocking_send(ResponseChunk::Final { text: content, completion_tokens });
+                let emotions = res.emotions;
+                let _ = txs[i].blocking_send(ResponseChunk::Final {
+                    text: content, completion_tokens, emotions,
+                });
                 let finish = if completion_tokens >= 1 && res.generated.last().map_or(false, |t| GEMMA4_EOS.contains(t)) {
                     "stop"
                 } else { "length" };
@@ -220,6 +241,8 @@ struct UsageStats { prompt_tokens: usize, completion_tokens: usize, total_tokens
 struct ChatResponse {
     id: String, object: &'static str, created: u64, model: String,
     choices: Vec<ChatResponseChoice>, usage: UsageStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emotions: Option<BTreeMap<String, f32>>,
 }
 
 #[derive(Serialize)]
@@ -318,26 +341,40 @@ async fn post_chat_completions(
     let want_stream = req.stream.unwrap_or(false);
 
     let rx = enqueue(&st, prompt_ids, max_new, sampler).await?;
+    let top_k = st.emotion_top_k;
     if want_stream {
         Ok(chat_stream_from_rx(st.model_id, rx).into_response())
     } else {
-        Ok(chat_full_from_rx(st.model_id, rx, prompt_len).await.into_response())
+        Ok(chat_full_from_rx(st.model_id, rx, prompt_len, top_k).await.into_response())
     }
+}
+
+/// Reduce a `Vec<(emotion, score)>` to a sorted-by-|score| top-K map.
+fn top_k_emotions(entries: Vec<(String, f32)>, k: usize) -> BTreeMap<String, f32> {
+    if k == 0 || entries.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut sorted = entries;
+    sorted.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.truncate(k);
+    sorted.into_iter().collect()
 }
 
 async fn chat_full_from_rx(
     model_id: String,
     mut rx: mpsc::Receiver<ResponseChunk>,
     prompt_len: usize,
+    emotion_top_k: usize,
 ) -> impl IntoResponse {
     let mut content = String::new();
     let mut completion_tokens = 0usize;
     let mut finish_reason = "stop".to_string();
+    let mut emotions: Option<Vec<(String, f32)>> = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
             ResponseChunk::Delta(_) => {}  // non-streaming ignores partial deltas
-            ResponseChunk::Final { text, completion_tokens: ct } => {
-                content = text; completion_tokens = ct;
+            ResponseChunk::Final { text, completion_tokens: ct, emotions: e } => {
+                content = text; completion_tokens = ct; emotions = e;
             }
             ResponseChunk::Done { finish_reason: fr } => {
                 finish_reason = fr.into();
@@ -360,6 +397,7 @@ async fn chat_full_from_rx(
             completion_tokens,
             total_tokens: prompt_len + completion_tokens,
         },
+        emotions: emotions.map(|e| top_k_emotions(e, emotion_top_k)),
     })
 }
 
@@ -449,6 +487,8 @@ struct CompletionChoice { index: usize, text: String, finish_reason: String }
 struct CompletionResponse {
     id: String, object: &'static str, created: u64, model: String,
     choices: Vec<CompletionChoice>, usage: UsageStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emotions: Option<BTreeMap<String, f32>>,
 }
 
 #[derive(Serialize)]
@@ -475,10 +515,11 @@ async fn post_completions(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokenize: {e}")))?;
     let prompt_len = prompt_ids.len();
     let rx = enqueue(&st, prompt_ids, max_new, sampler).await?;
+    let top_k = st.emotion_top_k;
     if want_stream {
         Ok(completion_stream_from_rx(st.model_id, rx).into_response())
     } else {
-        Ok(completion_full_from_rx(st.model_id, rx, prompt_len).await.into_response())
+        Ok(completion_full_from_rx(st.model_id, rx, prompt_len, top_k).await.into_response())
     }
 }
 
@@ -486,15 +527,17 @@ async fn completion_full_from_rx(
     model_id: String,
     mut rx: mpsc::Receiver<ResponseChunk>,
     prompt_len: usize,
+    emotion_top_k: usize,
 ) -> impl IntoResponse {
     let mut text = String::new();
     let mut completion_tokens = 0usize;
     let mut finish_reason = "stop".to_string();
+    let mut emotions: Option<Vec<(String, f32)>> = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
             ResponseChunk::Delta(_) => {}
-            ResponseChunk::Final { text: t, completion_tokens: ct } => {
-                text = t; completion_tokens = ct;
+            ResponseChunk::Final { text: t, completion_tokens: ct, emotions: e } => {
+                text = t; completion_tokens = ct; emotions = e;
             }
             ResponseChunk::Done { finish_reason: fr } => { finish_reason = fr.into(); break; }
         }
@@ -510,6 +553,7 @@ async fn completion_full_from_rx(
             completion_tokens,
             total_tokens: prompt_len + completion_tokens,
         },
+        emotions: emotions.map(|e| top_k_emotions(e, emotion_top_k)),
     })
 }
 
@@ -560,7 +604,17 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(path = %args.model.display(), "loading model");
     let t0 = Instant::now();
-    let engine = Engine::load(&args.model, args.max_len)?;
+    let mut engine = Engine::load(&args.model, args.max_len)?;
+    if let Some(path) = args.emotion_probes.as_ref() {
+        engine.load_emotion_probes(path, None)?;
+        let probes = engine.emotion_probes.as_ref().unwrap();
+        tracing::info!(
+            path = %path.display(),
+            emotions = probes.num_emotions,
+            layer = probes.scored_model_layer,
+            "emotion probes loaded",
+        );
+    }
     let tokenizer = Arc::new(engine.tokenizer.clone());
     tracing::info!(
         elapsed_s = t0.elapsed().as_secs_f64(),
@@ -582,10 +636,11 @@ async fn main() -> anyhow::Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<PendingRequest>(64);
     let max_batch = args.max_batch;
     let batch_wait_ms = args.batch_wait_ms;
+    let emotion_top_k = args.emotion_top_k;
     std::thread::spawn(move || batcher_loop(engine, req_rx, max_batch, batch_wait_ms));
 
     let state = AppState {
-        tx: req_tx, tokenizer, model_id, max_len: args.max_len,
+        tx: req_tx, tokenizer, model_id, max_len: args.max_len, emotion_top_k,
     };
 
     let app = Router::new()

@@ -109,6 +109,17 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn xk_emotion_score_bf16(
+        out: *mut c_void,
+        x: *const c_void,
+        mean: *const c_void,
+        vectors: *const c_void,
+        t: i32,
+        h: i32,
+        n: i32,
+        accumulate: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn xk_per_layer_slice_bf16(
         out: *mut c_void,
         src: *const c_void,
@@ -736,6 +747,43 @@ pub fn scale_bf16(
             input.as_device_ptr(),
             out.len() as i32,
             scale,
+            stream_ptr,
+        )
+    };
+    if code == 0 { Ok(()) } else { Err(CudaError(-code)) }
+}
+
+/// Emotion probe scoring: `out[t, n] = dot(x[t] - mean, vectors[n])`.
+/// `x: [t, h] bf16`, `mean: [h] bf16`, `vectors: [n, h] bf16`, `out: [t, n] fp32`.
+///
+/// If `accumulate` is true, `out[t, n] += ...` (via atomicAdd). Callers that
+/// accumulate across repeated calls must zero `out` before the first call.
+pub fn emotion_score_bf16(
+    out: &mut DeviceBuffer<f32>,
+    x: &DeviceBuffer<bf16>,
+    mean: &DeviceBuffer<bf16>,
+    vectors: &DeviceBuffer<bf16>,
+    t: usize,
+    h: usize,
+    n: usize,
+    accumulate: bool,
+    stream: Option<&Stream>,
+) -> Result<(), CudaError> {
+    assert_eq!(x.len(), t * h, "emotion_score: x length");
+    assert_eq!(mean.len(), h, "emotion_score: mean length");
+    assert_eq!(vectors.len(), n * h, "emotion_score: vectors length");
+    assert_eq!(out.len(), t * n, "emotion_score: out length");
+    let stream_ptr = stream.map(|s| s.as_raw()).unwrap_or(std::ptr::null_mut());
+    let code = unsafe {
+        xk_emotion_score_bf16(
+            out.as_device_ptr(),
+            x.as_device_ptr(),
+            mean.as_device_ptr(),
+            vectors.as_device_ptr(),
+            t as i32,
+            h as i32,
+            n as i32,
+            if accumulate { 1 } else { 0 },
             stream_ptr,
         )
     };
